@@ -37,6 +37,33 @@ void AudioCapture::AddTap(PcmRingBuffer& ring) {
     taps_.push_back(&ring);
 }
 
+void AudioCapture::AddWakeTap(PcmRingBuffer& ring) {
+    if (running_.load(std::memory_order_relaxed)) {
+        LVA_LOGW(kTag, "AddWakeTap called after Start; ignoring");
+        return;
+    }
+
+    wake_taps_.push_back(&ring);
+}
+
+
+void AudioCapture::AddLinearWakeTap(PcmRingBuffer& ring) {
+    if (opts_.frames_per_read != 160) {
+        LVA_LOGW(
+            kTag,
+            "linear AEC wake path requires 160-frame periods; "
+            "configured frames_per_read=%zu, so the shadow wake "
+            "path will be unavailable",
+            opts_.frames_per_read);
+    }
+
+    if (running_.load(std::memory_order_relaxed)) {
+        LVA_LOGW(kTag, "AddLinearWakeTap called after Start; ignoring");
+        return;
+    }
+    linear_wake_taps_.push_back(&ring);
+}
+
 void AudioCapture::SetProcessor(WebRtcProcessor* processor) {
     if (running_.load(std::memory_order_relaxed)) {
         LVA_LOGW(kTag, "SetProcessor called after Start; ignoring");
@@ -252,6 +279,12 @@ void AudioCapture::ThreadLoopPulse() {
             processor_->Process(chunk.data(), chunk.size());
         }
 
+        // Wake-word audio is taken after WebRTC/APM but before
+        // PostFrame() applies the live microphone-volume multiplier.
+        for (PcmRingBuffer* tap : wake_taps_) {
+            tap->Write(chunk.data(), chunk.size());
+        }
+
         PostFrame(chunk.data(), chunk.size());
     }
 
@@ -269,6 +302,12 @@ void AudioCapture::ThreadLoopAlsa() {
     std::vector<std::int16_t> il(period * nch);
     std::vector<std::int16_t> mic(period);
     std::vector<std::int16_t> ref(period);
+
+    // Preserve the unmodified hardware-loopback reference. WebRTC's
+    // ProcessReverseStream() is allowed to write to the ref buffer, while
+    // the post-AEC Sendspin residual suppressor needs the original,
+    // sample-aligned outgoing music reference.
+    std::vector<std::int16_t> ref_raw(period);
 
     const int  ref_a = opts_.ref_channels[0];
     const int  ref_b = opts_.ref_channels[1];
@@ -334,6 +373,8 @@ void AudioCapture::ThreadLoopAlsa() {
                         static_cast<int32_t>(row[ref_b]);
                     ref[i] = static_cast<std::int16_t>(s >> 1);
                 }
+
+                ref_raw[i] = ref[i];
             }
         }
 
@@ -341,7 +382,48 @@ void AudioCapture::ThreadLoopAlsa() {
             if (have_ref) {
                 processor_->ProcessReverse(ref.data(), period);
             }
+
             processor_->Process(mic.data(), period);
+
+            // Primary wake path:
+            //
+            // Feed the normal post-WebRTC/APM microphone to the primary
+            // detector. This keeps wake detection on the normal processed
+            // microphone stream while playback is active.
+            for (PcmRingBuffer* tap : wake_taps_) {
+                tap->Write(mic.data(), period);
+            }
+
+            // Shadow wake path:
+            //
+            // Independently feed WebRTC's continuously exported linear-AEC
+            // signal to the shadow detector. Do not fall back to the primary
+            // stream here: when linear AEC is unavailable the secondary
+            // detector simply receives no frames.
+            if (!linear_wake_taps_.empty()) {
+                std::vector<std::int16_t> linear_wake_frame(
+                    mic.begin(), mic.end());
+
+                const bool have_linear_wake =
+                    processor_->GetLinearAecOutput(
+                        linear_wake_frame.data(),
+                        linear_wake_frame.size());
+
+                if (have_linear_wake) {
+                    for (PcmRingBuffer* tap : linear_wake_taps_) {
+                        tap->Write(linear_wake_frame.data(), period);
+                    }
+                }
+            }
+
+            // WebRTC AEC runs first. Only then remove a conservative,
+            // strongly-correlated remainder of external Sendspin audio.
+            // PostFrame() applies mic_volume after this stage.
+            if (have_ref) {
+                processor_->SuppressSendspinResidual(
+                    mic.data(), ref_raw.data(), period);
+            }
+
         }
 
         PostFrame(mic.data(), period);

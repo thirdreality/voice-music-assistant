@@ -1,5 +1,6 @@
 
 #include <getopt.h>
+#include <fcntl.h>
 #include <sys/timerfd.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -32,6 +33,7 @@
 #include "audio/OpenWakeWord.h"
 #include "audio/OpenWakeWordFeatures.h"
 #include "audio/PcmRingBuffer.h"
+#include "audio/SendspinPlaybackMonitor.h"
 #include "audio/WakeWordEngine.h"
 #include "audio/WebRtcProcessor.h"
 #include "entities/EventEntity.h"
@@ -47,6 +49,7 @@
 #include "state/Preferences.h"
 #include "state/ServerState.h"
 #include "tr/HomeButton.h"
+#include "tr/MusicAssistantControl.h"
 #include "tr/MicMuteGpio.h"
 #include "tr/SoundConfWatcher.h"
 #include "tr/Supervisor.h"
@@ -326,8 +329,14 @@ int main(int argc, char** argv) {
     tts_opts.short_sound_safe = true;
     auto announce_player = std::make_unique<lva::audio::LibMpvPlayer>(tts_opts);
 
-    auto pcm_ring = std::make_unique<lva::audio::PcmRingBuffer>(
+    // Primary detector: normal post-WebRTC/APM microphone stream.
+    auto wake_ring = std::make_unique<lva::audio::PcmRingBuffer>(
         16'000 * 2);
+
+    // Shadow detector: independent continuous linear-AEC stream.
+    auto linear_wake_ring = std::make_unique<lva::audio::PcmRingBuffer>(
+        16'000 * 2);
+
     auto satellite_ring = std::make_unique<lva::audio::PcmRingBuffer>(
         16'000 * 2);
 
@@ -371,8 +380,9 @@ int main(int argc, char** argv) {
     }
 
     auto audio_capture = std::make_unique<lva::audio::AudioCapture>(
-        cap_opts, *pcm_ring);
-    audio_capture->AddTap(*satellite_ring);
+        cap_opts, *satellite_ring);
+    audio_capture->AddWakeTap(*wake_ring);
+    audio_capture->AddLinearWakeTap(*linear_wake_ring);
 
     // Tracks whether we materialized any first-boot default into
     // preferences; if so we persist once below so /data/conf/sound.json
@@ -415,6 +425,52 @@ int main(int argc, char** argv) {
     state.webrtc_processor = webrtc_processor.get();
     state.announce_player  = announce_player.get();
     state.music_player     = music_player.get();
+
+    // Suppress only the linear-AEC shadow detector during the
+    // first 1500 ms after Sendspin playback becomes active. This avoids
+    // that a playback-resume transient could survive the original 1000 ms
+    // guard by roughly 67 ms. Primary post-APM remains unrestricted.
+    std::atomic<std::int64_t> linear_guard_until_ns{0};
+
+    // Detect external Sendspin playback through PulseAudio rather than
+    // modifying/signalling the Sendspin process. The official Sendspin
+    // client creates a uniquely-identifiable sink input only while actual
+    // Music Assistant audio is playing.
+    auto sendspin_playback_monitor =
+        std::make_unique<lva::audio::SendspinPlaybackMonitor>(
+            [processor = webrtc_processor.get(),
+             &linear_guard_until_ns](bool active) {
+                if (active) {
+                    const auto now_ns =
+                        std::chrono::duration_cast<
+                            std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now()
+                                .time_since_epoch()).count();
+
+                    constexpr std::int64_t
+                        kLinearResumeGuardNs =
+                            1'500'000'000LL;
+
+                    linear_guard_until_ns.store(
+                        now_ns + kLinearResumeGuardNs,
+                        std::memory_order_relaxed);
+
+                    LVA_LOGD(
+                        "wake",
+                        "linear resume guard armed: 1500 ms");
+                } else {
+                    linear_guard_until_ns.store(
+                        0,
+                        std::memory_order_relaxed);
+                }
+
+                lva::tr::MusicAssistantObserveSendspinPlayback(active);
+                processor->SetExternalFarEndActive(active);
+            });
+
+    if (aec_enabled && !sendspin_playback_monitor->Start()) {
+        LVA_LOGW(kTag, "Sendspin playback monitor failed to start");
+    }
 
     // Set initial volume on announce player to match music player.
     if (state.preferences.volume.has_value()) {
@@ -624,6 +680,7 @@ int main(int argc, char** argv) {
 
     lva::proto::ApiServer server(state, opts);
     g_server = &server;
+
     InstallSignalHandlers();
 
     if (!server.Start()) {
@@ -665,7 +722,7 @@ int main(int argc, char** argv) {
     }
 
     auto wakeword_engine =
-        std::make_unique<lva::audio::WakeWordEngine>(*pcm_ring);
+        std::make_unique<lva::audio::WakeWordEngine>(*wake_ring);
 
     {
         // Prefer the persisted selection (survives cold reboot); fall
@@ -821,10 +878,57 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Shared dispatch gate. Only one detector is allowed to hand a
+    // wake to Satellite inside this interval. This prevents the two wake
+    // threads from concurrently writing Satellite's pending-wake payload.
+    std::atomic<std::int64_t> last_wake_dispatch_ns{0};
+
     // Voice satellite state machine.
     auto satellite = std::make_unique<lva::satellite::Satellite>(
         state, *satellite_ring, *wakeword_engine, announce_player.get());
     state.satellite = satellite.get();
+
+    // The shadow wake engine owns a completely independent
+    // MicroFeatures instance, TFLite runtime, and probability history.
+    // It is intentionally not exposed through state.wakeword_engine:
+    // Home Assistant continues to manage only the primary engine.
+    auto linear_wakeword_engine =
+        std::make_unique<lva::audio::WakeWordEngine>(*linear_wake_ring);
+
+    if (!use_openwakeword) {
+        for (const auto& primary_model :
+             wakeword_engine->SnapshotModels()) {
+            if (!primary_model ||
+                primary_model->config().id == "stop") {
+                continue;
+            }
+
+            const auto json_path =
+                wakeword_dir / (primary_model->config().id + ".json");
+
+            auto shadow_model =
+                lva::audio::MicroWakeWord::FromConfig(json_path);
+
+            if (shadow_model && shadow_model->Ok()) {
+                shadow_model->SetProbabilityCutoff(
+                    primary_model->ProbabilityCutoff());
+
+                LVA_LOGI(
+                    kTag,
+                    "shadow model loaded: id=%s cutoff=%.3f",
+                    primary_model->config().id.c_str(),
+                    primary_model->ProbabilityCutoff());
+
+                linear_wakeword_engine->AddModel(
+                    std::move(shadow_model));
+            } else {
+                LVA_LOGW(
+                    kTag,
+                    "shadow model failed to load: %s",
+                    primary_model->config().id.c_str());
+            }
+        }
+    }
 
     // When HA disconnects, reset satellite state.
     state.on_client_disconnected = [&satellite] {
@@ -845,17 +949,124 @@ int main(int argc, char** argv) {
     }
 
     wakeword_engine->SetDetectionCallback(
-        [&satellite](const std::string& model_id, float prob) {
+        [&satellite, &last_wake_dispatch_ns](
+            const std::string& model_id, float prob) {
             if (model_id == "stop") {
                 LVA_LOGD("wake",
                          "stop word detected prob=%.3f", prob);
                 satellite->OnStopDetected();
-            } else {
-                LVA_LOGD("wake",
-                         "wake word detected id=%s prob=%.3f",
-                         model_id.c_str(), prob);
-                satellite->OnWakeDetected(model_id, prob);
+                return;
             }
+
+            const auto now_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now()
+                        .time_since_epoch()).count();
+
+            constexpr std::int64_t kWakeDedupNs =
+                1'000'000'000LL;
+
+            auto previous =
+                last_wake_dispatch_ns.load(
+                    std::memory_order_relaxed);
+
+            while (true) {
+                if (previous != 0 &&
+                    now_ns - previous < kWakeDedupNs) {
+                    LVA_LOGD(
+                        "wake",
+                        "duplicate wake suppressed source=post_apm "
+                        "id=%s prob=%.3f",
+                        model_id.c_str(), prob);
+                    return;
+                }
+
+                if (last_wake_dispatch_ns
+                        .compare_exchange_weak(
+                            previous,
+                            now_ns,
+                            std::memory_order_relaxed,
+                            std::memory_order_relaxed)) {
+                    break;
+                }
+            }
+
+            LVA_LOGD(
+                "wake",
+                "wake candidate source=post_apm "
+                "id=%s prob=%.3f",
+                model_id.c_str(), prob);
+
+            satellite->OnWakeDetected(model_id, prob);
+        });
+
+    linear_wakeword_engine->SetDetectionCallback(
+        [&satellite,
+         &last_wake_dispatch_ns,
+         &linear_guard_until_ns](
+            const std::string& model_id, float prob) {
+            if (model_id == "stop") return;
+
+            const auto now_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now()
+                        .time_since_epoch()).count();
+
+            const auto guard_until_ns =
+                linear_guard_until_ns.load(
+                    std::memory_order_relaxed);
+
+            if (guard_until_ns != 0 &&
+                now_ns < guard_until_ns) {
+                const auto remaining_ms =
+                    (guard_until_ns - now_ns) / 1'000'000LL;
+
+                LVA_LOGD(
+                    "wake",
+                    "linear resume guard suppressed "
+                    "id=%s prob=%.3f remaining_ms=%lld",
+                    model_id.c_str(),
+                    prob,
+                    static_cast<long long>(remaining_ms));
+
+                return;
+            }
+
+            constexpr std::int64_t kWakeDedupNs =
+                1'000'000'000LL;
+
+            auto previous =
+                last_wake_dispatch_ns.load(
+                    std::memory_order_relaxed);
+
+            while (true) {
+                if (previous != 0 &&
+                    now_ns - previous < kWakeDedupNs) {
+                    LVA_LOGD(
+                        "wake",
+                        "duplicate wake suppressed source=linear_aec "
+                        "id=%s prob=%.3f",
+                        model_id.c_str(), prob);
+                    return;
+                }
+
+                if (last_wake_dispatch_ns
+                        .compare_exchange_weak(
+                            previous,
+                            now_ns,
+                            std::memory_order_relaxed,
+                            std::memory_order_relaxed)) {
+                    break;
+                }
+            }
+
+            LVA_LOGD(
+                "wake",
+                "wake candidate source=linear_aec "
+                "id=%s prob=%.3f",
+                model_id.c_str(), prob);
+
+            satellite->OnWakeDetected(model_id, prob);
         });
 
     state.wakeword_engine = wakeword_engine.get();
@@ -864,6 +1075,24 @@ int main(int argc, char** argv) {
     if (!wakeword_engine->Start()) {
         LVA_LOGW(kTag, "wake-word engine failed to start; voice "
                        "pipeline disabled");
+    }
+
+    if (!use_openwakeword &&
+        !linear_wakeword_engine->SnapshotModels().empty()) {
+        if (!linear_wakeword_engine->Start()) {
+            LVA_LOGW(
+                kTag,
+                "linear-AEC shadow wake engine failed to start");
+        } else {
+            LVA_LOGI(
+                kTag,
+                "dual-path wake active "
+                "(primary=post_apm secondary=linear_aec)");
+
+            LVA_LOGI(
+                kTag,
+                "wake guards active: linear_resume=1500 ms stop_after_wake=1000 ms");
+        }
     }
 
     const int satellite_tick_fd = ::timerfd_create(CLOCK_MONOTONIC,
@@ -920,6 +1149,9 @@ int main(int argc, char** argv) {
     mdns.Stop();
     home_button->Stop();
     wakeword_engine->Stop();
+    if (sendspin_playback_monitor) {
+        sendspin_playback_monitor->Stop();
+    }
     audio_capture->Stop();
 
     const int signo = g_shutdown_signal.load(std::memory_order_relaxed);

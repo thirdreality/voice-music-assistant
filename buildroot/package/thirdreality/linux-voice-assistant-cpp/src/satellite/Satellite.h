@@ -7,10 +7,13 @@
 #include <functional>
 #include <google/protobuf/message_lite.h>
 #include <map>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "audio/ExternalWakeWord.h"
+#include "tr/MusicAssistantControl.h"
 
 namespace lva::audio    { class WakeWordEngine; class PcmRingBuffer; class IAudioPlayer; }
 namespace lva::state    { class ServerState; }
@@ -66,6 +69,9 @@ class Satellite {
     void Duck();
     void Unduck();
 
+    void PauseMusicForVoice();
+    void ResumeMusicForVoice();
+
     struct PendingWake {
         std::string model_id;
         float       prob = 0.0f;
@@ -100,6 +106,11 @@ class Satellite {
     double pre_duck_volume_  = 1.0;
 
     std::atomic<std::int64_t> refractory_until_ns_{0};
+
+    // Ignore stop-word detections briefly after a fresh wake.
+    // This prevents the wake chime / transition itself from aborting
+    // the pipeline before HA streaming has opened.
+    std::atomic<std::int64_t> stop_guard_until_ns_{0};
 
     std::map<std::string, lva::audio::ExternalWakeWordInfo>
         external_wake_words_;
