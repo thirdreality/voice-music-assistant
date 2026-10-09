@@ -225,6 +225,20 @@ bool MicroWakeWord::Process(const float* frames,
                               probabilities_.end(), 0.0f)
                           / static_cast<float>(probabilities_.size());
         const float cutoff = cutoff_live_.load(std::memory_order_relaxed);
+
+        // Temporary diagnostic telemetry for Okay Computer.
+        // Log the raw model output and the actual sliding-window mean
+        // used for detection without changing wake-word behavior.
+        if (cfg_.id == "okay_computer") {
+            static thread_local unsigned int score_log_counter = 0;
+            ++score_log_counter;
+            if ((score_log_counter % 5u) == 0u || mean >= cutoff) {
+                LVA_LOGD(kTag,
+                         "[%s] score raw=%.3f mean=%.3f cutoff=%.3f",
+                         cfg_.id.c_str(), prob, mean, cutoff);
+            }
+        }
+
         if (mean > cutoff) {
             LVA_LOGD(kTag, "[%s] detected (mean=%.3f cutoff=%.3f)",
                      cfg_.id.c_str(), mean, cutoff);

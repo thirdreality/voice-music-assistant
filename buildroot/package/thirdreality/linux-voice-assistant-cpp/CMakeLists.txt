@@ -87,6 +87,11 @@ message(STATUS "Found mpv ${MPV_VERSION} via pkg-config")
 pkg_check_modules(PULSE_SIMPLE REQUIRED IMPORTED_TARGET libpulse-simple)
 message(STATUS "Found libpulse-simple ${PULSE_SIMPLE_VERSION} via pkg-config")
 
+# libpulse: asynchronous PulseAudio introspection/subscription API used by
+# SendspinPlaybackMonitor to detect the official Sendspin playback stream.
+pkg_check_modules(PULSE REQUIRED IMPORTED_TARGET libpulse)
+message(STATUS "Found libpulse ${PULSE_VERSION} via pkg-config")
+
 # webrtc-audio-processing 1.x: AGC + NoiseSuppression for the mic
 # pipeline (phase 6). Without this, wake-word detection rate is
 # noticeably worse than the Python build (which uses
@@ -167,6 +172,7 @@ add_executable(linux-voice-assistant-cpp
     src/audio/LibMpvPlayer.cpp
     src/audio/PcmRingBuffer.cpp
     src/audio/AudioCapture.cpp
+    src/audio/SendspinPlaybackMonitor.cpp
     src/audio/ExternalWakeWord.cpp
     src/audio/MicroFeatures.cpp
     src/audio/MicroWakeWord.cpp
@@ -179,6 +185,7 @@ add_executable(linux-voice-assistant-cpp
     src/satellite/Satellite.cpp
     src/tr/HomeButton.cpp
     src/tr/LedRing.cpp
+    src/tr/MusicAssistantControl.cpp
     src/tr/MicMuteGpio.cpp
     src/tr/OtaClient.cpp
     src/tr/SendspinSignal.cpp
@@ -224,6 +231,7 @@ target_link_libraries(linux-voice-assistant-cpp
         nlohmann_json::nlohmann_json
         PkgConfig::MPV
         PkgConfig::PULSE_SIMPLE
+        PkgConfig::PULSE
         PkgConfig::ALSA
         PkgConfig::WEBRTC_APM
         PkgConfig::LIBCURL

@@ -1,0 +1,66 @@
+diff -rN -U0 base/webrtc/modules/audio_processing/aec3/echo_canceller3.cc desired/webrtc/modules/audio_processing/aec3/echo_canceller3.cc
+--- a/webrtc/modules/audio_processing/aec3/echo_canceller3.cc	2026-10-09 15:18:27.826289831 -0400
++++ b/webrtc/modules/audio_processing/aec3/echo_canceller3.cc	2026-10-09 15:19:24.798742074 -0400
+@@ -841,0 +842,6 @@
++
++  // Preserve near-end speech more aggressively during double-talk.
++  // 0.75f is the value used by WebRTC's own
++  // WebRTC-Aec3VerySensitiveDominantNearendActivation field trial.
++  cfg.suppressor.dominant_nearend_detection.enr_threshold = 0.75f;
++
+diff -rN -U0 base/webrtc/modules/audio_processing/aec3/echo_remover.cc desired/webrtc/modules/audio_processing/aec3/echo_remover.cc
+--- a/webrtc/modules/audio_processing/aec3/echo_remover.cc	2026-10-09 15:18:27.757213203 -0400
++++ b/webrtc/modules/audio_processing/aec3/echo_remover.cc	2026-10-09 15:19:24.818339169 -0400
+@@ -253,0 +254,11 @@
++  // Preserve the capture block before AEC3 output substitution so confirmed
++  // near-end speech can pass without nonlinear suppression.
++  std::vector<std::array<float, kBlockSize>> capture_input;
++  if (y->size() == 1) {
++    capture_input.resize(num_capture_channels_);
++    for (size_t ch = 0; ch < num_capture_channels_; ++ch) {
++      std::copy((*y)[0][ch].begin(), (*y)[0][ch].end(),
++                capture_input[ch].begin());
++    }
++  }
++
+@@ -423,0 +435,2 @@
++  const bool nearend_state = suppression_gain_.IsNearendState();
++
+@@ -425,0 +439,18 @@
++
++  // Keep AEC3 adaptation and state estimation active, but select the output
++  // best suited to wake-word capture at 16 kHz: preserve confirmed near-end
++  // speech, otherwise use the adaptive linear echo-cancelled signal.
++  if (y->size() == 1) {
++    if (nearend_state &&
++        capture_input.size() == num_capture_channels_) {
++      for (size_t ch = 0; ch < num_capture_channels_; ++ch) {
++        std::copy(capture_input[ch].begin(),
++                  capture_input[ch].end(),
++                  (*y)[0][ch].begin());
++      }
++    } else if (aec_state_.UseLinearFilterOutput()) {
++      for (size_t ch = 0; ch < num_capture_channels_; ++ch) {
++        std::copy(e[ch].begin(), e[ch].end(), (*y)[0][ch].begin());
++      }
++    }
++  }
+diff -rN -U0 base/webrtc/modules/audio_processing/aec3/suppression_gain.h desired/webrtc/modules/audio_processing/aec3/suppression_gain.h
+--- a/webrtc/modules/audio_processing/aec3/suppression_gain.h	2026-10-09 15:18:27.720402897 -0400
++++ b/webrtc/modules/audio_processing/aec3/suppression_gain.h	2026-10-09 15:19:24.818232186 -0400
+@@ -55,0 +56,5 @@
++  // Returns whether dominant near-end speech is currently detected.
++  bool IsNearendState() const {
++    return dominant_nearend_detector_->IsNearendState();
++  }
++
+diff -rN -U0 base/webrtc/modules/audio_processing/audio_processing_impl.cc desired/webrtc/modules/audio_processing/audio_processing_impl.cc
+--- a/webrtc/modules/audio_processing/audio_processing_impl.cc	2026-10-09 15:18:27.776633350 -0400
++++ b/webrtc/modules/audio_processing/audio_processing_impl.cc	2026-10-09 15:19:24.818505314 -0400
+@@ -1693,0 +1694,6 @@
++
++      // Keep AEC3's internal linear-output machinery synchronized with the
++      // public AudioProcessing export request.
++      config.filter.export_linear_aec_output =
++          config_.echo_canceller.export_linear_aec_output;
++

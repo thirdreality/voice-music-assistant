@@ -1,8 +1,10 @@
 #include "satellite/Satellite.h"
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <optional>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -16,6 +18,7 @@
 #include "protocol/MessageRegistry.h"
 #include "state/ServerState.h"
 #include "tr/LedRing.h"
+#include "tr/MusicAssistantControl.h"
 #include "tr/SendspinSignal.h"
 #include "util/Log.h"
 
@@ -79,6 +82,34 @@ void Satellite::OnWakeDetected(const std::string& model_id, float prob) {
 void Satellite::OnStopDetected() {
     if (!pipeline_active_ && !timer_ringing_) return;
 
+    // Timer stop must always remain immediate. For an ordinary voice
+    // pipeline, however, ignore stop detections during the first second
+    // after a wake, while the wake chime is still transitioning into
+    // HA streaming.
+    if (!timer_ringing_) {
+        const auto now_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now()
+                    .time_since_epoch()).count();
+
+        const auto guard_until_ns =
+            stop_guard_until_ns_.load(
+                std::memory_order_relaxed);
+
+        if (guard_until_ns != 0 &&
+            now_ns < guard_until_ns) {
+            const auto remaining_ms =
+                (guard_until_ns - now_ns) / 1'000'000LL;
+
+            LVA_LOGD(
+                kTag,
+                "stop-word guard suppressed detection "
+                "(remaining_ms=%lld)",
+                static_cast<long long>(remaining_ms));
+            return;
+        }
+    }
+
     if (timer_ringing_) {
         LVA_LOGI(kTag, "stop word → stopping timer ring");
         StopTimerRing();
@@ -89,6 +120,7 @@ void Satellite::OnStopDetected() {
         continue_conversation_ = false;
         continue_listen_at_ns_.store(0, std::memory_order_relaxed);
         Unduck();
+        ResumeMusicForVoice();
         lva::tr::Show(lva::tr::LedState::Idle);
     }
 }
@@ -123,6 +155,17 @@ void Satellite::StartPipeline(const std::string& wake_word_phrase) {
     refractory_until_ns_.store(now_ns + 2'000'000'000LL,
                                std::memory_order_relaxed);
 
+    constexpr std::int64_t kStopGuardNs =
+        1'000'000'000LL;
+
+    stop_guard_until_ns_.store(
+        now_ns + kStopGuardNs,
+        std::memory_order_relaxed);
+
+    LVA_LOGD(
+        kTag,
+        "stop-word guard armed: 1000 ms");
+
     pipeline_active_       = true;
     is_streaming_audio_    = false;  // not yet — wakeup sound first
     tts_url_.clear();
@@ -131,6 +174,7 @@ void Satellite::StartPipeline(const std::string& wake_word_phrase) {
 
     lva::tr::Show(lva::tr::LedState::Listening);
     Duck();
+    PauseMusicForVoice();
 
     if (announce_player_ != nullptr) {
         const std::string phrase_copy = wake_word_phrase;
@@ -258,6 +302,7 @@ void Satellite::PlayTts() {
             pipeline_active_ = false;
             lva::tr::Show(lva::tr::LedState::Idle);
             Unduck();
+            ResumeMusicForVoice();
         }
     });
 }
@@ -310,6 +355,14 @@ void Satellite::PlayAnnounce(const std::string& media_id,
     } else {
         play_main();
     }
+}
+
+void Satellite::PauseMusicForVoice() {
+    lva::tr::MusicAssistantPauseForVoiceAsync();
+}
+
+void Satellite::ResumeMusicForVoice() {
+    lva::tr::MusicAssistantResumeForVoiceAsync();
 }
 
 void Satellite::Duck() {
@@ -402,6 +455,7 @@ void Satellite::OnVoiceEvent(
             continue_conversation_ = false;
             // Pair the duck() from StartPipeline.
             Unduck();
+            ResumeMusicForVoice();
             break;
         }
 
@@ -465,6 +519,7 @@ void Satellite::OnVoiceEvent(
                     pipeline_active_ = false;
                     lva::tr::Show(lva::tr::LedState::Idle);
                     Unduck();
+                    ResumeMusicForVoice();
                 }
             }
             break;
@@ -496,6 +551,7 @@ void Satellite::OnLoopTick() {
                 pipeline_active_ = false;
                 lva::tr::Show(lva::tr::LedState::Idle);
                 Unduck();
+                ResumeMusicForVoice();
             } else {
                 LVA_LOGI(kTag, "settle delay elapsed — listening");
                 BeginListening();
@@ -515,6 +571,7 @@ void Satellite::OnDisconnected() {
     continue_conversation_ = false;
     continue_listen_at_ns_.store(0, std::memory_order_relaxed);
     Unduck();
+    ResumeMusicForVoice();
     lva::tr::Show(lva::tr::LedState::Idle);
     if (announce_player_) announce_player_->Stop();
     if (state_.music_player) state_.music_player->Stop();
@@ -530,6 +587,7 @@ void Satellite::OnMuted() {
         pipeline_active_       = false;
         continue_conversation_ = false;
         Unduck();
+        ResumeMusicForVoice();
         lva::tr::Show(lva::tr::LedState::Idle);
     }
 }

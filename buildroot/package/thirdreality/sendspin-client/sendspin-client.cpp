@@ -912,6 +912,7 @@ int main(int argc, char *argv[]) {
       {SendspinCodecFormat::FLAC, 2, 44100, 16},
       {SendspinCodecFormat::FLAC, 2, 48000, 16},
       {SendspinCodecFormat::OPUS, 2, 48000, 16},
+      {SendspinCodecFormat::OPUS, 1, 48000, 16},
       {SendspinCodecFormat::PCM, 2, 44100, 16},
       {SendspinCodecFormat::PCM, 2, 48000, 16},
   };

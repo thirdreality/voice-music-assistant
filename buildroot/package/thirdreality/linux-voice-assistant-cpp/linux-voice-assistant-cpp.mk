@@ -21,7 +21,7 @@ LINUX_VOICE_ASSISTANT_CPP_LICENSE_FILES =
 # change, will back the production AudioCapture's ALSA backend for
 # hardware-loopback AEC). Keep it explicit even though pulseaudio /
 # webrtc-audio-processing already pull it transitively.
-LINUX_VOICE_ASSISTANT_CPP_DEPENDENCIES = host-protobuf protobuf json-for-modern-cpp mpv webrtc-audio-processing libcurl avahi alsa-lib
+LINUX_VOICE_ASSISTANT_CPP_DEPENDENCIES = host-protobuf protobuf json-for-modern-cpp mpv pulseaudio webrtc-audio-processing libcurl avahi alsa-lib
 
 LINUX_VOICE_ASSISTANT_CPP_CONF_OPTS =
 

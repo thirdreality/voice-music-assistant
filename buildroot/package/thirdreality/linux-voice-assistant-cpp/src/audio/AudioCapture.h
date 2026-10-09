@@ -52,6 +52,14 @@ class AudioCapture {
 
     void AddTap(PcmRingBuffer& ring);
 
+    // Primary wake path: normal post-WebRTC/APM microphone.
+    // This is before Sendspin residual suppression and mic-volume gain.
+    void AddWakeTap(PcmRingBuffer& ring);
+
+    // Shadow wake path: WebRTC continuous linear-AEC output.
+    // Frames are supplied only while linear AEC output is available.
+    void AddLinearWakeTap(PcmRingBuffer& ring);
+
     void SetProcessor(WebRtcProcessor* processor);
 
     void SetMicVolumeSource(const std::atomic<int>* vol) {
@@ -79,6 +87,8 @@ class AudioCapture {
     Options                  opts_;
     PcmRingBuffer&           ring_;
     std::vector<PcmRingBuffer*> taps_;
+    std::vector<PcmRingBuffer*> wake_taps_;
+    std::vector<PcmRingBuffer*> linear_wake_taps_;
     WebRtcProcessor*         processor_ = nullptr;
 
     const std::atomic<int>*  mic_volume_ptr_ = nullptr;
