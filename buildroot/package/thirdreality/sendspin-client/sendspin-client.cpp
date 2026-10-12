@@ -5,7 +5,7 @@
 // LED ring via tr-ledring D-Bus animations and direct sysfs writes.
 //
 // Volume conventions (do not mix without converting):
-//   - Sendspin wire (MA 2.8+): 0-100 percent
+//   - Sendspin wire: 0-100 percent
 //   - PulseAudio linear: 0.0-1.0
 //   - /data/conf/sound.json: 0-100 percent
 
@@ -18,13 +18,13 @@
 
 #include <pulse/error.h>
 #include <pulse/pulseaudio.h>
-#include <pulse/simple.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cerrno>
 #include <cctype>
+#include <cstdint>
 #include <cstddef>
 #include <climits>
 #include <csignal>
@@ -34,20 +34,23 @@
 #include <fstream>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/file.h>
-#include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
 using namespace sendspin;
 
+static constexpr bool kUnpairedAccess = true;
 static std::atomic<bool> g_running{true};
 static std::atomic<bool> g_ducked{false};
 static void signal_handler(int) { g_running = false; }
@@ -82,6 +85,14 @@ class ControlSocket {
       fd_ = -1;
       return false;
     }
+    if (::chmod(PATH, 0600) != 0) {
+      fprintf(stderr, "[sendspin] control chmod(%s) failed: %s\n",
+              PATH, strerror(errno));
+      close(fd_);
+      fd_ = -1;
+      unlink(PATH);
+      return false;
+    }
     return true;
   }
 
@@ -112,6 +123,7 @@ static constexpr const char *SOUND_CONF = "/data/conf/sound.json";
 static constexpr const char *LVA_CONTROL_PATH = "/tmp/lva-control.sock";
 static constexpr const char *SOUND_LOCK_PATH = "/tmp/sound_config.lock";
 static constexpr const char *SENDSPIN_CONF = "/data/conf/sendspin.json";
+static constexpr const char *SENDSPIN_STATE_DIR = "/data/conf/sendspin-state";
 
 // ============================================================================
 // JSON helpers
@@ -147,8 +159,7 @@ static int read_json_int(const char *path, const char *field) {
 
 class ScopedSoundLock {
  public:
-  explicit ScopedSoundLock(bool required) {
-    if (!required) return;
+  ScopedSoundLock() {
     fd_ = ::open(SOUND_LOCK_PATH, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
     if (fd_ >= 0 && ::flock(fd_, LOCK_EX) != 0) {
       ::close(fd_);
@@ -169,9 +180,8 @@ class ScopedSoundLock {
 };
 
 static bool write_json_int(const char *path, const char *field, int value) {
-  const bool is_sound_config = std::strcmp(path, SOUND_CONF) == 0;
-  ScopedSoundLock lock(is_sound_config);
-  if (is_sound_config && !lock.locked()) return false;
+  ScopedSoundLock lock;
+  if (!lock.locked()) return false;
   std::ifstream in(path);
   if (!in) return false;
   std::string content((std::istreambuf_iterator<char>(in)),
@@ -300,58 +310,146 @@ static int64_t now_us() {
 }
 
 // ============================================================================
-// Persistence Provider — saves state to /data/conf/sendspin.json
+// Persistence provider for identity, trust, delay, and LED settings
 // ============================================================================
 
 class FilePersistenceProvider : public SendspinPersistenceProvider {
  public:
   FilePersistenceProvider() {
-    // Ensure all required fields exist in config file
     std::ifstream test(SENDSPIN_CONF);
     if (!test) {
       std::ofstream out(SENDSPIN_CONF, std::ios::trunc);
-      out << "{\n  \"last_server_hash\": 0,\n  \"static_delay_ms\": 0,\n  \"led_disabled\": 1\n}\n";
+      out << "{\n  \"led_disabled\": 1\n}\n";
     } else {
-      // Check if led_disabled field exists, add it if missing
       std::string content((std::istreambuf_iterator<char>(test)),
                           std::istreambuf_iterator<char>());
       test.close();
       if (content.find("\"led_disabled\"") == std::string::npos) {
-        auto pos = content.rfind('}');
-        if (pos != std::string::npos) {
-          content.insert(pos, ",\n  \"led_disabled\": 1\n");
+        const auto open = content.find('{');
+        const auto close = content.rfind('}');
+        if (open != std::string::npos && close != std::string::npos &&
+            open < close) {
+          const bool has_fields = std::any_of(
+              content.begin() + static_cast<ptrdiff_t>(open + 1),
+              content.begin() + static_cast<ptrdiff_t>(close),
+              [](unsigned char c) { return !std::isspace(c); });
+          content.insert(close, has_fields
+                                    ? ",\n  \"led_disabled\": 1\n"
+                                    : "\n  \"led_disabled\": 1\n");
           std::ofstream out(SENDSPIN_CONF, std::ios::trunc);
           out << content;
+        } else {
+          fprintf(stderr, "[sendspin] invalid config: %s\n", SENDSPIN_CONF);
+        }
+      }
+    }
+
+    if (::mkdir(SENDSPIN_STATE_DIR, 0700) != 0 && errno != EEXIST) {
+      fprintf(stderr, "[sendspin] mkdir(%s) failed: %s\n",
+              SENDSPIN_STATE_DIR, strerror(errno));
+    } else if (::chmod(SENDSPIN_STATE_DIR, 0700) != 0) {
+      fprintf(stderr, "[sendspin] chmod(%s) failed: %s\n",
+              SENDSPIN_STATE_DIR, strerror(errno));
+    }
+
+    if (!load_blob(persistence_keys::OUTPUT_DELAY).has_value()) {
+      const int old_delay = read_json_int(SENDSPIN_CONF, "static_delay_ms");
+      if (old_delay >= 0 && old_delay <= 5000) {
+        const auto delay = static_cast<uint16_t>(old_delay);
+        if (!save_blob(persistence_keys::OUTPUT_DELAY,
+                       reinterpret_cast<const uint8_t *>(&delay),
+                       sizeof(delay))) {
+          fprintf(stderr, "[sendspin] output-delay migration failed\n");
         }
       }
     }
   }
 
-  bool save_last_server_hash(uint32_t hash) override {
-    write_json_int(SENDSPIN_CONF, "last_server_hash", static_cast<int>(hash));
-    fprintf(stderr, "[sendspin] persisted last_server_hash: %u\n", hash);
+  std::optional<std::vector<uint8_t>> load_blob(
+      const std::string &key) override {
+    if (!valid_key(key)) return std::nullopt;
+
+    std::ifstream in(blob_path(key), std::ios::binary | std::ios::ate);
+    if (!in) return std::nullopt;
+    const auto length = in.tellg();
+    if (length < 0 || length > 4096) return std::nullopt;
+    in.seekg(0);
+
+    return std::vector<uint8_t>(std::istreambuf_iterator<char>(in),
+                                std::istreambuf_iterator<char>());
+  }
+
+  bool save_blob(const std::string &key, const uint8_t *data,
+                 size_t len) override {
+    if (!valid_key(key) || (data == nullptr && len != 0) || len > 4096) {
+      return false;
+    }
+
+    if (::mkdir(SENDSPIN_STATE_DIR, 0700) != 0 && errno != EEXIST) {
+      return false;
+    }
+
+    const std::string path = blob_path(key);
+    const std::string tmp = path + ".tmp";
+    int fd = ::open(tmp.c_str(),
+                    O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW,
+                    0600);
+    if (fd < 0) return false;
+
+    if (::fchmod(fd, 0600) != 0) {
+      ::close(fd);
+      ::unlink(tmp.c_str());
+      return false;
+    }
+
+    bool ok = true;
+    size_t written = 0;
+    while (written < len) {
+      const ssize_t n = ::write(fd, data + written, len - written);
+      if (n < 0) {
+        if (errno == EINTR) continue;
+        ok = false;
+        break;
+      }
+      if (n == 0) {
+        ok = false;
+        break;
+      }
+      written += static_cast<size_t>(n);
+    }
+
+    if (ok && ::fsync(fd) != 0) ok = false;
+    if (::close(fd) != 0) ok = false;
+    if (!ok) {
+      ::unlink(tmp.c_str());
+      return false;
+    }
+    if (::rename(tmp.c_str(), path.c_str()) != 0) {
+      ::unlink(tmp.c_str());
+      return false;
+    }
+
+    const int dir_fd =
+        ::open(SENDSPIN_STATE_DIR, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir_fd < 0) return false;
+    const bool synced = (::fsync(dir_fd) == 0);
+    ::close(dir_fd);
+    return synced;
+  }
+
+ private:
+  static bool valid_key(const std::string &key) {
+    if (key.empty()) return false;
+    for (unsigned char c : key) {
+      if (!std::isalnum(c) && c != '_') return false;
+    }
     return true;
   }
 
-  std::optional<uint32_t> load_last_server_hash() override {
-    int val = read_json_int(SENDSPIN_CONF, "last_server_hash");
-    if (val < 0) return std::nullopt;
-    return static_cast<uint32_t>(val);
-  }
-
-  bool save_static_delay(uint16_t delay_ms) override {
-    write_json_int(SENDSPIN_CONF, "static_delay_ms", delay_ms);
-    fprintf(stderr, "[sendspin] persisted static_delay: %u ms\n", delay_ms);
-    return true;
-  }
-
-  std::optional<uint16_t> load_static_delay() override {
-    int val = read_json_int(SENDSPIN_CONF, "static_delay_ms");
-    if (val < 0) return std::nullopt;
-    return static_cast<uint16_t>(val);
+  static std::string blob_path(const std::string &key) {
+    return std::string(SENDSPIN_STATE_DIR) + "/" + key;
   }
 };
-
 // ============================================================================
 // PulseAudio volume/mute controller (async, non-blocking)
 // ============================================================================
@@ -438,52 +536,23 @@ class LedColorController {
     }
   }
 
-  // Beat flash: briefly shows full brightness then fades back
-  void pulse() {
-    std::lock_guard<std::mutex> lock(mu_);
-    if (!playing_ || led_disabled_) return;
-    int64_t now = now_us();
-    if (now < suppress_until_ || now - last_pulse_time_ < 250000) return;
-    last_pulse_time_ = now;
-    generate_pulse();
+  void queue_pulse() {
+    pulse_pending_.store(true, std::memory_order_release);
   }
 
-  // Continuous loudness-driven brightness via direct sysfs writes
-  void set_loudness(uint16_t loudness) {
+  void queue_loudness(uint16_t loudness) {
+    pending_loudness_.store(loudness, std::memory_order_relaxed);
+    loudness_pending_.store(true, std::memory_order_release);
+  }
+
+  void reset_visualizer() {
+    pulse_pending_.store(false, std::memory_order_release);
+    loudness_pending_.store(false, std::memory_order_release);
     std::lock_guard<std::mutex> lock(mu_);
-    if (!playing_ || now_us() < suppress_until_) return;
-    if (led_disabled_) return;
-
-    // On first loudness frame, stop tr-ledring so we own sysfs exclusively
-    if (!sysfs_mode_) {
-      send_led_idle();
-      sysfs_mode_ = true;
-    }
-
-    // Auto-scale to observed peak with minimum floor
-    if (loudness > loudness_peak_) loudness_peak_ = loudness;
-    else loudness_peak_ = loudness_peak_ * 255 / 256;
-    uint16_t peak = (loudness_peak_ > 2000) ? loudness_peak_ : 2000;
-
-    // Normalize and apply squared curve for contrast
-    float norm = static_cast<float>(loudness) / peak;
-    if (norm > 1.0f) norm = 1.0f;
-    float target = norm * norm;
-
-    // Smooth: fast attack (0.7), fast decay (0.6)
-    if (target > smooth_bright_)
-      smooth_bright_ += (target - smooth_bright_) * 0.7f;
-    else
-      smooth_bright_ += (target - smooth_bright_) * 0.6f;
-
-    // Scale color for visibility (cap at 2.5x)
-    float scale = std::min(2.5f, 220.0f / std::max({base_r_, base_g_, base_b_, (uint8_t)1}));
-    write_sysfs("/sys/class/leds/RGB_R/brightness",
-                static_cast<uint8_t>(std::min(255.0f, base_r_ * scale * smooth_bright_)));
-    write_sysfs("/sys/class/leds/RGB_G/brightness",
-                static_cast<uint8_t>(std::min(255.0f, base_g_ * scale * smooth_bright_)));
-    write_sysfs("/sys/class/leds/RGB_B/brightness",
-                static_cast<uint8_t>(std::min(255.0f, base_b_ * scale * smooth_bright_)));
+    loudness_peak_ = 0;
+    smooth_bright_ = 0.0f;
+    sysfs_mode_ = false;
+    if (playing_ && !led_disabled_) start_breathing();
   }
 
   // Stop all LED output
@@ -523,8 +592,12 @@ class LedColorController {
   void toggle_enabled() {
     std::lock_guard<std::mutex> lock(mu_);
     led_disabled_ = !led_disabled_;
-    write_json_int(SENDSPIN_CONF, "led_disabled", led_disabled_ ? 1 : 0);
-    fprintf(stderr, "[sendspin] LED %s\n", led_disabled_ ? "disabled" : "enabled");
+    if (!write_json_int(SENDSPIN_CONF, "led_disabled",
+                        led_disabled_ ? 1 : 0)) {
+      fprintf(stderr, "[sendspin] failed to persist LED setting\n");
+    }
+    fprintf(stderr, "[sendspin] LED %s\n",
+            led_disabled_ ? "disabled" : "enabled");
     if (led_disabled_) {
       send_led_idle();
       write_sysfs("/sys/class/leds/RGB_R/brightness", 0);
@@ -545,14 +618,57 @@ class LedColorController {
     led_disabled_ = (val != 0);
   }
 
-  // Call from main loop to handle suppress expiry
+  // Call from the main loop for all Visualizer-driven LED I/O.
   void tick() {
+    const bool pulse = pulse_pending_.exchange(false, std::memory_order_acq_rel);
+    const bool loudness =
+        loudness_pending_.exchange(false, std::memory_order_acq_rel);
+    const uint16_t level =
+        pending_loudness_.load(std::memory_order_relaxed);
+
     std::lock_guard<std::mutex> lock(mu_);
     if (!playing_ || led_disabled_) return;
-    if (suppress_until_ > 0 && now_us() >= suppress_until_) {
+
+    const int64_t now = now_us();
+    if (suppress_until_ > 0 && now >= suppress_until_) {
       suppress_until_ = 0;
       send_led_idle();
       sysfs_mode_ = true;
+    }
+    if (now < suppress_until_) return;
+
+    if (pulse && now - last_pulse_time_ >= 250000) {
+      last_pulse_time_ = now;
+      generate_pulse();
+      return;
+    }
+
+    if (loudness) {
+      if (!sysfs_mode_) {
+        send_led_idle();
+        sysfs_mode_ = true;
+      }
+      if (level > loudness_peak_) loudness_peak_ = level;
+      else loudness_peak_ = loudness_peak_ * 255 / 256;
+      const uint16_t peak = loudness_peak_ > 2000 ? loudness_peak_ : 2000;
+      float norm = static_cast<float>(level) / peak;
+      if (norm > 1.0f) norm = 1.0f;
+      const float target = norm * norm;
+      const float smoothing = target > smooth_bright_ ? 0.7f : 0.6f;
+      smooth_bright_ += (target - smooth_bright_) * smoothing;
+
+      const float scale =
+          std::min(2.5f, 220.0f /
+                    std::max({base_r_, base_g_, base_b_, uint8_t{1}}));
+      write_sysfs("/sys/class/leds/RGB_R/brightness",
+                  static_cast<uint8_t>(
+                      std::min(255.0f, base_r_ * scale * smooth_bright_)));
+      write_sysfs("/sys/class/leds/RGB_G/brightness",
+                  static_cast<uint8_t>(
+                      std::min(255.0f, base_g_ * scale * smooth_bright_)));
+      write_sysfs("/sys/class/leds/RGB_B/brightness",
+                  static_cast<uint8_t>(
+                      std::min(255.0f, base_b_ * scale * smooth_bright_)));
     }
   }
 
@@ -641,13 +757,20 @@ class LedColorController {
         "com._3reality.EventBus.LedShow boolean:false "
         "array:string:\"%s\"", path);
     }
-    (void)system(cmd);
+    const int rc = ::system(cmd);
+    if (rc != 0) {
+      fprintf(stderr, "[sendspin] LED animation command failed: %d\n", rc);
+    }
   }
 
   void send_led_idle() {
-    (void)system("dbus-send --system --type=signal /com/3r/EventBus "
+    const int rc =
+        ::system("dbus-send --system --type=signal /com/3r/EventBus "
                  "com._3reality.EventBus.LedShow boolean:true "
                  "array:string:");
+    if (rc != 0) {
+      fprintf(stderr, "[sendspin] LED idle command failed: %d\n", rc);
+    }
   }
 
   std::mutex mu_;
@@ -659,103 +782,152 @@ class LedColorController {
   bool playing_{false};
   bool sysfs_mode_{false};
   bool led_disabled_{false};
+  std::atomic<bool> pulse_pending_{false};
+  std::atomic<bool> loudness_pending_{false};
+  std::atomic<uint16_t> pending_loudness_{0};
 };
 
 // ============================================================================
-// Player listener — blocking PA audio output
+// Player listener — bounded asynchronous PulseAudio output
 // ============================================================================
 
 class PulsePlayerListener : public PlayerRoleListener {
  public:
-  ~PulsePlayerListener() override { close_pa(true); }
+  PulsePlayerListener() {
+    mainloop_ = pa_threaded_mainloop_new();
+    if (!mainloop_) {
+      fprintf(stderr, "[sendspin] pa_threaded_mainloop_new failed\n");
+      return;
+    }
+    if (pa_threaded_mainloop_start(mainloop_) < 0) {
+      fprintf(stderr, "[sendspin] pa_threaded_mainloop_start failed\n");
+      pa_threaded_mainloop_free(mainloop_);
+      mainloop_ = nullptr;
+      return;
+    }
+
+    pa_threaded_mainloop_lock(mainloop_);
+    create_context_locked();
+    pa_threaded_mainloop_unlock(mainloop_);
+
+    const int volume = read_device_volume();
+    if (volume >= 0 && volume <= 100) {
+      last_volume_.store(volume, std::memory_order_relaxed);
+    }
+  }
+
+  ~PulsePlayerListener() override {
+    shutting_down_.store(true, std::memory_order_release);
+    if (!mainloop_) return;
+
+    pa_threaded_mainloop_lock(mainloop_);
+    close_stream_locked();
+    if (context_) {
+      pa_context_disconnect(context_);
+      pa_context_unref(context_);
+      context_ = nullptr;
+    }
+    pa_threaded_mainloop_unlock(mainloop_);
+    pa_threaded_mainloop_stop(mainloop_);
+    pa_threaded_mainloop_free(mainloop_);
+    mainloop_ = nullptr;
+  }
 
   void set_player(PlayerRole *p) { player_ = p; }
   void set_volume_controller(PulseVolumeController *vc) { vol_ctrl_ = vc; }
   void set_led_controller(LedColorController *lc) { led_ctrl_ = lc; }
 
-  size_t on_audio_write(uint8_t *data, size_t length, uint32_t /*timeout_ms*/) override {
-    if (length == 0) return 0;
+  size_t on_audio_write(uint8_t *data, size_t length,
+                        uint32_t timeout_ms) override {
+    if (length == 0 || !mainloop_ || !player_) return 0;
 
-    if (!pa_.load()) {
-      int64_t now = now_us();
-      if (now - last_open_attempt_us_ < backoff_us_) return length;
-      last_open_attempt_us_ = now;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeout_ms);
 
-      pa_sample_spec ss{PA_SAMPLE_S16LE, 48000, 2};
-      if (player_) {
-        auto &params = player_->get_current_stream_params();
-        if (params.sample_rate.has_value()) ss.rate = params.sample_rate.value();
-        if (params.channels.has_value()) ss.channels = static_cast<uint8_t>(params.channels.value());
+    do {
+      if (shutting_down_.load(std::memory_order_acquire)) return 0;
+
+      size_t written = 0;
+      size_t written_frame_size = 1;
+      pa_usec_t latency_us = 20000;
+
+      pa_threaded_mainloop_lock(mainloop_);
+      if (stream_active_ && ensure_stream_locked()) {
+        const size_t writable = pa_stream_writable_size(stream_);
+        if (writable == static_cast<size_t>(-1)) {
+          fprintf(stderr, "[sendspin] pa_stream_writable_size failed: %s\n",
+                  pa_strerror(pa_context_errno(context_)));
+          close_stream_locked();
+        } else {
+          written = std::min(length, writable);
+          written -= written % frame_size_;
+          written_frame_size = frame_size_;
+          if (written > 0) {
+            write_buffer_.assign(data, data + written);
+            apply_stream_gain(write_buffer_.data(), written);
+            if (pa_stream_write(stream_, write_buffer_.data(), written,
+                                nullptr, 0, PA_SEEK_RELATIVE) < 0) {
+              fprintf(stderr, "[sendspin] pa_stream_write failed: %s\n",
+                      pa_strerror(pa_context_errno(context_)));
+              close_stream_locked();
+              written = 0;
+            } else {
+              int negative = 0;
+              if (pa_stream_get_latency(stream_, &latency_us, &negative) < 0 ||
+                  negative) {
+                latency_us = 20000;
+              }
+            }
+          }
+        }
+      }
+      pa_threaded_mainloop_unlock(mainloop_);
+
+      if (written > 0) {
+        const uint32_t frames =
+            static_cast<uint32_t>(written / written_frame_size);
+        player_->notify_audio_played(frames, now_us() + latency_us);
+        return written;
       }
 
-      uint32_t bytes_per_frame = pa_frame_size(&ss);
-      uint32_t tlength_bytes = ss.rate * bytes_per_frame * 20 / 1000;
-      pa_buffer_attr ba{tlength_bytes * 2, tlength_bytes, 0, (uint32_t)-1, (uint32_t)-1};
-
-      int err = 0;
-      auto *pa = pa_simple_new(nullptr, "sendspin-client", PA_STREAM_PLAYBACK,
-                               nullptr, "Sendspin", &ss, nullptr, &ba, &err);
-      if (pa) {
-        frame_size_ = bytes_per_frame;
-        current_rate_ = ss.rate;
-        current_channels_ = ss.channels;
-        pa_.store(pa);
-        backoff_us_ = kInitialBackoffUs;
-        fprintf(stderr, "[sendspin] opened PA %uHz %uch (frame=%zu, tlength=%ums)\n",
-                ss.rate, ss.channels, frame_size_,
-                tlength_bytes * 1000 / (ss.rate * bytes_per_frame));
-      } else {
-        fprintf(stderr, "[sendspin] pa_simple_new failed: %s\n", pa_strerror(err));
-        backoff_us_ = std::min(backoff_us_ * 2, kMaxBackoffUs);
-        return length;
+      if (timeout_ms == 0 || std::chrono::steady_clock::now() >= deadline) {
+        return 0;
       }
-    }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (std::chrono::steady_clock::now() < deadline);
 
-    auto *pa = pa_.load();
-    size_t aligned = length - (length % frame_size_);
-    if (aligned == 0) return length;
-
-    if (g_ducked.load(std::memory_order_relaxed)) {
-      auto *samples = reinterpret_cast<int16_t *>(data);
-      const size_t count = aligned / sizeof(int16_t);
-      for (size_t i = 0; i < count; ++i)
-        samples[i] = static_cast<int16_t>(samples[i] >> 2);
-    }
-
-    int err = 0;
-    if (pa_simple_write(pa, data, aligned, &err) < 0) {
-      fprintf(stderr, "pa_simple_write: %s\n", pa_strerror(err));
-      close_pa(false);
-      return length;
-    }
-
-    uint32_t frames = static_cast<uint32_t>(aligned / frame_size_);
-    int64_t latency_us = pa_simple_get_latency(pa, nullptr);
-    if (latency_us < 0) latency_us = 0;
-    player_->notify_audio_played(frames, now_us() + latency_us);
-    return aligned;
+    return 0;
   }
 
   void on_stream_start() override {
     fprintf(stderr, "[sendspin] on_stream_start\n");
-    uint32_t new_rate = 0;
-    uint8_t new_channels = 0;
-    if (player_) {
-      auto &p = player_->get_current_stream_params();
-      if (p.sample_rate.has_value()) new_rate = *p.sample_rate;
-      if (p.channels.has_value()) new_channels = static_cast<uint8_t>(*p.channels);
+    if (!mainloop_ || !player_) return;
+
+    const auto &params = player_->get_current_stream_params();
+    if (!params.sample_rate.has_value() || !params.channels.has_value()) {
+      fprintf(stderr, "[sendspin] stream parameters unavailable\n");
+      return;
     }
-    auto *pa = pa_.load();
-    if (pa && new_rate == current_rate_ && new_channels == current_channels_) {
-      pa_simple_flush(pa, nullptr);
-    } else {
-      close_pa(false);
-    }
+
+    pa_threaded_mainloop_lock(mainloop_);
+    stream_active_ = true;
+    next_stream_attempt_us_ = 0;
+    sample_rate_ = *params.sample_rate;
+    channels_ = *params.channels;
+    frame_size_ = static_cast<size_t>(channels_) * sizeof(int16_t);
+    close_stream_locked();
+    ensure_stream_locked();
+    pa_threaded_mainloop_unlock(mainloop_);
   }
 
   void on_stream_end() override {
     fprintf(stderr, "[sendspin] on_stream_end\n");
-    close_pa(false);
+    if (!mainloop_) return;
+
+    pa_threaded_mainloop_lock(mainloop_);
+    stream_active_ = false;
+    close_stream_locked();
+    pa_threaded_mainloop_unlock(mainloop_);
   }
 
   void on_mute_changed(bool muted) override {
@@ -764,56 +936,161 @@ class PulsePlayerListener : public PlayerRoleListener {
   }
 
   void on_volume_changed(uint8_t volume_percent) override {
-    int percent = std::min((int)volume_percent, 100);
-    last_volume_ = percent;
+    const int percent = std::min(static_cast<int>(volume_percent), 100);
+    last_volume_.store(percent, std::memory_order_release);
     if (led_ctrl_) led_ctrl_->suppress(2000000);
     persist_volume(percent);
     fprintf(stderr, "[sendspin] volume: %d%%\n", percent);
   }
 
-  void on_static_delay_changed(uint16_t delay_ms) override {
-    fprintf(stderr, "[sendspin] static_delay: %u ms\n", delay_ms);
+  void on_output_delay_changed(uint16_t delay_ms) override {
+    fprintf(stderr, "[sendspin] output_delay: %u ms\n", delay_ms);
   }
 
   void sync_local_state(PlayerRole &player) {
-    int percent = read_device_volume();
-    if (percent < 0) return;
-    if (percent != last_volume_) {
-      player.update_volume(static_cast<uint8_t>(percent));
-      last_volume_ = percent;
+    const int percent = read_device_volume();
+    if (percent < 0 || percent > 100) return;
+    const bool changed =
+        percent != last_volume_.load(std::memory_order_acquire);
+    if (changed) {
+      last_volume_.store(percent, std::memory_order_release);
       if (led_ctrl_) led_ctrl_->suppress(2000000);
+    }
+    if (changed || player.get_volume() != percent) {
+      player.update_volume(static_cast<uint8_t>(percent));
       fprintf(stderr, "[sendspin] local volume synced: %d%%\n", percent);
     }
   }
 
  private:
-  static constexpr int64_t kInitialBackoffUs = 100'000;
-  static constexpr int64_t kMaxBackoffUs = 5'000'000;
+  static constexpr int64_t kReconnectBackoffUs = 1000000;
 
-  void close_pa(bool drain) {
-    auto *pa = pa_.exchange(nullptr);
-    if (pa) {
-      if (drain) pa_simple_drain(pa, nullptr);
-      else pa_simple_flush(pa, nullptr);
-      pa_simple_free(pa);
-      fprintf(stderr, "[sendspin] closed PulseAudio (%s)\n", drain ? "drain" : "flush");
+  void create_context_locked() {
+    if (!mainloop_ || context_) return;
+    const int64_t now = now_us();
+    if (now < next_connect_attempt_us_) return;
+    next_connect_attempt_us_ = now + kReconnectBackoffUs;
+
+    context_ = pa_context_new(pa_threaded_mainloop_get_api(mainloop_),
+                              "sendspin-client");
+    if (!context_) {
+      fprintf(stderr, "[sendspin] pa_context_new failed\n");
+      return;
     }
-    current_rate_ = 0;
-    current_channels_ = 0;
+    if (pa_context_connect(context_, nullptr, PA_CONTEXT_NOFLAGS, nullptr) < 0) {
+      fprintf(stderr, "[sendspin] pa_context_connect failed: %s\n",
+              pa_strerror(pa_context_errno(context_)));
+      pa_context_unref(context_);
+      context_ = nullptr;
+    }
   }
 
-  std::atomic<pa_simple *> pa_{nullptr};
+  bool ensure_context_locked() {
+    if (context_) {
+      const auto state = pa_context_get_state(context_);
+      if (state == PA_CONTEXT_READY) return true;
+      if (state != PA_CONTEXT_FAILED && state != PA_CONTEXT_TERMINATED) {
+        return false;
+      }
+      close_stream_locked();
+      pa_context_disconnect(context_);
+      pa_context_unref(context_);
+      context_ = nullptr;
+    }
+    create_context_locked();
+    return context_ && pa_context_get_state(context_) == PA_CONTEXT_READY;
+  }
+
+  bool ensure_stream_locked() {
+    if (!stream_active_ || !ensure_context_locked()) return false;
+    if (stream_) {
+      const auto state = pa_stream_get_state(stream_);
+      if (state == PA_STREAM_READY) return true;
+      if (state != PA_STREAM_FAILED && state != PA_STREAM_TERMINATED) {
+        return false;
+      }
+      close_stream_locked();
+    }
+
+    const int64_t now = now_us();
+    if (now < next_stream_attempt_us_) return false;
+    next_stream_attempt_us_ = now + 100000;
+
+    pa_sample_spec spec{PA_SAMPLE_S16LE, sample_rate_, channels_};
+    if (!pa_sample_spec_valid(&spec)) {
+      fprintf(stderr, "[sendspin] invalid PA format %uHz %uch\n",
+              sample_rate_, channels_);
+      return false;
+    }
+
+    pa_proplist *props = pa_proplist_new();
+    if (props) {
+      pa_proplist_sets(props, PA_PROP_APPLICATION_NAME, "sendspin-client");
+      pa_proplist_sets(props, PA_PROP_MEDIA_NAME, "Sendspin");
+    }
+    stream_ = pa_stream_new_with_proplist(context_, "Sendspin", &spec,
+                                          nullptr, props);
+    if (props) pa_proplist_free(props);
+    if (!stream_) {
+      fprintf(stderr, "[sendspin] pa_stream_new failed: %s\n",
+              pa_strerror(pa_context_errno(context_)));
+      return false;
+    }
+
+    const uint32_t bytes_per_frame = pa_frame_size(&spec);
+    const uint32_t target_length = spec.rate * bytes_per_frame * 20 / 1000;
+    pa_buffer_attr attr{target_length * 2, target_length, 0,
+                        static_cast<uint32_t>(-1),
+                        static_cast<uint32_t>(-1)};
+    const auto flags = static_cast<pa_stream_flags_t>(
+        PA_STREAM_INTERPOLATE_TIMING | PA_STREAM_AUTO_TIMING_UPDATE |
+        PA_STREAM_ADJUST_LATENCY);
+    if (pa_stream_connect_playback(stream_, nullptr, &attr, flags, nullptr,
+                                   nullptr) < 0) {
+      fprintf(stderr, "[sendspin] pa_stream_connect_playback failed: %s\n",
+              pa_strerror(pa_context_errno(context_)));
+      close_stream_locked();
+      return false;
+    }
+
+    fprintf(stderr, "[sendspin] opening PA %uHz %uch (frame=%zu)\n",
+            sample_rate_, channels_, frame_size_);
+    return pa_stream_get_state(stream_) == PA_STREAM_READY;
+  }
+
+  void close_stream_locked() {
+    if (!stream_) return;
+    pa_stream_disconnect(stream_);
+    pa_stream_unref(stream_);
+    stream_ = nullptr;
+    fprintf(stderr, "[sendspin] closed PulseAudio stream\n");
+  }
+
+  void apply_stream_gain(uint8_t *data, size_t length) {
+    if (!g_ducked.load(std::memory_order_relaxed)) return;
+    auto *samples = reinterpret_cast<int16_t *>(data);
+    const size_t count = length / sizeof(int16_t);
+    for (size_t i = 0; i < count; ++i) {
+      samples[i] = static_cast<int16_t>(samples[i] >> 2);
+    }
+  }
+
+  pa_threaded_mainloop *mainloop_{nullptr};
+  pa_context *context_{nullptr};
+  pa_stream *stream_{nullptr};
   PlayerRole *player_{nullptr};
   PulseVolumeController *vol_ctrl_{nullptr};
   LedColorController *led_ctrl_{nullptr};
+  std::vector<uint8_t> write_buffer_;
+  std::atomic<int> last_volume_{100};
+  std::atomic<bool> shutting_down_{false};
+  bool stream_active_{false};
+  uint32_t sample_rate_{48000};
+  uint8_t channels_{2};
   size_t frame_size_{4};
-  uint32_t current_rate_{0};
-  uint8_t current_channels_{0};
-  int last_volume_{-1};
-  int64_t last_open_attempt_us_{0};
-  int64_t backoff_us_{kInitialBackoffUs};
+  int64_t next_connect_attempt_us_{0};
+  int64_t next_stream_attempt_us_{0};
 };
-
 // ============================================================================
 // Color listener — applies album color to LED
 // ============================================================================
@@ -836,7 +1113,7 @@ class ColorListener : public ColorRoleListener {
   }
 
   void on_color_clear() override {
-    if (led_) led_->clear();
+    if (led_) led_->reset_color();
   }
 
  private:
@@ -853,18 +1130,25 @@ class VisualizerListener : public VisualizerRoleListener {
 
   void on_visualizer_stream_start(const ServerVisualizerStreamObject &) override {
     fprintf(stderr, "[sendspin] visualizer stream started\n");
+    if (led_) led_->reset_visualizer();
   }
 
   void on_visualizer_stream_end() override {
     fprintf(stderr, "[sendspin] visualizer stream ended\n");
+    if (led_) led_->reset_visualizer();
+  }
+
+  void on_visualizer_stream_clear() override {
+    fprintf(stderr, "[sendspin] visualizer stream cleared\n");
+    if (led_) led_->reset_visualizer();
   }
 
   void on_beat(int64_t, bool) override {
-    if (led_) led_->pulse();
+    if (led_) led_->queue_pulse();
   }
 
   void on_loudness(int64_t, uint16_t loudness) override {
-    if (led_) led_->set_loudness(loudness);
+    if (led_) led_->queue_loudness(loudness);
   }
 
  private:
@@ -995,23 +1279,37 @@ int main(int argc, char *argv[]) {
   SendspinClient::set_log_level(log_level);
 
   SendspinClientConfig config;
-  config.client_id = friendly_name;
   config.name = friendly_name;
   config.product_name = "Voice & Music Assistant";
   config.manufacturer = "ThirdReality";
-  config.software_version = "1.0.0";
-
-  SendspinClient client(std::move(config));
+  config.software_version = SENDSPIN_CLIENT_VERSION;
 
   FilePersistenceProvider persistence;
-  client.set_persistence_provider(&persistence);
-
   PulseVolumeController vol_ctrl;
   LedColorController led_ctrl;
-  led_ctrl.load_led_state();
-
-  // Player
   PulsePlayerListener player_listener;
+  SimpleMetadataListener metadata_listener;
+  ControllerListener controller_listener;
+  ColorListener color_listener;
+  VisualizerListener visualizer_listener;
+  HostNetworkProvider network;
+  MainClientListener client_listener;
+
+  led_ctrl.load_led_state();
+  player_listener.set_volume_controller(&vol_ctrl);
+  player_listener.set_led_controller(&led_ctrl);
+  metadata_listener.set_led(&led_ctrl);
+  controller_listener.set_led(&led_ctrl);
+  color_listener.set_led(&led_ctrl);
+  visualizer_listener.set_led(&led_ctrl);
+  client_listener.set_led(&led_ctrl);
+
+  SendspinClient client(std::move(config));
+  client.set_persistence_provider(&persistence);
+  client.set_unpaired_access_enabled(kUnpairedAccess);
+  client.set_network_provider(&network);
+  client.set_listener(&client_listener);
+
   PlayerRoleConfig player_config;
   player_config.audio_formats = {
       {SendspinCodecFormat::FLAC, 2, 44100, 16},
@@ -1021,56 +1319,44 @@ int main(int argc, char *argv[]) {
       {SendspinCodecFormat::PCM, 2, 44100, 16},
       {SendspinCodecFormat::PCM, 2, 48000, 16},
   };
-  auto saved_delay = persistence.load_static_delay();
-  if (saved_delay.has_value()) player_config.initial_static_delay_ms = *saved_delay;
   auto &player = client.add_player(std::move(player_config));
-  player.set_static_delay_adjustable(true);
+  player.set_output_delay_adjustable(true);
   player_listener.set_player(&player);
-  player_listener.set_volume_controller(&vol_ctrl);
-  player_listener.set_led_controller(&led_ctrl);
   player.set_listener(&player_listener);
   const int initial_volume = read_device_volume();
   if (initial_volume >= 0 && initial_volume <= 100) {
     player.update_volume(static_cast<uint8_t>(initial_volume));
   }
 
-  // Metadata
-  SimpleMetadataListener metadata_listener;
-  metadata_listener.set_led(&led_ctrl);
   auto &metadata = client.add_metadata();
   metadata.set_listener(&metadata_listener);
 
-  // Controller
-  ControllerListener controller_listener;
-  controller_listener.set_led(&led_ctrl);
   auto &controller = client.add_controller();
   controller.set_listener(&controller_listener);
 
-  // Color
-  ColorListener color_listener;
-  color_listener.set_led(&led_ctrl);
   auto &color = client.add_color();
   color.set_listener(&color_listener);
 
-  // Visualizer
-  VisualizerListener visualizer_listener;
-  visualizer_listener.set_led(&led_ctrl);
   VisualizerRoleConfig viz_config;
-  viz_config.support.types = {VisualizerDataType::BEAT, VisualizerDataType::LOUDNESS};
   viz_config.support.buffer_capacity = 8192;
-  viz_config.support.rate_max = 30;
+  viz_config.stream.types = {
+      VisualizerDataType::BEAT,
+      VisualizerDataType::LOUDNESS,
+  };
+  viz_config.stream.rate_max = 30;
   auto &visualizer = client.add_visualizer(std::move(viz_config));
   visualizer.set_listener(&visualizer_listener);
 
-  // Client
-  HostNetworkProvider network;
-  MainClientListener client_listener;
-  client_listener.set_led(&led_ctrl);
-  client.set_network_provider(&network);
-  client.set_listener(&client_listener);
-
-  client.start_server();
-  fprintf(stderr, "[sendspin] listening as \"%s\"\n", friendly_name.c_str());
+  fprintf(stderr,
+          "[sendspin] client %s starting (protocol=1.0.0-rc1 access=%s)\n",
+          SENDSPIN_CLIENT_VERSION,
+          kUnpairedAccess ? "unpaired" : "paired-only");
+  if (!client.start()) {
+    fprintf(stderr, "[sendspin] client start failed\n");
+    return 1;
+  }
+  fprintf(stderr, "[sendspin] listening as \"%s\" (id=%s)\n",
+          friendly_name.c_str(), client.client_id().c_str());
   if (!connect_url.empty()) client.connect_to(connect_url);
 
   // Control socket: tap commands arrive from lva, which owns the tap key.
@@ -1079,6 +1365,18 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "[sendspin] control socket unavailable; "
                     "tap commands disabled\n");
   }
+
+  int64_t last_controller_failure_us = 0;
+  auto send_controller_command =
+      [&](SendspinControllerCommand command, const char *name) {
+        if (controller.send_command({.command = command})) return;
+        const int64_t now = now_us();
+        if (now - last_controller_failure_us >= 5000000) {
+          last_controller_failure_us = now;
+          fprintf(stderr, "[sendspin] controller command rejected: %s\n",
+                  name);
+        }
+      };
 
   int poll_count = 0;
   while (g_running) {
@@ -1089,11 +1387,11 @@ int main(int argc, char *argv[]) {
       if (strcmp(cmd, "MUSIC_TOGGLE") == 0) {
         if (client.get_group_state().playback_state ==
             SendspinPlaybackState::PLAYING)
-          controller.send_command({.command = SendspinControllerCommand::PAUSE});
+          send_controller_command(SendspinControllerCommand::PAUSE, "PAUSE");
         else
-          controller.send_command({.command = SendspinControllerCommand::PLAY});
+          send_controller_command(SendspinControllerCommand::PLAY, "PLAY");
       } else if (strcmp(cmd, "PAUSE") == 0) {
-        controller.send_command({.command = SendspinControllerCommand::PAUSE});
+        send_controller_command(SendspinControllerCommand::PAUSE, "PAUSE");
       } else if (strcmp(cmd, "LED_TOGGLE") == 0) {
         led_ctrl.toggle_enabled();
       } else if (strcmp(cmd, "DUCK") == 0) {
@@ -1112,6 +1410,6 @@ int main(int argc, char *argv[]) {
 
   fprintf(stderr, "[sendspin] shutting down\n");
   led_ctrl.clear();
-  client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+  client.stop();
   return 0;
 }
