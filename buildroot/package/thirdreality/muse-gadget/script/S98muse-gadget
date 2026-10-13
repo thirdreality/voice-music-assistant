@@ -1,0 +1,64 @@
+#!/bin/sh
+
+DAEMON=/usr/bin/muse-gadget
+PIDFILE=/var/run/thirdreality/muse-gadget.pid
+STATE_DIR=/data/conf/muse
+LOGFILE=/tmp/muse-gadget.log
+TTS_HOST=
+TTS_PORT=10200
+TTS_VOICE=
+CHAT_MODE=main
+if [ -r /etc/default/muse-gadget ]; then
+    . /etc/default/muse-gadget
+fi
+
+if [ -t 1 ]; then
+    C_STEP=$(printf '\033[1;36m')
+    C_OK=$(printf '\033[32m')
+    C_WARN=$(printf '\033[33m')
+    C_ERR=$(printf '\033[31m')
+    C_DIM=$(printf '\033[2m')
+    C_R=$(printf '\033[0m')
+else
+    C_STEP=''; C_OK=''; C_WARN=''; C_ERR=''; C_DIM=''; C_R=''
+fi
+
+start() {
+    printf '%s[1/2]%s Starting Muse gadget service...\n' "$C_STEP" "$C_R"
+    if [ ! -r "$STATE_DIR/sdk-token" ]; then
+        printf '%s!%s Skipped: %s is missing.\n' "$C_WARN" "$C_R" "$STATE_DIR/sdk-token"
+        return 0
+    fi
+    install -d -m 0700 "$STATE_DIR" /var/run/thirdreality
+    if start-stop-daemon --start --quiet --background --make-pidfile \
+        --pidfile "$PIDFILE" --exec "$DAEMON" -- \
+        --state-dir "$STATE_DIR" --sdk-token-file "$STATE_DIR/sdk-token" \
+        --log-file "$LOGFILE" --tts-host "$TTS_HOST" --tts-port "$TTS_PORT" \
+        --tts-voice "$TTS_VOICE" --chat-mode "$CHAT_MODE"; then
+        printf '%s[2/2]%s %s+%s Muse gadget service started.\n' \
+            "$C_STEP" "$C_R" "$C_OK" "$C_R"
+        printf '   %-8s: %s%s%s\n' PID "$C_DIM" "$(cat "$PIDFILE")" "$C_R"
+        printf '   %-8s: %s%s%s\n' Control "$C_DIM" /tmp/muse-gadget-control.sock "$C_R"
+        printf '   %-8s: %s%s%s\n' Log "$C_DIM" "$LOGFILE" "$C_R"
+        printf '   %-8s: %s\n' Next 'tail -f /tmp/muse-gadget.log'
+    else
+        printf '%sError:%s failed to start Muse gadget service.\n' "$C_ERR" "$C_R" >&2
+        return 1
+    fi
+}
+
+stop() {
+    printf '%s[1/1]%s Stopping Muse gadget service...\n' "$C_STEP" "$C_R"
+    start-stop-daemon --stop --quiet --oknodo --retry=TERM/5/KILL/2 \
+        --pidfile "$PIDFILE" --exec "$DAEMON"
+    rm -f "$PIDFILE"
+    printf '%s+%s Muse gadget service stopped.\n' "$C_OK" "$C_R"
+    printf '   %-8s: %s\n' Next '/etc/init.d/S98muse-gadget start'
+}
+
+case "${1:-}" in
+    start) start ;;
+    stop) stop ;;
+    restart) stop; start ;;
+    *) printf 'Usage: %s {start|stop|restart}\n' "$0"; exit 1 ;;
+esac

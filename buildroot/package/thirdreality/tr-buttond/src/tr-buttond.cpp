@@ -47,6 +47,8 @@ constexpr const char* kInputDeviceName = "gpio_keypad";
 constexpr const char* kAdckeyScript   = "/etc/adckey/adckey_function.sh";
 constexpr const char* kLvaSocket      = "/tmp/lva-control.sock";
 constexpr const char* kSendspinSocket = "/tmp/sendspin-control.sock";
+constexpr const char* kMuseSocket     = "/tmp/muse-gadget-control.sock";
+constexpr const char* kMuseState      = "/data/conf/muse/pairing.json";
 
 // Key codes (see /etc/gpio_key.kl).
 constexpr int kKeyVoldown = 114;
@@ -135,6 +137,8 @@ bool SendTo(const char* socket_path, const char* cmd) {
     const ssize_t n = ::sendto(fd, cmd, std::strlen(cmd), MSG_NOSIGNAL,
                                reinterpret_cast<struct sockaddr*>(&addr),
                                sizeof(addr));
+    fprintf(stderr, "[buttond] SendTo %s cmd=%s n=%zd errno=%d\n",
+            socket_path, cmd, n, (n < 0 ? errno : 0));
     ::close(fd);
     return n >= 0;
 }
@@ -153,6 +157,7 @@ void OnTap(int taps) {
 }
 
 void OnHome(int taps) {
+    if (::access(kMuseState, R_OK) == 0) return;
     const char* cmd = (taps == 1)   ? "HOME_SINGLE"
                       : (taps == 2)  ? "HOME_DOUBLE"
                                      : "HOME_TRIPLE";
@@ -277,11 +282,25 @@ void HandleKey(const struct input_event& ev, int64_t now_ms,
                GestureKey& tap_key, GestureKey& home_key,
                SimpleKey& volup_key, SimpleKey& voldown_key,
                SimpleKey& mute_key) {
+    // Keep a paired Home gesture exclusively in Muse, including release.
+    static bool muse_home_active = false;
     // ev.value: 1 = down, 0 = up, 2 = autorepeat (ignored).
     const int code = ev.code;
 
     if (ev.value == 2) return;  // ignore kernel autorepeat
     const bool down = (ev.value == 1);
+    fprintf(stderr, "[buttond] key code=%d value=%d\n", code, ev.value);
+    if (code == kKeyHome) {
+        if (down && ::access(kMuseState, R_OK) == 0 && SendTo(kMuseSocket, "BUTTON_DOWN")) {
+            muse_home_active = true;
+            return;
+        }
+        if (!down && muse_home_active) {
+            SendTo(kMuseSocket, "BUTTON_UP");
+            muse_home_active = false;
+            return;
+        }
+    }
 
     switch (code) {
         case kKeyTap:

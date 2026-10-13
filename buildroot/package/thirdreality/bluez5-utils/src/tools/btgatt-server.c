@@ -37,6 +37,8 @@
 #include <sys/select.h>
 #include <sys/signal.h>
 #include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <cjson/cJSON.h>
 
 #include "lib/bluetooth.h"
@@ -77,6 +79,13 @@ static const char *get_device_name(void);
 #define IMPROV_CHAR_RESULT_UUID_STR "00467768-6228-2272-4663-277478268004"
 #define IMPROV_CHAR_CAPS_UUID_STR "00467768-6228-2272-4663-277478268005"
 
+#define MUSE_SERVICE_UUID_STR "7fdd3d1c-38ea-46cf-8b46-314ecf5f240c"
+#define MUSE_RX_UUID_STR "4d593029-28a2-4a6e-a1f0-3c2d5e8f9b01"
+#define MUSE_TX_UUID_STR "d75dc4ca-7b2b-4e9c-8f0a-1d2e3f4a5b6c"
+#define MUSE_CONTROL_SOCKET "/tmp/muse-gadget-control.sock"
+#define MUSE_CHUNK_MAGIC 0xFE
+#define MUSE_MAX_MESSAGE 8192
+
 #define ATT_CID 4
 
 static struct hci_dev_info hdi;
@@ -96,7 +105,13 @@ struct server {
 	bool state_notify_enabled;
 	bool error_notify_enabled;
 	bool result_notify_enabled;
+	bool muse_notify_enabled;
 	pthread_mutex_t notification_lock;
+
+	uint8_t muse_buffer[MUSE_MAX_MESSAGE];
+	size_t muse_buffer_len;
+	uint8_t muse_chunk_count;
+	uint8_t muse_next_chunk;
 
 	// BLE GATT long write buffer for RPC
 #define MAX_WRITE_BUFFER 1024
@@ -116,6 +131,12 @@ static struct {
 	uint16_t state_value_handle;
 	uint16_t error_value_handle;
 } improv_chars;
+
+static struct {
+	struct gatt_db_attribute *rx;
+	struct gatt_db_attribute *tx;
+	uint16_t tx_value_handle;
+} muse_chars;
 
 // Global state management variables
 static bool client_connected = false;
@@ -776,6 +797,8 @@ static void cccd_read_cb(struct gatt_db_attribute *attrib, unsigned int id, uint
 		value[0] = 0x01;
 	else if (cccd_handle == improv_chars.result_handle + 1 && server->result_notify_enabled)
 		value[0] = 0x01;
+	else if (cccd_handle == muse_chars.tx_value_handle + 1 && server->muse_notify_enabled)
+		value[0] = 0x01;
 
 	pthread_mutex_unlock(&server->notification_lock);
 
@@ -809,6 +832,8 @@ static void cccd_write_cb(struct gatt_db_attribute *attrib, unsigned int id, uin
 		server->error_notify_enabled = enabled;
 	else if (cccd_handle == improv_chars.result_handle + 1)
 		server->result_notify_enabled = enabled;
+	else if (cccd_handle == muse_chars.tx_value_handle + 1)
+		server->muse_notify_enabled = enabled;
 
 	pthread_mutex_unlock(&server->notification_lock);
 	gatt_db_attribute_write_result(attrib, id, 0);
@@ -925,6 +950,168 @@ static void improv_read_result_cb(struct gatt_db_attribute *attrib, unsigned int
 {
 	/* Result is empty until RPC command is processed */
 	gatt_db_attribute_read_result(attrib, id, 0, NULL, 0);
+}
+
+
+static void muse_notify_json(struct server *server, const uint8_t *data, size_t len)
+{
+	uint16_t mtu = bt_gatt_server_get_mtu(server->gatt);
+	size_t usable = mtu > 6 ? mtu - 6 : 0;
+	size_t total, i;
+	uint8_t packet[520];
+
+	if (!server->muse_notify_enabled || usable == 0)
+		return;
+	if (usable > sizeof(packet) - 3)
+		usable = sizeof(packet) - 3;
+	total = (len + usable - 1) / usable;
+	if (total == 0 || total > 255)
+		return;
+	for (i = 0; i < total; i++) {
+		size_t offset = i * usable;
+		size_t part = len - offset > usable ? usable : len - offset;
+		packet[0] = MUSE_CHUNK_MAGIC;
+		packet[1] = (uint8_t)i;
+		packet[2] = (uint8_t)total;
+		memcpy(packet + 3, data + offset, part);
+		bt_gatt_server_send_notification(server->gatt, muse_chars.tx_value_handle,
+						 packet, part + 3, false);
+		if (i + 1 < total)
+			usleep(50000);
+	}
+}
+
+static void muse_dispatch(struct server *server, const uint8_t *data, size_t len)
+{
+	struct sockaddr_un local = { 0 }, remote = { 0 };
+	struct timeval first = { .tv_sec = 10 };
+	struct timeval next = { .tv_sec = 2 };
+	char local_path[sizeof(local.sun_path)];
+	uint8_t response[MUSE_MAX_MESSAGE];
+	int fd;
+	ssize_t n;
+	bool got_any = false;
+
+	fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	if (fd < 0) {
+		static const uint8_t error[] = "{\"status\":\"error_pairing_unavailable\"}";
+		muse_notify_json(server, error, sizeof(error) - 1);
+		return;
+	}
+	snprintf(local_path, sizeof(local_path), "/tmp/muse-gatt-%ld.sock", (long)getpid());
+	unlink(local_path);
+	local.sun_family = AF_UNIX;
+	strncpy(local.sun_path, local_path, sizeof(local.sun_path) - 1);
+	remote.sun_family = AF_UNIX;
+	strncpy(remote.sun_path, MUSE_CONTROL_SOCKET, sizeof(remote.sun_path) - 1);
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &first, sizeof(first));
+	if (bind(fd, (struct sockaddr *)&local, sizeof(local)) < 0 ||
+	    sendto(fd, data, len, MSG_NOSIGNAL,
+		   (struct sockaddr *)&remote, sizeof(remote)) < 0) {
+		close(fd);
+		unlink(local_path);
+		static const uint8_t error[] = "{\"status\":\"error_pairing_unavailable\"}";
+		muse_notify_json(server, error, sizeof(error) - 1);
+		return;
+	}
+
+	/*
+	 * One request may yield several responses (e.g. provision_v2 streams
+	 * wifi_connecting -> wifi_connected -> auth_ok). Forward each datagram
+	 * as it arrives, then stop after a short idle gap.
+	 */
+	for (;;) {
+		n = recv(fd, response, sizeof(response), 0);
+		if (n <= 0)
+			break;
+		muse_notify_json(server, response, (size_t)n);
+		got_any = true;
+		setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &next, sizeof(next));
+	}
+
+	close(fd);
+	unlink(local_path);
+	if (!got_any) {
+		static const uint8_t error[] = "{\"status\":\"error_pairing_unavailable\"}";
+		muse_notify_json(server, error, sizeof(error) - 1);
+	}
+}
+
+static void muse_rx_write_cb(struct gatt_db_attribute *attrib, unsigned int id,
+			     uint16_t offset, const uint8_t *value, size_t len,
+			     uint8_t opcode, struct bt_att *att, void *user_data)
+{
+	struct server *server = user_data;
+	(void)opcode;
+	(void)att;
+	if (offset != 0 || len == 0) {
+		gatt_db_attribute_write_result(attrib, id, BT_ATT_ERROR_INVALID_OFFSET);
+		return;
+	}
+	if (value[0] != MUSE_CHUNK_MAGIC) {
+		muse_dispatch(server, value, len);
+	} else if (len >= 3) {
+		uint8_t index = value[1], total = value[2];
+		if (index == 0) {
+			server->muse_buffer_len = 0;
+			server->muse_chunk_count = total;
+			server->muse_next_chunk = 0;
+		}
+		if (total == 0 || total != server->muse_chunk_count ||
+		    index != server->muse_next_chunk ||
+		    server->muse_buffer_len + len - 3 > sizeof(server->muse_buffer)) {
+			server->muse_buffer_len = 0;
+			server->muse_chunk_count = 0;
+		} else {
+			memcpy(server->muse_buffer + server->muse_buffer_len, value + 3, len - 3);
+			server->muse_buffer_len += len - 3;
+			server->muse_next_chunk++;
+			if (server->muse_next_chunk == total) {
+				muse_dispatch(server, server->muse_buffer, server->muse_buffer_len);
+				server->muse_buffer_len = 0;
+				server->muse_chunk_count = 0;
+			}
+		}
+	}
+	gatt_db_attribute_write_result(attrib, id, 0);
+}
+
+static void muse_tx_read_cb(struct gatt_db_attribute *attrib, unsigned int id,
+			    uint16_t offset, uint8_t opcode, struct bt_att *att,
+			    void *user_data)
+{
+	(void)opcode;
+	(void)att;
+	(void)user_data;
+	if (offset != 0) {
+		gatt_db_attribute_read_result(attrib, id, BT_ATT_ERROR_INVALID_OFFSET, NULL, 0);
+		return;
+	}
+	gatt_db_attribute_read_result(attrib, id, 0, NULL, 0);
+}
+
+static void populate_muse_service(struct server *server)
+{
+	struct gatt_db_attribute *service, *characteristic;
+	bt_uuid_t uuid;
+	parse_uuid_string(MUSE_SERVICE_UUID_STR, &uuid);
+	service = gatt_db_add_service(server->db, &uuid, true, 8);
+	if (!service)
+		return;
+	parse_uuid_string(MUSE_RX_UUID_STR, &uuid);
+	muse_chars.rx = gatt_db_service_add_characteristic(
+		service, &uuid, BT_ATT_PERM_WRITE,
+		BT_GATT_CHRC_PROP_WRITE | BT_GATT_CHRC_PROP_WRITE_WITHOUT_RESP,
+		NULL, muse_rx_write_cb, server);
+	parse_uuid_string(MUSE_TX_UUID_STR, &uuid);
+	characteristic = gatt_db_service_add_characteristic(
+		service, &uuid, BT_ATT_PERM_READ,
+		BT_GATT_CHRC_PROP_READ | BT_GATT_CHRC_PROP_NOTIFY,
+		muse_tx_read_cb, NULL, server);
+	gatt_db_service_add_ccc(characteristic, BT_ATT_PERM_READ | BT_ATT_PERM_WRITE);
+	muse_chars.tx = characteristic;
+	muse_chars.tx_value_handle = gatt_db_attribute_get_handle(characteristic);
+	gatt_db_service_set_active(service, true);
 }
 
 static void populate_improv_service(struct server *server)
@@ -1061,6 +1248,7 @@ static struct server *server_create(int fd)
 	populate_gap_service(server);
 	populate_gatt_service(server);
 	populate_improv_service(server);
+	populate_muse_service(server);
 
 	return server;
 }
@@ -1348,7 +1536,8 @@ static void set_adv_enable(int enable)
 static void set_adv_response(void)
 {
 	struct bt_hci_cmd_le_set_scan_rsp_data param;
-	const char *device_name = get_device_name();
+	const char *device_name = access("/data/conf/muse/sdk-token", R_OK) == 0
+		? "MuseGadget-3RSPK" : get_device_name();
 
 	memset(&param, 0, sizeof(param));
 	param.len = 0;
@@ -1379,9 +1568,11 @@ static void set_adv_data(void)
 	param.data[param.len++] = 0x01;
 	param.data[param.len++] = 0x06;
 
-	// Improv Service UUID 128-bit (18 bytes) - REQUIRED by Improv spec
+	// Advertise Muse when configured; both services remain in the GATT database.
 	uint8_t uuid_bytes[16];
-	uuid_str_to_le_bytes(IMPROV_SERVICE_UUID_STR, uuid_bytes);
+	const char *advertised_uuid = access("/data/conf/muse/sdk-token", R_OK) == 0
+		? MUSE_SERVICE_UUID_STR : IMPROV_SERVICE_UUID_STR;
+	uuid_str_to_le_bytes(advertised_uuid, uuid_bytes);
 	param.data[param.len++] = 17;
 	param.data[param.len++] = 0x07;  // Complete List of 128-bit Service UUIDs
 	memcpy(&param.data[param.len], uuid_bytes, 16);
