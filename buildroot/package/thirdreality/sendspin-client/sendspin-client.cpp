@@ -257,6 +257,27 @@ static bool send_volume_to_lva(int volume) {
   return n == 2 && std::memcmp(reply, "OK", 2) == 0;
 }
 
+// Notify lva of external Sendspin playback transitions so it can gate the
+// AEC echo canceller (and the linear-AEC shadow wake path) on actual Music
+// Assistant playback. Fire-and-forget: lva binds the socket and may be down.
+static void send_playback_state_to_lva(bool playing) {
+  const int fd = ::socket(AF_UNIX,
+                          SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+  if (fd < 0) return;
+
+  struct sockaddr_un peer{};
+  peer.sun_family = AF_UNIX;
+  std::strncpy(peer.sun_path, LVA_CONTROL_PATH, sizeof(peer.sun_path) - 1);
+
+  const char *command = playing ? "SENDSPIN_PLAYING:1" : "SENDSPIN_PLAYING:0";
+  if (::sendto(fd, command, std::strlen(command), MSG_NOSIGNAL,
+               reinterpret_cast<struct sockaddr *>(&peer),
+               sizeof(peer)) < 0) {
+    // Expected when lva is not running (no bound socket); drop silently.
+  }
+  ::close(fd);
+}
+
 static void persist_volume(int vol) {
   if (vol < 0) vol = 0;
   if (vol > 100) vol = 100;
@@ -922,6 +943,8 @@ class MainClientListener : public SendspinClientListener {
       auto state = *group.playback_state;
       fprintf(stderr, "[sendspin] group playback: %s\n",
               state == SendspinPlaybackState::PLAYING ? "playing" : "stopped");
+      const bool playing = (state == SendspinPlaybackState::PLAYING);
+      send_playback_state_to_lva(playing);
       if (state == SendspinPlaybackState::STOPPED && led_) led_->clear();
       else if (state == SendspinPlaybackState::PLAYING && led_) led_->resume();
     }
@@ -994,6 +1017,7 @@ int main(int argc, char *argv[]) {
       {SendspinCodecFormat::FLAC, 2, 44100, 16},
       {SendspinCodecFormat::FLAC, 2, 48000, 16},
       {SendspinCodecFormat::OPUS, 2, 48000, 16},
+      {SendspinCodecFormat::OPUS, 1, 48000, 16},
       {SendspinCodecFormat::PCM, 2, 44100, 16},
       {SendspinCodecFormat::PCM, 2, 48000, 16},
   };

@@ -47,6 +47,11 @@ class LibMpvPlayer final : public IAudioPlayer {
     static void OnMpvWakeupTrampoline(void* opaque);
     void        ReadDrainWakeupFd();
 
+    // Set state and fire on_state_changed_ on transition. Used by both the
+    // mpv event path and Play/Pause/Resume so the AEC far-end gate is always
+    // notified. All callers run on the main event-loop thread.
+    void        SetState(PlayerState new_state);
+
     mpv_handle* mpv_      = nullptr;
     int  wakeup_read_fd_  = -1;
     int  wakeup_write_fd_ = -1;

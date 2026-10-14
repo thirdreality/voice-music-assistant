@@ -23,6 +23,8 @@ constexpr int kMaxSlidingWindow = 256;
 MicroWakeWord::MicroWakeWord() = default;
 MicroWakeWord::~MicroWakeWord() = default;
 
+std::atomic<bool> MicroWakeWord::far_end_telemetry_{false};
+
 std::unique_ptr<MicroWakeWord> MicroWakeWord::FromConfig(
     const std::filesystem::path& json_path) {
     std::ifstream f(json_path);
@@ -225,9 +227,41 @@ bool MicroWakeWord::Process(const float* frames,
                               probabilities_.end(), 0.0f)
                           / static_cast<float>(probabilities_.size());
         const float cutoff = cutoff_live_.load(std::memory_order_relaxed);
+
+        // Diagnostic score telemetry. Skip quiet frames so the log is not
+        // flooded with mean=0.000; a sparse heartbeat still shows liveness.
+        {
+            const bool far_end =
+                far_end_telemetry_.load(std::memory_order_relaxed);
+            ++score_log_counter_;
+
+            constexpr float kQuietFloor = 0.02f;
+            constexpr unsigned int kHeartbeat = 1000u;
+
+            const bool active =
+                (prob >= kQuietFloor) || (mean >= kQuietFloor);
+            const bool heartbeat =
+                (score_log_counter_ % kHeartbeat) == 0u;
+
+            if (active || heartbeat) {
+                LVA_LOGD(kTag,
+                         "[%s/%s] far_end=%d score raw=%.3f mean=%.3f cutoff=%.3f%s",
+                         source_tag_.empty() ? "?" : source_tag_.c_str(),
+                         cfg_.id.c_str(), far_end ? 1 : 0, prob, mean, cutoff,
+                         (!active && heartbeat) ? " (heartbeat)" : "");
+            }
+        }
+
         if (mean > cutoff) {
-            LVA_LOGD(kTag, "[%s] detected (mean=%.3f cutoff=%.3f)",
-                     cfg_.id.c_str(), mean, cutoff);
+            // Per-frame hit: fires on every frame above cutoff for the whole
+            // ~0.5 s utterance. DEBUG only; the single wake event is logged
+            // upstream ("starting voice pipeline").
+            LVA_LOGD(kTag,
+                     "[%s/%s] far_end=%d DETECTED mean=%.3f cutoff=%.3f raw=%.3f",
+                     source_tag_.empty() ? "?" : source_tag_.c_str(),
+                     cfg_.id.c_str(),
+                     far_end_telemetry_.load(std::memory_order_relaxed) ? 1 : 0,
+                     mean, cutoff, prob);
             detected = true;
         }
     }

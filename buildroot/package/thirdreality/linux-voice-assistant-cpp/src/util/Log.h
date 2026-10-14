@@ -1,6 +1,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdio>
 #include <string>
 #include <string_view>
@@ -18,6 +19,11 @@ void SetLevel(Level level) noexcept;
 Level GetLevel() noexcept;
 
 void Write(Level level, std::string_view tag, std::string_view message) noexcept;
+
+// Mirror log output to a file as well as stderr. Creates the parent dir,
+// rotates once to "<path>.1" past max_bytes. Non-fatal on open failure;
+// empty path disables the file sink.
+void SetLogFile(std::string_view path, std::size_t max_bytes = 1u << 20) noexcept;
 
 namespace detail {
 
