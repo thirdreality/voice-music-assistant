@@ -66,6 +66,10 @@ class Satellite {
                       const std::string& preannounce_media_id,
                       bool start_conversation);
 
+    // Runs the stop-word handling on the main thread (posted from
+    // OnStopDetected via pending_stop_).
+    void ProcessStopDetected();
+
     void StartTimerRing();
     void StopTimerRing();
     void OnTimerSoundEof();
@@ -85,6 +89,10 @@ class Satellite {
 
     std::atomic<bool> pending_wake_{false};
     PendingWake       pending_wake_data_;
+
+    // Set from the wake-word engine thread when the stop word fires;
+    // consumed on the main thread in OnLoopTick (mirrors pending_wake_).
+    std::atomic<bool> pending_stop_{false};
 
     // Pipeline state. Mostly mirrors the Python class's flags.
     // These are accessed from both the main epoll thread (OnVoiceEvent,

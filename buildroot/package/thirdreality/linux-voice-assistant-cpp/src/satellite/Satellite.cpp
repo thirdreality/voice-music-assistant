@@ -78,6 +78,13 @@ void Satellite::OnWakeDetected(const std::string& model_id, float prob) {
 }
 
 void Satellite::OnStopDetected() {
+    // Called on the wake-word engine thread. Do not touch non-atomic
+    // members here; just post the event and let OnLoopTick handle it on
+    // the main thread (mirrors the pending_wake_ pattern).
+    pending_stop_.store(true, std::memory_order_release);
+}
+
+void Satellite::ProcessStopDetected() {
     if (!pipeline_active_ && !timer_ringing_) return;
 
     // Timer stop must always remain immediate. For an ordinary voice
@@ -594,6 +601,11 @@ void Satellite::OnLoopTick() {
         const PendingWake snap = pending_wake_data_;
         pending_wake_.store(false, std::memory_order_relaxed);
         StartPipeline(snap.model_id);
+    }
+
+    // Consume pending stop-word event, if any.
+    if (pending_stop_.exchange(false, std::memory_order_acq_rel)) {
+        ProcessStopDetected();
     }
 
     // Open the mic for a continued conversation once the settle delay elapses.
