@@ -72,6 +72,7 @@ class Satellite {
     void Duck();
     void Unduck();
 
+
     struct PendingWake {
         std::string model_id;
         float       prob = 0.0f;
@@ -109,6 +110,11 @@ class Satellite {
     bool   ducked_           = false;
 
     std::atomic<std::int64_t> refractory_until_ns_{0};
+
+    // Ignore stop-word detections briefly after a fresh wake.
+    // This prevents the wake chime / transition itself from aborting
+    // the pipeline before HA streaming has opened.
+    std::atomic<std::int64_t> stop_guard_until_ns_{0};
 
     std::map<std::string, lva::audio::ExternalWakeWordInfo>
         external_wake_words_;

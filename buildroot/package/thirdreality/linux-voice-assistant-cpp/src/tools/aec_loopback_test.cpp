@@ -99,6 +99,8 @@ struct Options {
     int         ns_level    = 2;     // 0=off, 1..4 = APM NS level
     bool        hpf_enabled = true;
     int         stream_delay_ms = 0;
+    int         agc_db          = 0;    // production fixed-digital AGC, 0=off
+    int         mic_volume      = 100;  // post-APM percent multiplier, 100=unity
 
     // --play <wav>: tool spawns "aplay -Dhw:0,1 <wav>" before opening
     // capture, sleeps --play-delay ms, then opens the capture stream.
@@ -126,6 +128,8 @@ void PrintUsage(const char* argv0) {
         "  --no-hpf                Disable high-pass filter\n"
         "  --ns-level <0-4>        Noise suppression level (default 2; 0=off)\n"
         "  --stream-delay-ms <n>   Hint to AEC; 0 is right for hw loopback\n"
+        "  --agc-db <0-31>          Fixed-digital WebRTC AGC gain (default 0)\n"
+        "  --mic-volume <1-4000>    Post-APM percent gain (default 100)\n"
         "  --play <file.wav>       Spawn aplay on this WAV before opening\n"
         "                          capture (loops in a child process; killed\n"
         "                          on exit). Loopback DAI requires playback\n"
@@ -150,6 +154,8 @@ bool ParseCli(int argc, char** argv, Options& out) {
         {"no-hpf",          no_argument,       nullptr, 'H'},
         {"ns-level",        required_argument, nullptr, 'n'},
         {"stream-delay-ms", required_argument, nullptr, 'D'},
+        {"agc-db",          required_argument, nullptr, 'G'},
+        {"mic-volume",      required_argument, nullptr, 'M'},
         {"play",            required_argument, nullptr, 'P'},
         {"play-device",     required_argument, nullptr, 'V'},
         {"play-delay-ms",   required_argument, nullptr, 'L'},
@@ -169,6 +175,8 @@ bool ParseCli(int argc, char** argv, Options& out) {
             case 'H': out.hpf_enabled = false; break;
             case 'n': out.ns_level = std::atoi(optarg); break;
             case 'D': out.stream_delay_ms = std::atoi(optarg); break;
+            case 'G': out.agc_db = std::atoi(optarg); break;
+            case 'M': out.mic_volume = std::atoi(optarg); break;
             case 'P': out.play_wav = optarg; break;
             case 'V': out.play_device = optarg; break;
             case 'L': out.play_delay_ms = std::atoi(optarg); break;
@@ -200,6 +208,14 @@ bool ParseCli(int argc, char** argv, Options& out) {
     }
     if (out.ns_level < 0 || out.ns_level > 4) {
         std::fprintf(stderr, "--ns-level out of range\n");
+        return false;
+    }
+    if (out.agc_db < 0 || out.agc_db > 31) {
+        std::fprintf(stderr, "--agc-db out of range [0..31]\n");
+        return false;
+    }
+    if (out.mic_volume < 1 || out.mic_volume > 4000) {
+        std::fprintf(stderr, "--mic-volume out of range [1..4000]\n");
         return false;
     }
     return true;
@@ -599,6 +615,15 @@ int main(int argc, char** argv) {
                 case 4: cfg.noise_suppression.level = L::kVeryHigh;  break;
             }
         }
+        if (opts.agc_db > 0) {
+            cfg.gain_controller1.enabled = true;
+            cfg.gain_controller1.mode =
+                webrtc::AudioProcessing::Config::GainController1::kFixedDigital;
+            cfg.gain_controller1.target_level_dbfs = 3;
+            cfg.gain_controller1.compression_gain_db =
+                std::clamp(opts.agc_db, 1, 31);
+            cfg.gain_controller1.enable_limiter = true;
+        }
         apm->ApplyConfig(cfg);
     }
 
@@ -607,10 +632,11 @@ int main(int argc, char** argv) {
         kSampleRate, /*num_channels=*/1, /*has_keyboard=*/false);
 
     // -- WAV writers --
-    WavWriter wav_mic, wav_ref, wav_out;
+    WavWriter wav_mic, wav_ref, wav_out, wav_final;
     if (!wav_mic.Open(opts.out_dir + "/raw_mic.wav") ||
         !wav_ref.Open(opts.out_dir + "/ref.wav")    ||
-        !wav_out.Open(opts.out_dir + "/aec_out.wav")) {
+        !wav_out.Open(opts.out_dir + "/aec_out.wav") ||
+        !wav_final.Open(opts.out_dir + "/production_out.wav")) {
         ::snd_pcm_close(pcm);
         return 1;
     }
@@ -620,6 +646,7 @@ int main(int argc, char** argv) {
     std::vector<std::int16_t> mic(kFrameSamples);
     std::vector<std::int16_t> ref(kFrameSamples);
     std::vector<std::int16_t> out(kFrameSamples);
+    std::vector<std::int16_t> final_out(kFrameSamples);
 
     const std::size_t target_periods =
         static_cast<std::size_t>(opts.duration_s) * (kSampleRate / kFrameSamples);
@@ -685,7 +712,23 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "ProcessStream rc=%d\n", prc);
         }
 
+        // Preserve the direct WebRTC/APM output separately.
         wav_out.Write(out.data(), kFrameSamples);
+
+        // Reproduce AudioCapture::PostFrame(): production applies
+        // mic_volume / 100.0 after WebRTC processing, then clamps S16.
+        final_out = out;
+        if (opts.mic_volume > 0 && opts.mic_volume != 100) {
+            const float gain = static_cast<float>(opts.mic_volume) / 100.0f;
+            for (std::size_t i = 0; i < final_out.size(); ++i) {
+                const long scaled =
+                    std::lround(static_cast<float>(final_out[i]) * gain);
+                const long clamped =
+                    std::clamp(scaled, -32768L, 32767L);
+                final_out[i] = static_cast<std::int16_t>(clamped);
+            }
+        }
+        wav_final.Write(final_out.data(), kFrameSamples);
 
         const double mic_e = SumSquares(mic.data(), kFrameSamples);
         const double out_e = SumSquares(out.data(), kFrameSamples);

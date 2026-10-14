@@ -1,6 +1,7 @@
 #include "satellite/Satellite.h"
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <optional>
 #include <utility>
@@ -78,6 +79,34 @@ void Satellite::OnWakeDetected(const std::string& model_id, float prob) {
 
 void Satellite::OnStopDetected() {
     if (!pipeline_active_ && !timer_ringing_) return;
+
+    // Timer stop must always remain immediate. For an ordinary voice
+    // pipeline, however, ignore stop detections during the first second
+    // after a wake, while the wake chime is still transitioning into
+    // HA streaming.
+    if (!timer_ringing_) {
+        const auto now_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now()
+                    .time_since_epoch()).count();
+
+        const auto guard_until_ns =
+            stop_guard_until_ns_.load(
+                std::memory_order_relaxed);
+
+        if (guard_until_ns != 0 &&
+            now_ns < guard_until_ns) {
+            const auto remaining_ms =
+                (guard_until_ns - now_ns) / 1'000'000LL;
+
+            LVA_LOGD(
+                kTag,
+                "stop-word guard suppressed detection "
+                "(remaining_ms=%lld)",
+                static_cast<long long>(remaining_ms));
+            return;
+        }
+    }
 
     if (timer_ringing_) {
         LVA_LOGI(kTag, "stop word → stopping timer ring");
@@ -193,6 +222,17 @@ void Satellite::StartPipeline(const std::string& wake_word_phrase) {
     refractory_until_ns_.store(now_ns + 2'000'000'000LL,
                                std::memory_order_relaxed);
 
+    constexpr std::int64_t kStopGuardNs =
+        1'000'000'000LL;
+
+    stop_guard_until_ns_.store(
+        now_ns + kStopGuardNs,
+        std::memory_order_relaxed);
+
+    LVA_LOGD(
+        kTag,
+        "stop-word guard armed: 1000 ms");
+
     pipeline_active_       = true;
     is_streaming_audio_    = false;  // not yet — wakeup sound first
     tts_url_.clear();
@@ -253,10 +293,21 @@ void Satellite::OpenStreamToHa(const std::string& wake_word_phrase) {
 }
 
 void Satellite::PumpAudioToHa() {
-    if (!is_streaming_audio_) return;
-    if (!state_.broadcast)    return;
-
     std::vector<std::int16_t> chunk(kAudioPumpSamples);
+
+    // The capture thread writes mic audio into mic_ring_ unconditionally,
+    // but this ring is an on-demand consumer: HA only wants it while a voice
+    // pipeline is streaming. When idle, drain and discard so the ring never
+    // backs up (otherwise it fills within ~2 s and the capture thread logs a
+    // perpetual "ring overrun"). Draining here keeps a real overrun signal
+    // meaningful: if it ever fires again it means streaming could not keep up.
+    if (!is_streaming_audio_ || !state_.broadcast) {
+        while (mic_ring_.Read(chunk.data(), chunk.size()) > 0) {
+            // discard
+        }
+        return;
+    }
+
     for (int i = 0; i < kMaxPumpsPerTick; ++i) {
         const std::size_t got =
             mic_ring_.Read(chunk.data(), chunk.size());

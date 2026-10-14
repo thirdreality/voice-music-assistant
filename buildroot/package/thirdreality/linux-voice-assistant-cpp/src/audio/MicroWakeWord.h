@@ -49,6 +49,15 @@ class MicroWakeWord {
     // Live probability threshold. Written from the main thread,
     // read from the wake-word thread in Process(); atomic to avoid
     // a data race.
+    // Diagnostic: tag this detector's score logs (post_apm / linear_aec).
+    void SetSourceTag(const std::string& tag) { source_tag_ = tag; }
+
+    // Diagnostic only: annotates score logs with far-end playback state.
+    // Does not affect detection.
+    static void SetFarEndTelemetry(bool active) {
+        far_end_telemetry_.store(active, std::memory_order_relaxed);
+    }
+
     void SetProbabilityCutoff(float v) noexcept {
         cutoff_live_.store(v, std::memory_order_relaxed);
     }
@@ -68,6 +77,7 @@ class MicroWakeWord {
     float InvokeOnce(const float* stride_features);
 
     Config cfg_;
+    std::string source_tag_;
     bool   ok_ = false;
 
     // Live, thread-safe copy of cfg_.probability_cutoff.
@@ -90,6 +100,13 @@ class MicroWakeWord {
     std::deque<float>    probabilities_;
 
     float last_prob_ = 0.0f;
+
+    // Per-instance log-pacing counter (must not be shared across models on
+    // the same engine thread, or the heartbeat fires for only one of them).
+    unsigned int score_log_counter_ = 0;
+
+    // Shared across all detector instances; see SetFarEndTelemetry().
+    static std::atomic<bool> far_end_telemetry_;
 };
 
 }  // namespace lva::audio

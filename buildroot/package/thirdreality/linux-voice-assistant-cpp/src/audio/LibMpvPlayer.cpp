@@ -130,21 +130,21 @@ void LibMpvPlayer::ReadDrainWakeupFd() {
     }
 }
 
+void LibMpvPlayer::SetState(PlayerState new_state) {
+    const PlayerState prev =
+        state_.exchange(new_state, std::memory_order_relaxed);
+    if (prev != new_state && on_state_changed_) {
+        try {
+            on_state_changed_(new_state);
+        } catch (...) {
+            // Listener errors must never break the caller.
+        }
+    }
+}
+
 void LibMpvPlayer::DrainEvents() {
     if (mpv_ == nullptr) return;
     ReadDrainWakeupFd();
-
-    auto set_state = [this](PlayerState new_state) {
-        const PlayerState prev =
-            state_.exchange(new_state, std::memory_order_relaxed);
-        if (prev != new_state && on_state_changed_) {
-            try {
-                on_state_changed_(new_state);
-            } catch (...) {
-                // Listener errors must never break the loop.
-            }
-        }
-    };
 
     while (true) {
         mpv_event* ev = mpv_wait_event(mpv_, 0);
@@ -153,18 +153,18 @@ void LibMpvPlayer::DrainEvents() {
         }
         switch (ev->event_id) {
             case MPV_EVENT_START_FILE:
-                set_state(PlayerState::kLoading);
+                SetState(PlayerState::kLoading);
                 LVA_LOGD(kTag, "event: START_FILE");
                 break;
             case MPV_EVENT_FILE_LOADED:
-                set_state(PlayerState::kPlaying);
+                SetState(PlayerState::kPlaying);
                 LVA_LOGD(kTag, "event: FILE_LOADED");
                 break;
             case MPV_EVENT_END_FILE: {
                 auto* end = static_cast<mpv_event_end_file*>(ev->data);
                 const int reason = end ? static_cast<int>(end->reason) : -1;
                 LVA_LOGD(kTag, "event: END_FILE (reason=%d)", reason);
-                set_state(PlayerState::kIdle);
+                SetState(PlayerState::kIdle);
                 if (reason == MPV_END_FILE_REASON_EOF ||
                     reason == MPV_END_FILE_REASON_ERROR) {
                     std::function<void()> cb;
@@ -191,7 +191,7 @@ void LibMpvPlayer::DrainEvents() {
             }
             case MPV_EVENT_SHUTDOWN:
                 LVA_LOGI(kTag, "event: SHUTDOWN");
-                set_state(PlayerState::kIdle);
+                SetState(PlayerState::kIdle);
                 return;
             default:
                 LVA_LOGD(kTag, "event: %s", mpv_event_name(ev->event_id));
@@ -225,7 +225,7 @@ void LibMpvPlayer::Play(const std::string& url,
         rc < 0) {
         LVA_LOGW(kTag, "clear pause failed: %s", mpv_error_string(rc));
     }
-    state_.store(PlayerState::kLoading, std::memory_order_relaxed);
+    SetState(PlayerState::kLoading);
     LVA_LOGI(kTag, "Play: %s", url.c_str());
 }
 
@@ -237,7 +237,7 @@ void LibMpvPlayer::Pause() {
         LVA_LOGW(kTag, "pause set failed: %s", mpv_error_string(rc));
         return;
     }
-    state_.store(PlayerState::kPaused, std::memory_order_relaxed);
+    SetState(PlayerState::kPaused);
 }
 
 void LibMpvPlayer::Resume() {
@@ -248,7 +248,7 @@ void LibMpvPlayer::Resume() {
         LVA_LOGW(kTag, "resume set failed: %s", mpv_error_string(rc));
         return;
     }
-    state_.store(PlayerState::kPlaying, std::memory_order_relaxed);
+    SetState(PlayerState::kPlaying);
 }
 
 void LibMpvPlayer::Stop() {

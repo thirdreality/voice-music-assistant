@@ -33,9 +33,40 @@ class WebRtcProcessor {
     // applies the toggle only on transition.
     void SetFarEndActive(bool active);
 
+    // External far-end playback (currently Sendspin/Music Assistant).
+    // Kept separate from internal MPV/TTS playback so either source can
+    // independently keep the echo canceller enabled.
+    void SetExternalFarEndActive(bool active);
+
     bool Process(std::int16_t* buf, std::size_t n);
 
+    // Retrieve WebRTC's continuous linear AEC output for wake-word
+    // detection. Returns false when AEC is inactive or no linear output
+    // is available, allowing the caller to fall back to normal mic audio.
+    bool GetLinearAecOutput(std::int16_t* buf, std::size_t n);
+
+    // Monotonic steady_clock timestamp (ns) until which the shadow
+    // (linear-AEC) wake detector should be suppressed. Armed automatically
+    // whenever the echo canceller transitions idle->active (either far-end
+    // source), because AEC3 has not yet converged and its linear output is
+    // dirtiest right after playback starts. 0 means no guard active.
+    std::int64_t LinearGuardUntilNs() const noexcept {
+        return linear_guard_until_ns_.load(std::memory_order_relaxed);
+    }
+
     bool ProcessReverse(std::int16_t* buf, std::size_t n);
+
+    // Conservative post-AEC Sendspin residual suppressor.
+    //
+    // Uses the aligned hardware-loopback reference to remove only the
+    // component of the already-AEC-processed microphone signal that is
+    // still strongly correlated with external Music Assistant playback.
+    //
+    // This is intentionally gated to external far-end playback so normal
+    // wake-word capture, TTS and local sounds are not altered.
+    void SuppressSendspinResidual(std::int16_t* mic,
+                                  const std::int16_t* ref,
+                                  std::size_t n);
 
     // Reset the echo canceller (rebuild the APM) so it re-converges
     // from a clean state. Call after an ALSA xrun/recover, where the
@@ -71,7 +102,13 @@ class WebRtcProcessor {
     // currently applied to the APM (capture thread). The capture thread
     // reconciles them on transition inside Process().
     std::atomic<bool> far_end_active_{false};
+    std::atomic<bool> external_far_end_active_{false};
     bool              echo_on_applied_ = false;
+
+    // Shadow-detector resume guard; see LinearGuardUntilNs(). Written on the
+    // capture thread in ReconcileGateLocked() on an echo on/off transition,
+    // read on the shadow wake thread.
+    std::atomic<std::int64_t> linear_guard_until_ns_{0};
 
     void* apm_ = nullptr;
     std::unique_ptr<webrtc::StreamConfig> stream_cfg_;
