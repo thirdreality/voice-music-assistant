@@ -140,7 +140,6 @@ void WakeWordEngine::ThreadLoop() {
             continue;
         }
 
-        // MicroWakeWord path
         if (!active_micro.empty() && features_) {
             feature_buf.clear();
             const std::size_t frames =
@@ -160,7 +159,6 @@ void WakeWordEngine::ThreadLoop() {
             }
         }
 
-        // OpenWakeWord path
         if (!active_open.empty() && open_features_) {
             oww_embeddings.clear();
             open_features_->Process(chunk.data(), got, oww_embeddings);

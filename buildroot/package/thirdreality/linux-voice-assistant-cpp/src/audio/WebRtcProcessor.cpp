@@ -16,16 +16,8 @@ namespace {
 
 constexpr const char* kTag = "webrtc";
 
-// Post-AEC residual suppression is deliberately conservative.
-//
-// The reference channel is normally much hotter than the microphone.
-// We therefore use normalized correlation to decide whether a component
-// really resembles the outgoing Sendspin audio instead of using a simple
-// dB/noise gate.
-//
-// A 0.30 correlation threshold avoids acting on weak accidental matches.
-// Only 70% of the estimated correlated component is removed, and the
-// reference coefficient is hard-limited to 0.12.
+// Conservative post-AEC residual suppression. The ref is much hotter than
+// the mic, so match on normalized correlation, not level.
 constexpr double kResidualMinRefRms  = 120.0;
 constexpr double kResidualMinAbsCorr = 0.30;
 constexpr double kResidualStrength   = 0.70;
@@ -96,8 +88,6 @@ void WebRtcProcessor::ApplyConfigLocked(bool echo_on) {
         cfg.echo_canceller.enabled = true;
         cfg.echo_canceller.mobile_mode = false;
 
-        // Ask WebRTC to retain the continuous linear AEC output
-        // independently of the normal EchoRemover output path.
         cfg.echo_canceller.export_linear_aec_output = true;
 
         cfg.echo_canceller.enforce_high_pass_filtering = true;
@@ -112,10 +102,7 @@ void WebRtcProcessor::ApplyConfigLocked(bool echo_on) {
             std::clamp(agc_level_, 1, 31);
         cfg.gain_controller1.enable_limiter = true;
     }
-    // Keep the AEC path isolated from noise suppression:
-    // Keep the configured noise suppressor during normal listening, but
-    // disable only NS while far-end playback/AEC is active. This leaves
-    // AEC3, HPF, AGC1, wake-word settings, and all other processing intact.
+    // NS is disabled while AEC is active.
     if (ns_level_ > 0 && !echo_on) {
         cfg.noise_suppression.enabled = true;
         cfg.noise_suppression.level = ToNsLevel(ns_level_);
@@ -132,8 +119,6 @@ void WebRtcProcessor::ReconcileGateLocked() {
     if (want_echo != echo_on_applied_) {
         ApplyConfigLocked(want_echo);
 
-        // Arm the shadow-detector guard on idle->active (covers both far-end
-        // sources); clear on active->idle.
         if (echo_on_applied_) {
             const auto now_ns =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -165,17 +150,12 @@ void WebRtcProcessor::RebuildLocked() {
     }
     apm_ = apm;
 
-    // Rebuild preserves the current far-end gate: the echo canceller is
-    // only actually enabled when far-end playback is active. On a fresh
-    // build (startup / level change) start from the desired gate state.
     const bool echo_on =
         far_end_active_.load(std::memory_order_relaxed) ||
         external_far_end_active_.load(std::memory_order_relaxed);
     ApplyConfigLocked(echo_on);
 
-    // A rebuild (startup / level change / post-xrun ResetEcho) drops AEC3's
-    // converged state, so if echo is on the linear output will be dirty again
-    // for ~1.5 s. Arm/clear the shadow-detector guard to match.
+    // A rebuild drops AEC3's converged state; re-arm the shadow guard.
     if (echo_on_applied_) {
         const auto now_ns =
             std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -202,12 +182,8 @@ bool WebRtcProcessor::ProcessReverse(std::int16_t* buf,
     std::lock_guard<std::mutex> lk(apm_mutex_);
     if (apm_ == nullptr) return false;
     if (!aec_enabled_)   return true;   // no-op fast path
-    // ProcessReverse runs before Process each period; reconcile the gate
-    // here too so the reference and mic stages agree within a period.
+    // Reconcile here too so ref and mic agree within a period.
     ReconcileGateLocked();
-    // Skip reverse processing while the echo canceller is gated off:
-    // feeding the far-end stream is pointless (and only churns AEC
-    // state) when there is no local playback to cancel.
     if (!echo_on_applied_) return true;
     if (n == 0)          return true;
     if ((n % kFrameSamples) != 0) {
@@ -237,9 +213,7 @@ void WebRtcProcessor::SuppressSendspinResidual(
     if (mic == nullptr || ref == nullptr || n == 0) return;
     if (!aec_enabled_ || !echo_on_applied_) return;
 
-    // IMPORTANT: this extra suppression is ONLY for external Sendspin /
-    // Music Assistant playback. Local MPV/TTS audio keeps the normal
-    // WebRTC processing path unchanged.
+    // External (Sendspin) playback only.
     if (!external_far_end_active_.load(std::memory_order_relaxed)) {
         return;
     }
@@ -331,8 +305,7 @@ bool WebRtcProcessor::GetLinearAecOutput(std::int16_t* buf,
         return false;
     }
 
-    // WebRTC's linear AEC buffer uses FloatS16 scale, not normalized
-    // [-1, 1]. Clamp/round directly back into signed 16-bit PCM.
+    // FloatS16 scale, not [-1, 1].
     for (std::size_t i = 0; i < n; ++i) {
         const float sample =
             std::clamp(linear[0][i], -32768.0f, 32767.0f);
@@ -360,19 +333,14 @@ bool WebRtcProcessor::Process(std::int16_t* buf, std::size_t n) {
         return false;
     }
 
-    // Reconcile the far-end gate: enable the echo canceller only while
-    // there is genuine local playback (music/TTS). Toggling it via
-    // ApplyConfig avoids destroying near-end speech during plain
-    // listening, where the hardware-loopback reference is just crosstalk.
     ReconcileGateLocked();
 
     if (!echo_on_applied_ && agc_level_ == 0 && ns_level_ == 0) {
-        // Nothing enabled; cheap no-op.
         return true;
     }
     auto* apm = static_cast<::webrtc::AudioProcessing*>(apm_);
     if (echo_on_applied_) {
-        // mic and ref are the same ALSA capture period → ~0 delay.
+        // mic and ref come from the same ALSA period.
         apm->set_stream_delay_ms(0);
     }
     for (std::size_t off = 0; off < n; off += kFrameSamples) {

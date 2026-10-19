@@ -149,7 +149,6 @@ bool Connection::DispatchFrame(const InboundFrame& frame) {
             ::AuthenticationResponse resp;
             const bool ok = Send(resp);
             if (ok) {
-                // Ask HA for its timezone.
                 ::GetTimeRequest gt;
                 Send(gt);
 
@@ -192,7 +191,6 @@ bool Connection::DispatchFrame(const InboundFrame& frame) {
         case kIdDisconnectRequest: {
             ::DisconnectResponse resp;
             (void)Send(resp);
-            // After answering, tear the connection down ourselves.
             LVA_LOGI(kTag, "[%s] disconnect requested", peer_label_.c_str());
             closed_ = true;
             return true;
@@ -342,7 +340,6 @@ bool Connection::DispatchFrame(const InboundFrame& frame) {
             return true;
         }
 
-        // ---- Voice assistant ----
         case kIdSubscribeVoiceAssistantRequest: {
             ::SubscribeVoiceAssistantRequest m;
             if (!m.ParseFromArray(frame.payload.data(),
@@ -409,6 +406,20 @@ bool Connection::DispatchFrame(const InboundFrame& frame) {
             if (state_.satellite) {
                 state_.satellite->HandleMessage(
                     kIdVoiceAssistantTimerEventResponse, m);
+            }
+            return true;
+        }
+        case kIdHomeassistantActionResponse: {
+            ::HomeassistantActionResponse m;
+            if (!m.ParseFromArray(frame.payload.data(),
+                                  static_cast<int>(frame.payload.size()))) {
+                LVA_LOGE(kTag, "[%s] HomeassistantActionResponse parse failed",
+                         peer_label_.c_str());
+                return false;
+            }
+            if (state_.satellite) {
+                state_.satellite->HandleMessage(
+                    kIdHomeassistantActionResponse, m);
             }
             return true;
         }
@@ -485,7 +496,6 @@ bool Connection::SendRaw(std::span<const std::uint8_t> bytes) {
             continue;
         }
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            // Buffer the remainder for OnWritable to drain.
             write_buf_.assign(bytes.begin() + static_cast<std::ptrdiff_t>(sent_total),
                               bytes.end());
             return true;

@@ -20,10 +20,7 @@ namespace {
 
 constexpr const char* kTag = "wakeword";
 
-// ---------------------------------------------------------------------------
-// Minimal SHA-256 (self-contained, mirrors OtaClient's vendored MD5 so we
-// don't pull in an OpenSSL dependency just for one hash).
-// ---------------------------------------------------------------------------
+// Minimal SHA-256 to avoid an OpenSSL dependency.
 class Sha256 {
    public:
     Sha256() { Reset(); }
@@ -43,7 +40,6 @@ class Sha256 {
         std::size_t i = buffer_len_;
         bit_len_ += static_cast<std::uint64_t>(buffer_len_) * 8;
 
-        // Pad.
         buffer_[i++] = 0x80;
         if (i > 56) {
             while (i < 64) buffer_[i++] = 0x00;
@@ -52,7 +48,6 @@ class Sha256 {
         }
         while (i < 56) buffer_[i++] = 0x00;
 
-        // Append length (big-endian).
         for (int j = 7; j >= 0; --j) {
             buffer_[i++] = static_cast<unsigned char>(
                 (bit_len_ >> (j * 8)) & 0xFF);
@@ -167,13 +162,9 @@ std::string Sha256HexLower(const std::filesystem::path& path) {
     return out;
 }
 
-// Replace the last path segment of a URL with `filename`, mirroring the
-// Python build's posixpath.join(dirname(path), model_name) trick. The
-// query string and fragment, if any, are dropped (the Python code only
-// rewrites the path component, but HA's model URLs carry neither).
+// Replaces the last path segment of a URL; drops query and fragment.
 std::string ReplaceUrlFilename(const std::string& url,
                                const std::string& filename) {
-    // Find the start of the path (after scheme://host).
     std::size_t path_start = 0;
     const std::size_t scheme = url.find("://");
     if (scheme != std::string::npos) {
@@ -182,7 +173,6 @@ std::string ReplaceUrlFilename(const std::string& url,
             return url + "/" + filename;
         }
     }
-    // Strip query/fragment before locating the last slash.
     std::size_t end = url.find_first_of("?#", path_start);
     const std::string base =
         (end == std::string::npos) ? url : url.substr(0, end);
@@ -202,7 +192,6 @@ std::size_t WriteToFileCb(char* ptr, std::size_t size, std::size_t nmemb,
     return std::fwrite(ptr, 1, n, fp);
 }
 
-// GETs `url` into `dest`. Returns true on HTTP 200 with the body written.
 bool DownloadToFile(const std::string& url,
                     const std::filesystem::path& dest) {
     std::FILE* fp = std::fopen(dest.c_str(), "wb");
@@ -270,7 +259,6 @@ std::filesystem::path DownloadExternalWakeWord(
 
     const bool config_missing = !fs::exists(config_path);
 
-    // Decide whether the cached model is still valid (size + hash match).
     bool need_model = true;
     if (fs::exists(model_path)) {
         const auto cached_size = fs::file_size(model_path, ec);

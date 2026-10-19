@@ -54,17 +54,8 @@ MediaPlayerEntity::MediaPlayerEntity(std::uint32_t key,
 }
 
 void MediaPlayerEntity::OnPlayerStateChanged(lva::audio::PlayerState s) {
-    // Gate the echo canceller on genuine local playback. This entity is
-    // the single subscriber to both the music and announce (TTS) player
-    // state changes, so it is the natural place to reconcile the far-end
-    // signal for AEC. Both players feed the same physical output, which
-    // is what leaks into the hardware-loopback reference (ch3/ch4). The
-    // echo canceller must run ONLY while music or TTS is actually
-    // playing; during plain listening the reference carries no real
-    // far-end signal (just crosstalk ~25 dB hotter than the mic), and
-    // WebRTC AEC3's residual/NLP stage would mistake near-end speech for
-    // echo and zero-gate it. Computed live from both players so we don't
-    // depend on which one triggered this callback.
+    // AEC runs only while music or TTS plays (see SetFarEndActive). Check
+    // both players; either one may have triggered this callback.
     if (state_.webrtc_processor != nullptr) {
         auto is_active = [](lva::audio::PlayerState st) {
             return st == lva::audio::PlayerState::kLoading ||

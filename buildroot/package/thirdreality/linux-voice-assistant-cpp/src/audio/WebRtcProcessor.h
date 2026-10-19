@@ -23,55 +23,33 @@ class WebRtcProcessor {
 
     void SetLevels(int agc_level, int ns_level);
 
-    // Enable/disable actual echo cancellation at runtime. AEC must only
-    // run while there is genuine far-end playback (music/TTS), otherwise
-    // the hardware-loopback reference carries only crosstalk (~25 dB
-    // hotter than the mic, weakly correlated) and AEC3's residual/NLP
-    // stage mistakes near-end speech for echo and zero-gates it. Called
-    // from the main thread on player state changes; no-op when AEC was
-    // not configured (no reference channels). Cheap: the capture thread
-    // applies the toggle only on transition.
+    // AEC must run only during playback: otherwise the loopback ref is
+    // just crosstalk and AEC3 gates near-end speech as echo. Main thread.
     void SetFarEndActive(bool active);
 
-    // External far-end playback (currently Sendspin/Music Assistant).
-    // Kept separate from internal MPV/TTS playback so either source can
-    // independently keep the echo canceller enabled.
+    // Sendspin playback; either source keeps AEC on.
     void SetExternalFarEndActive(bool active);
 
     bool Process(std::int16_t* buf, std::size_t n);
 
-    // Retrieve WebRTC's continuous linear AEC output for wake-word
-    // detection. Returns false when AEC is inactive or no linear output
-    // is available, allowing the caller to fall back to normal mic audio.
+    // False when AEC is inactive.
     bool GetLinearAecOutput(std::int16_t* buf, std::size_t n);
 
-    // Monotonic steady_clock timestamp (ns) until which the shadow
-    // (linear-AEC) wake detector should be suppressed. Armed automatically
-    // whenever the echo canceller transitions idle->active (either far-end
-    // source), because AEC3 has not yet converged and its linear output is
-    // dirtiest right after playback starts. 0 means no guard active.
+    // steady_clock ns until which the shadow detector is suppressed while
+    // AEC3 converges after turning on. 0 = no guard.
     std::int64_t LinearGuardUntilNs() const noexcept {
         return linear_guard_until_ns_.load(std::memory_order_relaxed);
     }
 
     bool ProcessReverse(std::int16_t* buf, std::size_t n);
 
-    // Conservative post-AEC Sendspin residual suppressor.
-    //
-    // Uses the aligned hardware-loopback reference to remove only the
-    // component of the already-AEC-processed microphone signal that is
-    // still strongly correlated with external Music Assistant playback.
-    //
-    // This is intentionally gated to external far-end playback so normal
-    // wake-word capture, TTS and local sounds are not altered.
+    // Removes the Sendspin component still correlated with the ref after
+    // AEC. Only active during external playback.
     void SuppressSendspinResidual(std::int16_t* mic,
                                   const std::int16_t* ref,
                                   std::size_t n);
 
-    // Reset the echo canceller (rebuild the APM) so it re-converges
-    // from a clean state. Call after an ALSA xrun/recover, where the
-    // mic and reference streams are no longer aligned. No-op when AEC
-    // is disabled.
+    // Call after an xrun, when mic and ref are misaligned.
     void ResetEcho();
 
     int  agc_level()   const { return agc_level_; }
@@ -81,33 +59,23 @@ class WebRtcProcessor {
    private:
     // Caller must hold apm_mutex_.
     void RebuildLocked();
-    // Build the APM Config from the current agc/ns/aec fields, with the
-    // echo canceller enabled only when echo_on is true. Caller must hold
-    // apm_mutex_.
+    // Caller must hold apm_mutex_.
     void ApplyConfigLocked(bool echo_on);
-    // Reconcile the applied echo state with the desired far-end gate.
     // Caller must hold apm_mutex_.
     void ReconcileGateLocked();
 
-    // Serializes all access to apm_: Process()/ProcessReverse()/
-    // ResetEcho() run on the capture thread, SetLevels() on the main
-    // thread, so APM rebuilds must not race.
+    // Capture thread vs. SetLevels() on the main thread.
     std::mutex apm_mutex_;
 
     int  agc_level_   = 0;
     int  ns_level_    = 0;
     bool aec_enabled_ = false;
 
-    // Desired far-end state (main thread) vs. the echo-canceller state
-    // currently applied to the APM (capture thread). The capture thread
-    // reconciles them on transition inside Process().
+    // Desired (main thread) vs. applied (capture thread) echo state.
     std::atomic<bool> far_end_active_{false};
     std::atomic<bool> external_far_end_active_{false};
     bool              echo_on_applied_ = false;
 
-    // Shadow-detector resume guard; see LinearGuardUntilNs(). Written on the
-    // capture thread in ReconcileGateLocked() on an echo on/off transition,
-    // read on the shadow wake thread.
     std::atomic<std::int64_t> linear_guard_until_ns_{0};
 
     void* apm_ = nullptr;

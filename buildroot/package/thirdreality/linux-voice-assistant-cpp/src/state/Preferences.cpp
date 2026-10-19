@@ -280,9 +280,7 @@ bool Preferences::SaveToFile(const std::filesystem::path& storage_path) const {
     const auto tmp_path = storage_path.string() + ".tmp";
     const std::string payload = obj.dump(4) + '\n';
 
-    // Write + fsync the temp file, atomically rename, then fsync the
-    // parent directory. Without the fsyncs the data can sit in the page
-    // cache and be lost if power is cut right after saving.
+    // fsync file and directory so a power cut right after saving keeps it.
     const int fd = ::open(tmp_path.c_str(),
                           O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
@@ -330,7 +328,6 @@ bool Preferences::SaveToFile(const std::filesystem::path& storage_path) const {
         return false;
     }
 
-    // Persist the directory entry (the rename) to disk as well.
     const auto dir = storage_path.has_parent_path()
                          ? storage_path.parent_path()
                          : std::filesystem::path(".");

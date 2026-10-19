@@ -31,7 +31,6 @@ void ButtonEntity::OnListEntities(const ResponseSink& sink) {
 }
 
 void ButtonEntity::OnSubscribeStates(const ResponseSink& /*sink*/) {
-    // Buttons are stateless — no state response.
 }
 
 void ButtonEntity::OnCommand(const ::google::protobuf::MessageLite& request,

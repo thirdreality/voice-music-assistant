@@ -13,17 +13,9 @@ config BR2_PACKAGE_LINUX_VOICE_ASSISTANT_CPP
 	select BR2_PACKAGE_WEBRTC_AUDIO_PROCESSING  # AGC + NS for the mic
 	default n
 	help
-	  C++ rewrite of the linux-voice-assistant package.
-	  Replaces the Python implementation with a single native
-	  binary that speaks the ESPHome API to Home Assistant,
-	  runs MicroWakeWord inference natively, and integrates
-	  ThirdReality LED ring, mute GPIO, sound.json bridge,
-	  Home button events, OTA, and the supervisor HTTP API.
+	  Native ESPHome-API voice assistant for the ThirdReality
+	  speaker. STT/TTS run in Home Assistant by default;
+	  --voice-backend local runs them on-device.
 
-	  Requires a C++20-capable toolchain (gcc >= 10).
-
-	  This package is intended to fully replace
-	  BR2_PACKAGE_LINUX_VOICE_ASSISTANT once on-device
-	  verified. Do NOT enable both at the same time.
-
-	  See: doc/linux-voice-assistant-cpp-refactor-plan.md
+	  Requires gcc >= 10 (C++20). Do not enable together with
+	  BR2_PACKAGE_LINUX_VOICE_ASSISTANT.

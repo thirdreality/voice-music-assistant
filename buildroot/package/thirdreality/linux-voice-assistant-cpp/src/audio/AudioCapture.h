@@ -23,11 +23,9 @@ class AudioCapture {
     struct Options {
         Backend backend = Backend::kPulse;
 
-        // ----- pulse backend -----
         std::string source;
 
-        // ----- alsa backend -----
-        // hw:0,4 exposes ch1/ch2 = mic, ch3/ch4 = codec loopback ref.
+        // hw:0,4: ch1/ch2 = mic, ch3/ch4 = codec loopback ref.
         std::string alsa_device   = "hw:0,4";
         unsigned    alsa_channels = 4;
         unsigned    mic_channel   = 0;   // 0-based mic channel
@@ -36,11 +34,9 @@ class AudioCapture {
         // second = -1 → single-channel ref; first = -1 → AEC disabled.
         std::array<int, 2> ref_channels = {2, 3};
 
-        // Frames per read; for alsa this is also the period size and
-        // must equal the WebRTC APM frame (160 = 10 ms).
+        // alsa: period size, must equal the WebRTC frame (160).
         std::size_t frames_per_read = 160;
 
-        // Pulse-only: requested capture latency in microseconds.
         std::uint32_t buffer_latency_us = 100'000;
     };
 
@@ -52,12 +48,10 @@ class AudioCapture {
 
     void AddTap(PcmRingBuffer& ring);
 
-    // Primary wake path: normal post-WebRTC/APM microphone.
-    // This is before Sendspin residual suppression and mic-volume gain.
+    // Post-APM mic, before residual suppression and mic gain.
     void AddWakeTap(PcmRingBuffer& ring);
 
-    // Shadow wake path: WebRTC continuous linear-AEC output.
-    // Frames are supplied only while linear AEC output is available.
+    // Linear-AEC output; only while AEC is active.
     void AddLinearWakeTap(PcmRingBuffer& ring);
 
     void SetProcessor(WebRtcProcessor* processor);

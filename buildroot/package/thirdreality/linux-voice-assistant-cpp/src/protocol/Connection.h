@@ -30,7 +30,6 @@ class Connection {
     Connection(Connection&&) = delete;
     Connection& operator=(Connection&&) = delete;
 
-    // Returns the file descriptor for epoll registration.
     int fd() const noexcept { return fd_; }
 
     bool closed() const noexcept { return closed_; }
@@ -46,7 +45,6 @@ class Connection {
                        const ::google::protobuf::MessageLite&)>
         MakeSink();
 
-    // Close the file descriptor immediately. Idempotent.
     void Close();
 
     bool SendSerializedMessage(std::uint32_t msg_type_id,
@@ -62,10 +60,8 @@ class Connection {
     lva::state::ServerState& state_;
     std::string peer_label_;
 
-    // Inbound byte stream waiting for frame parse.
     std::vector<std::uint8_t> read_buf_;
 
-    // Outbound bytes that previously got EAGAIN. Drained by OnWritable.
     std::vector<std::uint8_t> write_buf_;
 };
 

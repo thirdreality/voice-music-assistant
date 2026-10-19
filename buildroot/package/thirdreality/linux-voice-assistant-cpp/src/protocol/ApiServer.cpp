@@ -193,7 +193,6 @@ bool ApiServer::AcceptOne() {
     ev.data.fd = fd;
     if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) < 0) {
         LVA_LOGE(kTag, "epoll_ctl(client) failed: %s", std::strerror(errno));
-        // conn destructor closes fd
         return true;
     }
 
@@ -209,7 +208,6 @@ void ApiServer::EraseConnection(int fd) {
     } else {
         ::close(fd);
     }
-    // Notify satellite of disconnect so it can clean up pipeline state.
     if (connections_.empty() && state_.on_client_disconnected) {
         state_.on_client_disconnected();
     }
@@ -233,20 +231,16 @@ int ApiServer::Run() {
             if (fd == wake_fd_) {
                 std::uint64_t v = 0;
                 while (::read(wake_fd_, &v, sizeof(v)) > 0) {
-                    // drain
                 }
-                // Loop will re-check stop_requested_ at top.
                 continue;
             }
 
             if (fd == listen_fd_) {
                 while (AcceptOne()) {
-                    // drain accept queue
                 }
                 continue;
             }
 
-            // Auxiliary fd registered via AddAuxFd?
             if (auto it = aux_handlers_.find(fd); it != aux_handlers_.end()) {
                 try {
                     it->second();
@@ -256,10 +250,8 @@ int ApiServer::Run() {
                 continue;
             }
 
-            // Otherwise it's a client connection.
             auto it = connections_.find(fd);
             if (it == connections_.end()) {
-                // Stray event — ignore.
                 continue;
             }
             Connection& conn = *it->second;
@@ -287,7 +279,6 @@ int ApiServer::Run() {
 
     LVA_LOGI(kTag, "stopping (cleaning up %zu connection(s))",
              connections_.size());
-    // Close all client connections cleanly.
     while (!connections_.empty()) {
         EraseConnection(connections_.begin()->first);
     }

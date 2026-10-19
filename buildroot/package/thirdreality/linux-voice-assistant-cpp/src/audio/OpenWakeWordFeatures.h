@@ -1,5 +1,4 @@
-// OpenWakeWordFeatures: shared mel-spectrogram + embedding extraction.
-// One instance per process, feeds all OpenWakeWord keyword models.
+// Shared mel + embedding extraction feeding all OpenWakeWord models.
 
 #pragma once
 
@@ -33,8 +32,6 @@ class OpenWakeWordFeatures {
     bool Load(const std::filesystem::path& models_dir);
     bool Ok() const noexcept { return ok_; }
 
-    // Feed raw int16 PCM. Returns embeddings (each kWwFeatures floats).
-    // Output may contain 0 or more embeddings per call.
     void Process(const std::int16_t* samples, std::size_t count,
                  std::vector<float>& out_embeddings);
 

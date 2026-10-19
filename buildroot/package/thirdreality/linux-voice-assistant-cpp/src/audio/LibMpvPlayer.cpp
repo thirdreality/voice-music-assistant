@@ -42,7 +42,6 @@ LibMpvPlayer::LibMpvPlayer(const Options& opts) {
         return;
     }
 
-    // No video/display, no terminal control. We're a daemon.
     SetMpvOptionString(mpv_, "audio-display", "no");
     SetMpvOptionString(mpv_, "vid",            "no");
     SetMpvOptionString(mpv_, "video",          "no");
@@ -50,7 +49,6 @@ LibMpvPlayer::LibMpvPlayer(const Options& opts) {
     SetMpvOptionString(mpv_, "input-vo-keyboard",      "no");
     SetMpvOptionString(mpv_, "terminal", "no");
 
-    // Network playback cache. Matches the python-mpv build's tunings.
     SetMpvOptionString(mpv_, "cache",                "yes");
     SetMpvOptionString(mpv_, "cache-pause",          "yes");
     SetMpvOptionString(mpv_, "cache-pause-wait",     "10");
@@ -126,7 +124,6 @@ void LibMpvPlayer::OnMpvWakeupTrampoline(void* opaque) {
 void LibMpvPlayer::ReadDrainWakeupFd() {
     std::uint64_t v = 0;
     while (::read(wakeup_read_fd_, &v, sizeof(v)) > 0) {
-        // drain
     }
 }
 

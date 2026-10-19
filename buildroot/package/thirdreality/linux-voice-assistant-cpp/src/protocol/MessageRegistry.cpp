@@ -27,6 +27,9 @@ std::string_view MessageName(std::uint32_t id) noexcept {
         case kIdListEntitiesButtonResponse:            return "ListEntitiesButtonResponse";
         case kIdButtonCommandRequest:                  return "ButtonCommandRequest";
 
+        case kIdSubscribeHomeassistantServicesRequest: return "SubscribeHomeassistantServicesRequest";
+        case kIdHomeassistantActionRequest:            return "HomeassistantActionRequest";
+        case kIdHomeassistantActionResponse:           return "HomeassistantActionResponse";
         case kIdGetTimeRequest:                        return "GetTimeRequest";
         case kIdGetTimeResponse:                       return "GetTimeResponse";
 

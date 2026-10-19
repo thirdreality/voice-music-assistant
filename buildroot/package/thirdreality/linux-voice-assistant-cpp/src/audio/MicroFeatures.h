@@ -26,7 +26,6 @@ class MicroFeatures {
     MicroFeatures(const MicroFeatures&)            = delete;
     MicroFeatures& operator=(const MicroFeatures&) = delete;
 
-    // True if the frontend was successfully initialized.
     bool Ok() const noexcept { return state_ != nullptr; }
 
     std::size_t Process(const std::int16_t* samples,

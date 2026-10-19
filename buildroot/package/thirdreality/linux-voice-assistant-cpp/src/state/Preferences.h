@@ -16,8 +16,6 @@ class Preferences {
         kSound,        // /data/conf/sound.json; volume 0..100; extra keys
     };
 
-    // ---- mutable fields ----
-
     std::vector<std::optional<std::string>> active_wake_words;
 
     std::optional<double> volume;
@@ -25,9 +23,7 @@ class Preferences {
     // 0 = disabled, 1 = enabled. Anything outside is treated as 0.
     int thinking_sound = 0;
 
-    // Seconds to keep listening after a turn ends before starting the
-    // next "continued conversation" turn. std::nullopt = use built-in
-    // default (see main.cpp). Persisted across reboots.
+    // Seconds; nullopt = CLI default.
     std::optional<double> continue_conversation_delay;
 
     std::optional<double> wake_word_1_sensitivity;
@@ -43,8 +39,6 @@ class Preferences {
     // sound.json-only fields. Round-tripped verbatim.
     int mic_gain = 30;   // analog gain knob, 0..100, hardware-defined
     int mic_mute = 1;    // 0 = muted, 1 = unmuted (matches GPIO 438)
-
-    // ---- format / persistence ----
 
     Format format() const noexcept { return format_; }
     bool is_mic_muted() const noexcept { return mic_mute == 0; }

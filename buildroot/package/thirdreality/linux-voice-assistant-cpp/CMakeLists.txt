@@ -9,15 +9,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_compile_options(-Wall -Wextra -Wpedantic)
 
-# ---------------------------------------------------------------------------
-# Generate api.pb.{h,cc} from vendored .proto files
-#
-# Buildroot puts host-protobuf's protoc on PATH and provides target
-# libprotobuf via pkg-config. We avoid CMake's FindProtobuf because in
-# Buildroot cross-compile it tends to mix host/target. Instead:
-#  - locate protoc by name (host PATH, set by Buildroot)
-#  - locate libprotobuf via pkg-config (target sysroot, set by toolchain file)
-# ---------------------------------------------------------------------------
+# Protobuf codegen. FindProtobuf mixes host/target when cross-compiling, so
+# use protoc from PATH and the target libprotobuf via pkg-config.
 
 find_program(PROTOC_EXECUTABLE protoc REQUIRED)
 message(STATUS "Found protoc: ${PROTOC_EXECUTABLE}")
@@ -44,9 +37,6 @@ set(PROTO_GEN_HDRS
     "${PROTO_GEN_DIR}/api.pb.h"
 )
 
-# Single custom command that emits both .pb.cc/.pb.h pairs in one
-# protoc invocation (protoc handles multiple inputs in one call,
-# resolving the api_options import correctly).
 add_custom_command(
     OUTPUT  ${PROTO_GEN_SRCS} ${PROTO_GEN_HDRS}
     COMMAND ${PROTOC_EXECUTABLE}
@@ -67,58 +57,30 @@ target_compile_options(lva_proto PRIVATE
     -Wno-deprecated-declarations
 )
 
-# ---------------------------------------------------------------------------
-# Main binary
-# ---------------------------------------------------------------------------
-
-# nlohmann_json: header-only JSON parser. Installed by the
-# json-for-modern-cpp Buildroot package (staging only — no runtime
-# cost). Provides the imported target `nlohmann_json::nlohmann_json`.
 find_package(nlohmann_json CONFIG REQUIRED)
 
-# libmpv: media playback for the MediaPlayerEntity (phase 3a) and
-# the TTS announce player (phase 4). Provides libmpv.so.2.
 pkg_check_modules(MPV REQUIRED IMPORTED_TARGET mpv)
 message(STATUS "Found mpv ${MPV_VERSION} via pkg-config")
 
-# libpulse-simple: synchronous PulseAudio capture API used by
-# AudioCapture (phase 3b). The "simple" wrapper is sufficient — we
-# only need a blocking read in a dedicated thread.
 pkg_check_modules(PULSE_SIMPLE REQUIRED IMPORTED_TARGET libpulse-simple)
 message(STATUS "Found libpulse-simple ${PULSE_SIMPLE_VERSION} via pkg-config")
 
-# webrtc-audio-processing 1.x: AGC + NoiseSuppression for the mic
-# pipeline (phase 6). Without this, wake-word detection rate is
-# noticeably worse than the Python build (which uses
-# webrtc-noise-gain). The pkg-config name is "webrtc-audio-processing-1".
 pkg_check_modules(WEBRTC_APM REQUIRED IMPORTED_TARGET webrtc-audio-processing-1)
 message(STATUS "Found webrtc-audio-processing ${WEBRTC_APM_VERSION} via pkg-config")
 
-# libcurl: OTA download + check-version HTTP POST (phase 7).
 pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl)
 message(STATUS "Found libcurl ${LIBCURL_VERSION} via pkg-config")
 
-# avahi-client: mDNS service registration (_esphomelib._tcp) for
-# HA auto-discovery. avahi-daemon is already in defconfig.
 pkg_check_modules(AVAHI_CLIENT REQUIRED IMPORTED_TARGET avahi-client)
 message(STATUS "Found avahi-client ${AVAHI_CLIENT_VERSION} via pkg-config")
 
-# alsa-lib: required by the aec_loopback_test dev tool, which opens
-# the hardware loopback capture device (e.g. plughw:0,4) directly.
-# A future change will also use this in the production AudioCapture
-# for the ALSA capture backend that drives hardware-loopback AEC.
 pkg_check_modules(ALSA REQUIRED IMPORTED_TARGET alsa)
 message(STATUS "Found alsa-lib ${ALSA_VERSION} via pkg-config")
 
-# ---------------------------------------------------------------------------
-# Vendored microfrontend + kissfft (phase 4 audio feature extractor)
-# ---------------------------------------------------------------------------
-# These C/C++ sources are the same TFLite Micro `microfrontend` and
-# kissfft fixed-point sources pymicro-features v2.0.2 ships. We
-# build them as a separate object library so we can apply
-# microfrontend-specific compile flags (notably -DFIXED_POINT=16
-# which kissfft hard-requires) without polluting the rest of the
-# project's flags.
+find_package(Threads REQUIRED)
+
+# Vendored TFLite Micro microfrontend + kissfft. Separate object library so
+# FIXED_POINT=16 (required by kissfft) stays local.
 set(MICROFRONTEND_DIR
     "${CMAKE_SOURCE_DIR}/third_party/microfrontend/include")
 
@@ -155,6 +117,43 @@ target_compile_options(lva_microfrontend PRIVATE
     -Wno-sign-compare
 )
 
+# lva_speech: on-device STT (whisper.cpp) + TTS (eSpeak-NG) from prebuilt
+# archives (third_party/*/README.md). --exclude-libs keeps their symbols private.
+set(WHISPER_CPP_DIR "${CMAKE_SOURCE_DIR}/third_party/whisper.cpp")
+add_library(whisper_cpp INTERFACE)
+target_include_directories(whisper_cpp INTERFACE "${WHISPER_CPP_DIR}/include")
+target_link_libraries(whisper_cpp INTERFACE
+    -Wl,--start-group
+    "${WHISPER_CPP_DIR}/lib/libwhisper.a"
+    "${WHISPER_CPP_DIR}/lib/libggml.a"
+    "${WHISPER_CPP_DIR}/lib/libggml-cpu.a"
+    "${WHISPER_CPP_DIR}/lib/libggml-base.a"
+    -Wl,--end-group
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
+    m
+)
+
+set(ESPEAK_NG_DIR "${CMAKE_SOURCE_DIR}/third_party/espeak-ng")
+add_library(espeak_ng INTERFACE)
+target_include_directories(espeak_ng INTERFACE "${ESPEAK_NG_DIR}/include")
+target_link_libraries(espeak_ng INTERFACE
+    "${ESPEAK_NG_DIR}/lib/libespeak-ng.a"
+    "${ESPEAK_NG_DIR}/lib/libucd.a"
+)
+
+add_library(lva_speech SHARED
+    src/audio/WhisperStt.cpp
+    src/audio/EspeakTts.cpp
+)
+target_include_directories(lva_speech PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(lva_speech PRIVATE whisper_cpp espeak_ng)
+target_link_options(lva_speech PRIVATE
+    -Wl,--exclude-libs,ALL
+    -Wl,-Bsymbolic
+)
+install(TARGETS lva_speech LIBRARY DESTINATION lib)
+
 add_executable(linux-voice-assistant-cpp
     src/main.cpp
     src/protocol/Frame.cpp
@@ -176,6 +175,9 @@ add_executable(linux-voice-assistant-cpp
     src/audio/WakeWordEngine.cpp
     src/audio/WakeWordScanner.cpp
     src/audio/WebRtcProcessor.cpp
+    src/audio/WavFile.cpp
+    src/satellite/ConversationReply.cpp
+    src/satellite/LocalStt.cpp
     src/satellite/Satellite.cpp
     src/tr/ControlListener.cpp
     src/tr/LedRing.cpp
@@ -204,18 +206,11 @@ target_include_directories(linux-voice-assistant-cpp
         ${CMAKE_SOURCE_DIR}/src
 )
 
-# The generated proto headers (api.pb.h) use deprecated enum values
-# at file scope — the warning fires in any TU that includes them, not
-# just where we call deprecated APIs. Suppress globally on the
-# executable; we keep the localized push/pop in Connection.cpp for
-# documentation of the one deprecated field we deliberately set.
+# api.pb.h uses deprecated enum values at file scope, so the warning fires in
+# every TU that includes it.
 target_compile_options(linux-voice-assistant-cpp PRIVATE
     -Wno-deprecated-declarations
 )
-
-# Threading is needed for the SIGTERM wait helper and (in later phases)
-# the audio capture thread.
-find_package(Threads REQUIRED)
 
 target_link_libraries(linux-voice-assistant-cpp
     PRIVATE
@@ -228,19 +223,14 @@ target_link_libraries(linux-voice-assistant-cpp
         PkgConfig::WEBRTC_APM
         PkgConfig::LIBCURL
         PkgConfig::AVAHI_CLIENT
+        lva_speech
         Threads::Threads
-        ${CMAKE_DL_LIBS}   # for dlopen/dlsym in TfliteRuntime
+        ${CMAKE_DL_LIBS}
 )
 
 install(TARGETS linux-voice-assistant-cpp RUNTIME DESTINATION bin)
 
-# ---------------------------------------------------------------------------
-# Dev tool: micro_features_dump (phase 4a verification)
-# ---------------------------------------------------------------------------
-# Small CLI that reads a 16 kHz mono S16LE WAV and prints C++
-# MicroFeatures output as text — one frame per line, 40 floats. The
-# host-side `test/verify_phase4a_features.py` compares against
-# pymicro_features.
+# Dev tool: dump MicroFeatures for a WAV (one 40-float frame per line).
 add_executable(micro_features_dump
     src/tools/micro_features_dump.cpp
     src/audio/MicroFeatures.cpp
@@ -254,8 +244,7 @@ target_link_libraries(micro_features_dump PRIVATE
 )
 install(TARGETS micro_features_dump RUNTIME DESTINATION bin)
 
-# Dev tool: tflite_inspect (phase 4b verification)
-# Prints shape/type/quant of all input/output tensors of a .tflite.
+# Dev tool: print tensor shapes/types/quantization of a .tflite.
 add_executable(tflite_inspect
     src/tools/tflite_inspect.cpp
     src/audio/TfliteRuntime.cpp
@@ -269,10 +258,7 @@ target_link_libraries(tflite_inspect PRIVATE
 )
 install(TARGETS tflite_inspect RUNTIME DESTINATION bin)
 
-# Dev tool: wake_word_dump (phase 4c verification)
-# Loads a microWakeWord JSON config and runs a WAV through the full
-# C++ pipeline (features → quantize → invoke → window). Emits one
-# line per invoke for cross-comparison with pymicro_wakeword.
+# Dev tool: run a WAV through a microWakeWord model, one line per invoke.
 add_executable(wake_word_dump
     src/tools/wake_word_dump.cpp
     src/audio/MicroFeatures.cpp
@@ -290,18 +276,7 @@ target_link_libraries(wake_word_dump PRIVATE
 )
 install(TARGETS wake_word_dump RUNTIME DESTINATION bin)
 
-# Dev tool: aec_loopback_test
-# Verifies hardware-loopback AEC using the same WebRTC APM 1.3 pipeline
-# the production capture path will use once the ALSA backend lands.
-# Opens an ALSA capture device (default plughw:0,4) at S16_LE 16 kHz 4ch,
-# splits ch1->mic, (ch3+ch4)/2->ref, runs ProcessReverseStream then
-# ProcessStream, and writes raw_mic.wav / ref.wav / aec_out.wav for
-# A/B comparison. Prints per-second ERLE.
-#
-# Standalone TU: does not link the production AudioCapture or
-# WebRtcProcessor, so the production binary is unaffected. Run with
-# linux-voice-assistant-cpp stopped (or at least with no concurrent
-# reader on hw:0,4 if your codec driver is exclusive).
+# Dev tool: hardware-loopback AEC check (writes mic/ref/AEC WAVs, prints ERLE).
 add_executable(aec_loopback_test
     src/tools/aec_loopback_test.cpp
 )
@@ -313,3 +288,23 @@ target_link_libraries(aec_loopback_test PRIVATE
     Threads::Threads
 )
 install(TARGETS aec_loopback_test RUNTIME DESTINATION bin)
+
+# Unit test: exit 0 = pass.
+add_executable(conversation_reply_test
+    src/tools/conversation_reply_test.cpp
+    src/satellite/ConversationReply.cpp
+)
+target_include_directories(conversation_reply_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(conversation_reply_test PRIVATE
+    nlohmann_json::nlohmann_json
+)
+
+# Dev tool: run WAV files through WhisperStt.
+add_executable(stt_wav_test
+    src/tools/stt_wav_test.cpp
+    src/util/Log.cpp
+)
+target_include_directories(stt_wav_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(stt_wav_test PRIVATE lva_speech Threads::Threads)
+install(TARGETS stt_wav_test RUNTIME DESTINATION bin)

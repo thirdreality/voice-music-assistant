@@ -123,7 +123,6 @@ class Md5 {
                  | (static_cast<std::uint32_t>(block[i * 4 + 2]) << 16)
                  | (static_cast<std::uint32_t>(block[i * 4 + 3]) << 24);
         }
-        // Round 1
         Step(F, a, b, c, d, x[0],  7,  0xD76AA478);
         Step(F, d, a, b, c, x[1],  12, 0xE8C7B756);
         Step(F, c, d, a, b, x[2],  17, 0x242070DB);
@@ -140,7 +139,6 @@ class Md5 {
         Step(F, d, a, b, c, x[13], 12, 0xFD987193);
         Step(F, c, d, a, b, x[14], 17, 0xA679438E);
         Step(F, b, c, d, a, x[15], 22, 0x49B40821);
-        // Round 2
         Step(G, a, b, c, d, x[1],  5,  0xF61E2562);
         Step(G, d, a, b, c, x[6],  9,  0xC040B340);
         Step(G, c, d, a, b, x[11], 14, 0x265E5A51);
@@ -157,7 +155,6 @@ class Md5 {
         Step(G, d, a, b, c, x[2],  9,  0xFCEFA3F8);
         Step(G, c, d, a, b, x[7],  14, 0x676F02D9);
         Step(G, b, c, d, a, x[12], 20, 0x8D2A4C8A);
-        // Round 3
         Step(H, a, b, c, d, x[5],  4,  0xFFFA3942);
         Step(H, d, a, b, c, x[8],  11, 0x8771F681);
         Step(H, c, d, a, b, x[11], 16, 0x6D9D6122);
@@ -174,7 +171,6 @@ class Md5 {
         Step(H, d, a, b, c, x[12], 11, 0xE6DB99E5);
         Step(H, c, d, a, b, x[15], 16, 0x1FA27CF8);
         Step(H, b, c, d, a, x[2],  23, 0xC4AC5665);
-        // Round 4
         Step(I, a, b, c, d, x[0],  6,  0xF4292244);
         Step(I, d, a, b, c, x[7],  10, 0x432AFF97);
         Step(I, c, d, a, b, x[14], 15, 0xAB9423A7);
@@ -305,7 +301,6 @@ void OtaClient::DownloadFirmware(const OtaRelease& release,
     const std::string final_path = download_path_;
     const std::string temp_path  = final_path + ".part";
 
-    // If an existing complete .swu matches MD5, reuse it.
     struct stat st{};
     if (::stat(final_path.c_str(), &st) == 0) {
         try {
@@ -330,7 +325,6 @@ void OtaClient::DownloadFirmware(const OtaRelease& release,
     }
     ::unlink(temp_path.c_str());
 
-    // Make sure the parent dir exists.
     {
         const auto slash = final_path.find_last_of('/');
         if (slash != std::string::npos) {
@@ -398,7 +392,6 @@ void OtaClient::DownloadFirmware(const OtaRelease& release,
                                  std::to_string(http_status));
     }
 
-    // MD5 verify
     unsigned char digest[16];
     ctx.md5.Final(digest);
     const std::string actual = Md5HexLower(digest);
@@ -440,8 +433,7 @@ void OtaClient::InstallFirmware() {
 
     LVA_LOGI(kTag, "starting swupdate");
 
-    // Block SIGCHLD so the global auto-reap handler cannot steal our
-    // child before we waitpid. Restored after waitpid returns.
+    // Keep the global SIGCHLD reaper from stealing our child.
     sigset_t block_chld, old_mask;
     sigemptyset(&block_chld);
     sigaddset(&block_chld, SIGCHLD);

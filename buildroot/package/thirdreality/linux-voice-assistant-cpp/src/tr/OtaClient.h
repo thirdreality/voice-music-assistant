@@ -16,7 +16,6 @@ struct OtaRelease {
 
 class OtaClient {
    public:
-    // Default download path mirrors Python: /data/software.swu.
     static constexpr const char* kDefaultDownloadPath = "/data/software.swu";
     static constexpr const char* kCaCertPath = "/etc/ssl/certs/ca-certificates.crt";
     static constexpr const char* kSwupdatePath = "/usr/bin/swupdate";
@@ -39,7 +38,6 @@ class OtaClient {
 
     static std::string CalculateFileMd5(const std::string& path);
 
-    // Path of the .swu file (most recent successful download).
     const std::string& download_path() const noexcept { return download_path_; }
 
    private:

@@ -81,7 +81,6 @@ bool OpenWakeWord::Process(const float* embeddings, std::size_t num_embeddings,
     const int num_emb_vectors = static_cast<int>(num_embeddings / kWwFeatures);
     if (num_emb_vectors == 0) return false;
     if (num_emb_vectors >= kMaxEmb) {
-        // Too many embeddings at once — just keep the latest kMaxEmb.
         std::memcpy(emb_buf_.data(),
                     embeddings + (num_emb_vectors - kMaxEmb) * kWwFeatures,
                     kMaxEmb * kWwFeatures * sizeof(float));
@@ -101,7 +100,6 @@ bool OpenWakeWord::Process(const float* embeddings, std::size_t num_embeddings,
 
     while (new_embeddings_ >= input_windows_) {
         const int start = (kMaxEmb - new_embeddings_) * kWwFeatures;
-        // Input: [1, input_windows_, kWwFeatures]
         if (!runtime_.CopyInput(0, emb_buf_.data() + start,
                                 input_windows_ * kWwFeatures * sizeof(float))) {
             new_embeddings_ = std::max(0, new_embeddings_ - 1);
@@ -111,7 +109,6 @@ bool OpenWakeWord::Process(const float* embeddings, std::size_t num_embeddings,
 
         if (!runtime_.Invoke()) break;
 
-        // Output: single float probability
         float prob = 0.0f;
         if (!runtime_.CopyOutput(0, &prob, sizeof(float))) break;
         last_prob_ = prob;

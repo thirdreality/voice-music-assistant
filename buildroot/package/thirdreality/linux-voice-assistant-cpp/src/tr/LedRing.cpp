@@ -19,7 +19,6 @@ namespace {
 constexpr const char* kTag    = "led";
 constexpr const char* kAnimDir = "/usr/share/thirdreality/animation/";
 
-// Mirrors the Python build's _LED_ANIMATIONS map exactly.
 const char* AnimationFor(LedState s) {
     switch (s) {
         case LedState::Listening: return "active-waking.animation";
@@ -34,7 +33,6 @@ const char* AnimationFor(LedState s) {
 }
 
 bool IsTerminal(LedState s) {
-    // "to_idle=true" cases in Python: muted, unmuted, idle, error.
     switch (s) {
         case LedState::Idle:
         case LedState::Error:

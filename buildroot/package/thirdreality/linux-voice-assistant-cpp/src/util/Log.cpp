@@ -25,7 +25,6 @@ const char* LevelTag(Level level) noexcept {
     return "?    ";
 }
 
-// Optional file sink, guarded by g_write_mtx so open/write never race.
 std::FILE*  g_file        = nullptr;
 std::string g_file_path;
 std::size_t g_file_max    = 0;
@@ -61,7 +60,6 @@ void SetLogFile(std::string_view path, std::size_t max_bytes) noexcept {
 
     std::FILE* f = std::fopen(p.c_str(), "ae");  // append, close-on-exec
     if (f == nullptr) {
-        // Non-fatal: keep logging to stderr only.
         std::fprintf(stderr,
                      "[log] cannot open log file '%s'; stderr only\n",
                      p.c_str());
@@ -110,8 +108,6 @@ void Write(Level level, std::string_view tag, std::string_view message) noexcept
                      static_cast<int>(message.size()), message.data());
         std::fflush(g_file);
 
-        // Single capped file: when it reaches max_bytes, truncate and start
-        // over (no rotation / second file).
         if (g_file_max > 0) {
             const long pos = std::ftell(g_file);
             if (pos >= 0 &&

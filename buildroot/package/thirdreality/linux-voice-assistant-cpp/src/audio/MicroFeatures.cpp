@@ -116,7 +116,6 @@ std::size_t MicroFeatures::Process(const std::int16_t* samples,
 
     std::size_t consumed = 0;
 
-    // 1. If we have leftover samples, fill the chunk and consume.
     if (!leftover_.empty()) {
         const std::size_t need = kSamplesPerChunk - leftover_.size();
         const std::size_t take = std::min(need, n);
@@ -128,13 +127,11 @@ std::size_t MicroFeatures::Process(const std::int16_t* samples,
         }
     }
 
-    // 2. Process full chunks straight from the input.
     while (consumed + kSamplesPerChunk <= n) {
         ProcessOneChunk(samples + consumed, out);
         consumed += kSamplesPerChunk;
     }
 
-    // 3. Stash the tail into leftover_ for the next call.
     if (consumed < n) {
         leftover_.insert(leftover_.end(),
                          samples + consumed,

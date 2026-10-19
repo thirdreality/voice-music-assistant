@@ -11,7 +11,6 @@
 
 namespace lva::proto {
 
-// One fully-parsed inbound frame.
 struct InboundFrame {
     std::uint32_t msg_type_id;
     std::vector<std::uint8_t> payload;

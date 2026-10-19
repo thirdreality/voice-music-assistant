@@ -208,9 +208,8 @@ bool AudioCapture::Start() {
 void AudioCapture::Stop() {
     if (!running_.load(std::memory_order_relaxed)) return;
 
-    // The capture thread owns handle teardown — closing the pa/alsa
-    // handle here would race a blocking read on it (use-after-free).
-    // Just signal and join; reads return within a period/buffer.
+    // The capture thread closes the handle; closing it here would race a
+    // blocking read.
     stop_requested_.store(true, std::memory_order_relaxed);
 
     if (thread_.joinable()) {
@@ -303,14 +302,10 @@ void AudioCapture::ThreadLoopAlsa() {
     std::vector<std::int16_t> mic(period);
     std::vector<std::int16_t> ref(period);
 
-    // Preserve the unmodified hardware-loopback reference. WebRTC's
-    // ProcessReverseStream() is allowed to write to the ref buffer, while
-    // the post-AEC Sendspin residual suppressor needs the original,
-    // sample-aligned outgoing music reference.
+    // ProcessReverseStream() may modify ref; the residual suppressor needs
+    // the original.
     std::vector<std::int16_t> ref_raw(period);
 
-    // Pre-allocated shadow-path scratch (avoid per-frame alloc on the
-    // real-time capture thread).
     std::vector<std::int16_t> linear_wake_frame(period);
 
     const int  ref_a = opts_.ref_channels[0];
@@ -339,8 +334,7 @@ void AudioCapture::ThreadLoopAlsa() {
                     }
                     break;
                 }
-                // Recover dropped samples → mic/ref no longer aligned;
-                // reset the AEC so it re-converges instead of leaking.
+                // After an xrun mic/ref are misaligned; reset the AEC.
                 if (processor_ != nullptr && have_ref) {
                     processor_->ResetEcho();
                 }
@@ -352,8 +346,7 @@ void AudioCapture::ThreadLoopAlsa() {
             break;
         }
         if (static_cast<std::size_t>(r) != period) {
-            // Short read: skip the partial frame rather than zero-pad
-            // it (padding would desync the AEC). Reset and retry.
+            // Zero-padding a short read would desync the AEC.
             if (!stop_requested_.load(std::memory_order_relaxed)) {
                 LVA_LOGW(kTag, "alsa short read: %ld/%zu frames; skipping",
                          static_cast<long>(r), period);
@@ -364,7 +357,6 @@ void AudioCapture::ThreadLoopAlsa() {
             continue;
         }
 
-        // De-interleave into mic + ref mono buffers.
         for (std::size_t i = 0; i < period; ++i) {
             const std::int16_t* row = il.data() + i * nch;
             mic[i] = row[mic_ch];
@@ -389,21 +381,12 @@ void AudioCapture::ThreadLoopAlsa() {
 
             processor_->Process(mic.data(), period);
 
-            // Primary wake path:
-            //
-            // Feed the normal post-WebRTC/APM microphone to the primary
-            // detector. This keeps wake detection on the normal processed
-            // microphone stream while playback is active.
             for (PcmRingBuffer* tap : wake_taps_) {
                 tap->Write(mic.data(), period);
             }
 
-            // Shadow wake path:
-            //
-            // Independently feed WebRTC's continuously exported linear-AEC
-            // signal to the shadow detector. Do not fall back to the primary
-            // stream here: when linear AEC is unavailable the secondary
-            // detector simply receives no frames.
+            // No fallback to the primary stream: without linear AEC the shadow
+            // detector gets no frames.
             if (!linear_wake_taps_.empty()) {
                 // GetLinearAecOutput() overwrites the buffer on success.
                 const bool have_linear_wake =
@@ -418,9 +401,6 @@ void AudioCapture::ThreadLoopAlsa() {
                 }
             }
 
-            // WebRTC AEC runs first. Only then remove a conservative,
-            // strongly-correlated remainder of external Sendspin audio.
-            // PostFrame() applies mic_volume after this stage.
             if (have_ref) {
                 processor_->SuppressSendspinResidual(
                     mic.data(), ref_raw.data(), period);

@@ -22,7 +22,6 @@ class UpdateEntity final : public Entity {
                    std::uint32_t request_msg_type_id,
                    const ResponseSink& sink) override;
 
-    // Push current state to all connected HA clients.
     void BroadcastState();
 
     void OnPeriodicTick();
@@ -53,7 +52,6 @@ class UpdateEntity final : public Entity {
     std::atomic<bool> worker_busy_{false};
     std::thread       worker_;
 
-    // Daily scheduled check state.
     int  daily_check_offset_min_ = -1;  // [0,60), set on first tick
     int  last_check_yday_        = -1;  // tm_yday of last daily check
 };

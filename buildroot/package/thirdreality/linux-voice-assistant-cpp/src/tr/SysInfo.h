@@ -17,9 +17,8 @@ struct DeviceInfo {
     std::string ssid;
     std::string ip;
 
-    // Convenience: MAC stripped to 12-char uppercase hex (AABBCCDDEEFF).
+    // AABBCCDDEEFF
     std::string normalized_mac() const;
-    // Convenience: serial == normalized_mac (matches Python convention).
     const std::string& serial_number() const { return mac_; }
     DeviceInfo();
 
@@ -28,7 +27,7 @@ struct DeviceInfo {
     std::string mac_;  // cached normalized form
 };
 
-// Reads /data/conf/device.json (default path). Cached by mtime.
+// Cached by mtime.
 DeviceInfo ReadDeviceInfo();
 
 std::string PreferredDeviceName();

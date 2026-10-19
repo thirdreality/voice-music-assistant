@@ -147,7 +147,6 @@ void ServerState::PersistStopWordSensitivity(double value) {
     auto& slot = preferences.stop_word_sensitivity;
     if (slot.has_value() && std::abs(*slot - value) < 1e-4) return;
     slot = value;
-    // Push to running stop model.
     if (wakeword_engine) {
         const auto micro_models = wakeword_engine->SnapshotModels();
         for (const auto& m : micro_models) {

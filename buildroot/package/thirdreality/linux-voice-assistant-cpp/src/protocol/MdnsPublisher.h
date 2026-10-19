@@ -1,5 +1,4 @@
-// MdnsPublisher: registers _esphomelib._tcp mDNS service via
-// avahi-client so HA can auto-discover this device on the LAN.
+// Publishes _esphomelib._tcp so HA discovers the device.
 
 #pragma once
 

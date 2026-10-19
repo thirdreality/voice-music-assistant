@@ -12,10 +12,21 @@
 
 #include "audio/ExternalWakeWord.h"
 
-namespace lva::audio    { class WakeWordEngine; class PcmRingBuffer; class IAudioPlayer; }
+namespace lva::audio    { class WakeWordEngine; class PcmRingBuffer; class IAudioPlayer; class ITextToSpeech; }
 namespace lva::state    { class ServerState; }
 
 namespace lva::satellite {
+
+class LocalStt;
+
+// On-device STT/TTS; HA only resolves the intent via conversation.process.
+// Pointers are non-owning.
+struct LocalVoiceConfig {
+    LocalStt*                  stt = nullptr;
+    lva::audio::ITextToSpeech* tts = nullptr;
+    std::string conversation_agent;  // empty = HA default
+    std::string language = "en";
+};
 
 class Satellite {
    public:
@@ -30,7 +41,6 @@ class Satellite {
 
     void OnWakeDetected(const std::string& model_id, float prob);
 
-    // Called when the stop word fires. Stops TTS / timer ring.
     void OnStopDetected();
 
     void OnTapPressed();
@@ -43,16 +53,15 @@ class Satellite {
 
     void OnLoopTick();
 
-    // Called when the last HA connection drops. Resets pipeline state.
     void OnDisconnected();
 
-    // Called when mic is muted. Stops streaming + TTS.
     void OnMuted();
 
+    // Call once at startup, before the first wake.
+    void EnableLocalVoice(LocalVoiceConfig cfg);
+
    private:
-    // ---- internal helpers (defined in .cpp) ----
     void StartPipeline(const std::string& wake_word_phrase);
-    // Begins streaming after the wake-up "ding" sound finishes.
     void OpenStreamToHa(const std::string& wake_word_phrase);
     void StopAudioStreaming();
     // Open the mic and ask HA to start listening (continued conversation).
@@ -64,10 +73,22 @@ class Satellite {
     void FinishSpeech(bool success);
     void PlayAnnounce(const std::string& media_id,
                       const std::string& preannounce_media_id,
+                      const std::string& text,
                       bool start_conversation);
 
-    // Runs the stop-word handling on the main thread (posted from
-    // OnStopDetected via pending_stop_).
+    // Local voice backend; main thread only.
+    bool LocalVoiceEnabled() const { return local_.stt != nullptr; }
+    void BeginLocalListening();
+    void PollLocalVoice();
+    void SendConversationRequest(const std::string& text);
+    void OnActionResponse(std::uint32_t call_id, bool success,
+                          const std::string& error_message,
+                          const std::string& response_data);
+    std::string SynthesizeToFile(const std::string& text);
+    void SpeakLocal(const std::string& text);
+    void FinishLocalTurn();
+    void CancelLocalTurn();
+
     void ProcessStopDetected();
 
     void StartTimerRing();
@@ -90,15 +111,9 @@ class Satellite {
     std::atomic<bool> pending_wake_{false};
     PendingWake       pending_wake_data_;
 
-    // Set from the wake-word engine thread when the stop word fires;
-    // consumed on the main thread in OnLoopTick (mirrors pending_wake_).
     std::atomic<bool> pending_stop_{false};
 
-    // Pipeline state. Mostly mirrors the Python class's flags.
-    // These are accessed from both the main epoll thread (OnVoiceEvent,
-    // mpv completion callbacks, OnLoopTick) and the wake-word engine thread
-    // (OnStopDetected) / mute path (OnMuted), so they must be atomic to avoid
-    // a data race.
+    // Atomic: also touched from the wake-word thread and the mute path.
     std::atomic<bool> is_streaming_audio_{false};
     std::atomic<bool> pipeline_active_{false};
     std::atomic<bool> continue_conversation_{false};
@@ -114,18 +129,25 @@ class Satellite {
     bool                                  timer_ringing_ = false;
     std::chrono::steady_clock::time_point timer_ring_start_{};
 
-    // Music player ducking state.
     bool   ducked_           = false;
 
     std::atomic<std::int64_t> refractory_until_ns_{0};
 
-    // Ignore stop-word detections briefly after a fresh wake.
-    // This prevents the wake chime / transition itself from aborting
-    // the pipeline before HA streaming has opened.
     std::atomic<std::int64_t> stop_guard_until_ns_{0};
 
     std::map<std::string, lva::audio::ExternalWakeWordInfo>
         external_wake_words_;
+
+    enum class LocalPhase { kIdle, kListening, kWaitingIntent };
+    LocalVoiceConfig local_;
+    LocalPhase       local_phase_       = LocalPhase::kIdle;
+    std::uint32_t    next_call_id_      = 1;
+    std::uint32_t    pending_call_id_   = 0;
+    std::chrono::steady_clock::time_point intent_deadline_{};
+    std::string      conversation_id_;
+    // Local reply playing: do not send AnnounceFinished to HA.
+    bool             local_speech_      = false;
+    unsigned         tts_file_seq_      = 0;
 
     std::filesystem::path ResolveWakeWordConfig(const std::string& id);
 };

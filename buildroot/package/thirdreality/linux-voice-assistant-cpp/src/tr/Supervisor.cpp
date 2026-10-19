@@ -174,7 +174,6 @@ void Supervisor::OtaWorker(std::string ota_id, OtaRelease release) {
 }
 
 void Supervisor::PerformReboot() {
-    // Sync 3x to flush NAND. Best-effort.
     for (int i = 0; i < 3; ++i) {
         std::system("sync");
     }
@@ -184,7 +183,6 @@ void Supervisor::PerformReboot() {
     pid_t pid = 0;
     if (::posix_spawn(&pid, prog, nullptr, nullptr,
                       argv, environ) != 0) {
-        // Fallback: try /usr/bin/reboot
         char prog2[]  = "/usr/bin/reboot";
         char* argv2[] = { prog2, nullptr };
         ::posix_spawn(&pid, prog2, nullptr, nullptr, argv2, environ);

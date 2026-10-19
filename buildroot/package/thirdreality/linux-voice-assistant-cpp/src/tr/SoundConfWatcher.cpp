@@ -39,7 +39,7 @@ void SoundConfWatcher::Poll() {
 
     struct stat st{};
     if (::stat(path_.c_str(), &st) != 0) {
-        // Silently ignore: file may not exist on first boot.
+        // May not exist on first boot.
         return;
     }
     if (st.st_mtim.tv_sec  == last_mtime_.tv_sec &&
@@ -53,7 +53,6 @@ void SoundConfWatcher::Poll() {
 void SoundConfWatcher::ReloadAndApply() {
     auto fresh = lva::state::Preferences::LoadFromFile(path_);
 
-    // ---- volume ----
     if (fresh.volume.has_value()) {
         const double on_disk = *fresh.volume;
         const double current =
@@ -66,7 +65,6 @@ void SoundConfWatcher::ReloadAndApply() {
         }
     }
 
-    // ---- mic_mute ----
     const bool on_disk_muted  = fresh.is_mic_muted();
     const bool current_muted  = state_.muted.load(std::memory_order_relaxed);
     if (on_disk_muted != current_muted) {

@@ -1,5 +1,3 @@
-// OpenWakeWord: per-keyword model that consumes embeddings from
-// OpenWakeWordFeatures and produces detection probabilities.
 
 #pragma once
 
@@ -37,9 +35,7 @@ class OpenWakeWord {
     bool Ok() const noexcept { return ok_; }
     const Config& config() const noexcept { return cfg_; }
 
-    // Live probability threshold. Written from the main thread,
-    // read from the wake-word thread in Process(); atomic to avoid a
-    // data race.
+    // Set on the main thread, read on the wake-word thread.
     void SetProbabilityCutoff(float v) noexcept {
         cutoff_live_.store(v, std::memory_order_relaxed);
     }
@@ -47,8 +43,7 @@ class OpenWakeWord {
         return cutoff_live_.load(std::memory_order_relaxed);
     }
 
-    // Feed embeddings (multiples of kWwFeatures floats).
-    // Returns true if detection threshold crossed.
+    // Takes multiples of kWwFeatures floats; true on detection.
     bool Process(const float* embeddings, std::size_t num_embeddings,
                  float* out_last_prob = nullptr);
 

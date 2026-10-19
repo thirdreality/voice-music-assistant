@@ -1,0 +1,379 @@
+diff --git a/include/whisper.h b/include/whisper.h
+index 545084e..c15b13d 100644
+--- a/include/whisper.h
++++ b/include/whisper.h
+@@ -210,6 +210,9 @@ extern "C" {
+     // These are the same as the above, but the internal state of the context is not allocated automatically
+     // It is the responsibility of the caller to allocate the state using whisper_init_state() (#523)
+     WHISPER_API struct whisper_context * whisper_init_from_file_with_params_no_state  (const char * path_model,              struct whisper_context_params params);
++    // LVA patch: mmap the weights instead of copying them. Needs a model
++    // rewritten by models/align-ggml-model.py.
++    WHISPER_API struct whisper_context * whisper_init_from_file_mmap_no_state(const char * path_model, struct whisper_context_params params);
+     WHISPER_API struct whisper_context * whisper_init_from_buffer_with_params_no_state(void * buffer, size_t buffer_size,    struct whisper_context_params params);
+     WHISPER_API struct whisper_context * whisper_init_with_params_no_state            (struct whisper_model_loader * loader, struct whisper_context_params params);
+ 
+diff --git a/src/whisper.cpp b/src/whisper.cpp
+index 1675f33..b1bf2e8 100644
+--- a/src/whisper.cpp
++++ b/src/whisper.cpp
+@@ -20,6 +20,13 @@
+ #include "vitisai/whisper-vitisai-encoder.h"
+ #endif
+ 
++#if !defined(_WIN32)
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#endif
++
+ #include <atomic>
+ #include <algorithm>
+ #include <cassert>
+@@ -931,6 +938,9 @@ struct whisper_state {
+ 
+     // [EXPERIMENTAL] speed-up techniques
+     int32_t exp_n_audio_ctx = 0; // 0 - use default
++    int32_t max_audio_ctx   = 0;       // LVA patch
++    int32_t max_text_ctx    = 0;       // LVA patch
++    bool    logits_single_row = false; // LVA patch
+ 
+     whisper_vad_context * vad_context = nullptr;
+ 
+@@ -961,6 +971,11 @@ struct whisper_context {
+     whisper_state * state = nullptr;
+ 
+     std::string path_model; // populated by whisper_init_from_file_with_params()
++
++    // LVA patch: CPU weights point into this read-only mapping when set.
++    void *   mmap_addr = nullptr;
++    size_t   mmap_len  = 0;
++    size_t * mmap_pos  = nullptr; // loader offset, only while loading
+ };
+ 
+ struct whisper_global {
+@@ -971,6 +986,13 @@ struct whisper_global {
+ 
+ static whisper_global g_state;
+ 
++// LVA patch: passes the mapping to whisper_init_with_params_no_state().
++struct whisper_mmap_handoff { void * addr = nullptr; size_t len = 0; size_t * pos = nullptr; };
++static whisper_mmap_handoff & whisper_mmap_pending() {
++    static thread_local whisper_mmap_handoff h;
++    return h;
++}
++
+ template<typename T>
+ static void read_safe(whisper_model_loader * loader, T & dest) {
+     loader->read(loader->context, &dest, sizeof(T));
+@@ -1858,9 +1880,17 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
+     }
+ 
+     // allocate tensors in the backend buffers
++    ggml_backend_buffer_t mmap_buf = nullptr;
++    if (wctx.mmap_addr != nullptr) {
++        mmap_buf = ggml_backend_cpu_buffer_from_ptr(wctx.mmap_addr, wctx.mmap_len);
++        model.buffers.emplace_back(mmap_buf);
++    }
+     for (auto & p : ctx_map) {
+         ggml_backend_buffer_type_t buft = p.first;
+         ggml_context * ctx = p.second;
++        if (mmap_buf != nullptr && buft == ggml_backend_cpu_buffer_type()) {
++            continue; // tensors are bound to the file mapping while loading
++        }
+         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+         if (buf) {
+             model.buffers.emplace_back(buf);
+@@ -1912,6 +1942,8 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
+             std::vector<char> tmp(length); // create a buffer
+             loader->read(loader->context, &tmp[0], tmp.size()); // read to buffer
+             name.assign(&tmp[0], tmp.size());
++            // LVA patch: aligned models NUL-pad the name.
++            while (!name.empty() && name.back() == '\0') name.pop_back();
+ 
+             if (model.tensors.find(name) == model.tensors.end()) {
+                 WHISPER_LOG_ERROR("%s: unknown tensor '%s' in model file\n", __func__, name.data());
+@@ -1941,7 +1973,21 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
+                 return false;
+             }
+ 
+-            if (ggml_backend_buffer_is_host(tensor->buffer)) {
++            if (tensor->buffer == nullptr && mmap_buf != nullptr) {
++                // LVA patch: bind the tensor to the mapping.
++                const size_t off = *wctx.mmap_pos;
++                if (off % 32 != 0 || off + ggml_nbytes(tensor) > wctx.mmap_len) {
++                    WHISPER_LOG_ERROR("%s: tensor '%s' at offset %zu is not 32-byte aligned; "
++                                      "use an aligned model file for mmap loading\n",
++                                      __func__, name.c_str(), off);
++                    return false;
++                }
++                if (ggml_backend_tensor_alloc(mmap_buf, tensor, (char *) wctx.mmap_addr + off) != GGML_STATUS_SUCCESS) {
++                    WHISPER_LOG_ERROR("%s: failed to bind tensor '%s'\n", __func__, name.c_str());
++                    return false;
++                }
++                *wctx.mmap_pos += ggml_nbytes(tensor);
++            } else if (ggml_backend_buffer_is_host(tensor->buffer)) {
+                 // for the CPU and Metal backend, we can read directly into the tensor
+                 loader->read(loader->context, tensor->data, ggml_nbytes(tensor));
+                 BYTESWAP_TENSOR(tensor);
+@@ -2518,6 +2564,15 @@ static bool whisper_encode_internal(
+     return !(abort_callback && abort_callback(abort_callback_data));
+ }
+ 
++// True when only the last token of the batch has its logits flag set.
++static bool whisper_batch_last_logits_only(const whisper_batch & batch) {
++    if (batch.n_tokens <= 0 || batch.logits == nullptr) return false;
++    for (int i = 0; i < batch.n_tokens - 1; ++i) {
++        if (batch.logits[i] != 0) return false;
++    }
++    return batch.logits[batch.n_tokens - 1] != 0;
++}
++
+ static struct ggml_cgraph * whisper_build_graph_decoder(
+          whisper_context & wctx,
+          whisper_state   & wstate,
+@@ -2874,10 +2929,10 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
+                 model.d_ln_b);
+     }
+ 
+-    // compute logits only for the last token
+-    // comment this line to compute logits for all n_tokens
+-    // might be useful in the future
+-    //cur = ggml_view_2d(ctx0, cur, cur->ne[0], 1, cur->nb[1], (cur->ne[1] - 1)*cur->nb[1]);
++    // LVA patch: logits for the last row only (96 MB -> 6 MB for tiny.en).
++    if (whisper_batch_last_logits_only(batch)) {
++        cur = ggml_view_2d(ctx0, cur, cur->ne[0], 1, cur->nb[1], (cur->ne[1] - 1)*cur->nb[1]);
++    }
+ 
+     struct ggml_tensor * logits = ggml_mul_mat(ctx0, model.d_te, cur);
+ 
+@@ -3009,12 +3064,20 @@ static bool whisper_decode_internal(
+         }
+     }
+ 
+-    logits_out.resize(n_tokens*n_vocab);
+-    for (int i = 0; i < n_tokens; i++) {
+-        if (batch.logits[i] == 0) {
+-            continue;
++    if (whisper_batch_last_logits_only(batch)) {
++        // Single row; readers use row 0 when logits_single_row is set.
++        logits_out.resize(n_vocab);
++        ggml_backend_tensor_get(logits, logits_out.data(), 0, sizeof(float)*n_vocab);
++        wstate.logits_single_row = true;
++    } else {
++        wstate.logits_single_row = false;
++        logits_out.resize(n_tokens*n_vocab);
++        for (int i = 0; i < n_tokens; i++) {
++            if (batch.logits[i] == 0) {
++                continue;
++            }
++            ggml_backend_tensor_get(logits, logits_out.data() + (n_vocab*i), sizeof(float)*(n_vocab*i), sizeof(float)*n_vocab);
+         }
+-        ggml_backend_tensor_get(logits, logits_out.data() + (n_vocab*i), sizeof(float)*(n_vocab*i), sizeof(float)*n_vocab);
+     }
+ 
+     if (batch.n_tokens > 1) {
+@@ -3461,13 +3524,27 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
+         return nullptr;
+     }
+ 
++    // LVA patch: optional caps for the KV caches and compute buffers.
++    // Unset = upstream sizing (30 s, 448 tokens).
++    state->max_audio_ctx = ctx->model.hparams.n_audio_ctx;
++    if (const char * env = getenv("WHISPER_MAX_AUDIO_CTX")) {
++        const int v = atoi(env);
++        if (v > 0 && v < state->max_audio_ctx) state->max_audio_ctx = v;
++    }
++    int max_text_ctx = ctx->model.hparams.n_text_ctx;
++    if (const char * env = getenv("WHISPER_MAX_TEXT_CTX")) {
++        const int v = atoi(env);
++        if (v > 0 && v < max_text_ctx) max_text_ctx = v;
++    }
++    state->exp_n_audio_ctx = state->max_audio_ctx;
++
+     // at this point, we don't know yet how many decoders will be used
+     // later during decoding, if more decoders are used, we will recreate the KV cache respectively
+     state->kv_self_n_dec = 1;
+     if (!whisper_kv_cache_init(state->kv_self, state->backends[0], ctx->itype,
+                 ctx->model.hparams.n_text_state,
+                 ctx->model.hparams.n_text_layer,
+-                GGML_PAD(ctx->model.hparams.n_text_ctx, 256))) {
++                GGML_PAD(max_text_ctx, 256))) {
+         WHISPER_LOG_ERROR("%s: whisper_kv_cache_init() failed for self-attention cache\n", __func__);
+         whisper_free_state(state);
+         return nullptr;
+@@ -3481,7 +3558,7 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
+     if (!whisper_kv_cache_init(state->kv_cross, state->backends[0], ctx->itype,
+                 ctx->model.hparams.n_text_state,
+                 ctx->model.hparams.n_text_layer,
+-                GGML_PAD(ctx->model.hparams.n_audio_ctx, 256))) {
++                GGML_PAD(state->max_audio_ctx, 256))) {
+         WHISPER_LOG_ERROR("%s: whisper_kv_cache_init() failed for cross-attention cache\n", __func__);
+         whisper_free_state(state);
+         return nullptr;
+@@ -3495,7 +3572,7 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
+     if (!whisper_kv_cache_init(state->kv_pad, state->backends[0], ctx->itype,
+                 ctx->model.hparams.n_audio_state,
+                 1,
+-                GGML_PAD(ctx->model.hparams.n_audio_ctx, 256))) {
++                GGML_PAD(state->max_audio_ctx, 256))) {
+         WHISPER_LOG_ERROR("%s: whisper_kv_cache_init() failed for self-attention cache\n", __func__);
+         whisper_free_state(state);
+         return nullptr;
+@@ -3562,7 +3639,9 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
+         WHISPER_LOG_INFO("%s: ANEForge encoder loaded\n", __func__);
+     }
+ 
+-    state->logits.reserve(ctx->vocab.n_vocab * ctx->model.hparams.n_text_ctx);
++    // LVA patch: one row of logits is enough (was 93 MB for tiny.en).
++    state->logits.reserve(ctx->vocab.n_vocab);
++    state->max_text_ctx = max_text_ctx;
+ 
+     state->batch = whisper_batch_init(ctx->model.hparams.n_text_ctx, WHISPER_MAX_DECODERS);
+ 
+@@ -3631,10 +3710,17 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
+                     const auto & hparams = ctx->model.hparams;
+ 
+                     // TODO: make sure this is the worst-case scenario
+-                    const int n_tokens = hparams.n_text_ctx;
++                    // LVA patch: optional prompt cap for buffer sizing.
++                    int n_tokens = hparams.n_text_ctx;
++                    if (const char * env = getenv("WHISPER_MAX_PROMPT_TOKENS")) {
++                        const int v = atoi(env);
++                        if (v > 0 && v < n_tokens) n_tokens = v;
++                    }
++                    n_tokens = std::min(n_tokens, max_text_ctx);
+                     const int n_past   = 0;
+ 
+                     whisper_batch_prep_legacy(state->batch, nullptr, n_tokens, n_past, 0);
++                    // Sized for greedy (last-row) logits.
+ 
+                     return whisper_build_graph_decoder(*ctx, *state, state->batch, ctx->params.dtw_token_timestamps, true);
+                 });
+@@ -3648,6 +3734,8 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
+         WHISPER_LOG_INFO("%s: compute buffer (decode) = %7.2f MB\n", __func__, whisper_sched_size(state->sched_decode) / 1e6);
+     }
+ 
++    state->exp_n_audio_ctx = 0;
++
+     return state;
+ }
+ 
+@@ -3772,6 +3860,58 @@ struct whisper_context * whisper_init_from_file_with_params_no_state(const char
+     return ctx;
+ }
+ 
++#if !defined(_WIN32)
++struct whisper_context * whisper_init_from_file_mmap_no_state(const char * path_model, struct whisper_context_params params) {
++    WHISPER_LOG_INFO("%s: mapping model from '%s'\n", __func__, path_model);
++
++    const int fd = open(path_model, O_RDONLY | O_CLOEXEC);
++    if (fd < 0) {
++        WHISPER_LOG_ERROR("%s: failed to open '%s'\n", __func__, path_model);
++        return nullptr;
++    }
++    struct stat st;
++    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
++        close(fd);
++        return nullptr;
++    }
++    const size_t len = (size_t) st.st_size;
++    void * addr = mmap(nullptr, len, PROT_READ, MAP_PRIVATE, fd, 0);
++    close(fd);
++    if (addr == MAP_FAILED) {
++        WHISPER_LOG_ERROR("%s: mmap failed for '%s'\n", __func__, path_model);
++        return nullptr;
++    }
++
++    struct map_ctx { const uint8_t * base; size_t size; size_t pos; };
++    map_ctx mc = { (const uint8_t *) addr, len, 0 };
++
++    whisper_model_loader loader = {};
++    loader.context = &mc;
++    loader.read = [](void * c, void * out, size_t n) {
++        auto * m = (map_ctx *) c;
++        const size_t k = m->pos + n <= m->size ? n : m->size - m->pos;
++        if (k > 0 && out != nullptr) memcpy(out, m->base + m->pos, k);
++        m->pos += k;
++        return k;
++    };
++    loader.eof   = [](void * c) { auto * m = (map_ctx *) c; return m->pos >= m->size; };
++    loader.close = [](void *) {};
++
++    whisper_mmap_pending() = { addr, len, &mc.pos };
++    auto * ctx = whisper_init_with_params_no_state(&loader, params);
++    whisper_mmap_pending() = {};
++
++    if (ctx == nullptr) {
++        munmap(addr, len);
++        return nullptr;
++    }
++    ctx->mmap_pos   = nullptr;
++    ctx->path_model = path_model;
++    madvise(addr, len, MADV_RANDOM);
++    return ctx;
++}
++#endif
++
+ struct whisper_context * whisper_init_from_buffer_with_params_no_state(void * buffer, size_t buffer_size, struct whisper_context_params params) {
+     struct buf_context {
+         uint8_t* buffer;
+@@ -3828,6 +3968,12 @@ struct whisper_context * whisper_init_with_params_no_state(struct whisper_model_
+ 
+     whisper_context * ctx = new whisper_context;
+     ctx->params = params;
++    {
++        const auto & m = whisper_mmap_pending();
++        ctx->mmap_addr = m.addr;
++        ctx->mmap_len  = m.len;
++        ctx->mmap_pos  = m.pos;
++    }
+ 
+     // A C++ exception escaping this extern "C" function aborts non-C++ callers
+     // (Rust via whisper-rs, Go via cgo, ...). whisper_model_load can throw
+@@ -3991,6 +4137,12 @@ void whisper_free(struct whisper_context * ctx) {
+ 
+         whisper_free_state(ctx->state);
+ 
++#if !defined(_WIN32)
++        if (ctx->mmap_addr != nullptr) {
++            munmap(ctx->mmap_addr, ctx->mmap_len);
++        }
++#endif
++
+         delete ctx;
+     }
+ }
+@@ -6356,7 +6508,8 @@ static void whisper_process_logits(
+     auto & logprobs = decoder.logprobs;
+     {
+         logits.resize(n_logits);
+-        memcpy(logits.data(), state.logits.data() + decoder.i_batch*n_logits, n_logits*sizeof(float));
++        const int row = state.logits_single_row ? 0 : decoder.i_batch;
++        memcpy(logits.data(), state.logits.data() + row*n_logits, n_logits*sizeof(float));
+ 
+         if (temperature > 0.0f) {
+             for (int i = 0; i < n_logits; i++) {
+@@ -7143,6 +7296,12 @@ int whisper_full_with_state(
+         WHISPER_LOG_ERROR("%s: audio_ctx is larger than the maximum allowed (%d > %d)\n", __func__, params.audio_ctx, whisper_n_audio_ctx(ctx));
+         return -5;
+     }
++    // LVA patch
++    if (state->max_audio_ctx > 0 &&
++        (params.audio_ctx == 0 ? whisper_n_audio_ctx(ctx) : params.audio_ctx) > state->max_audio_ctx) {
++        WHISPER_LOG_ERROR("%s: audio_ctx %d exceeds WHISPER_MAX_AUDIO_CTX %d\n", __func__, params.audio_ctx, state->max_audio_ctx);
++        return -5;
++    }
+     state->exp_n_audio_ctx = params.audio_ctx;
+ 
+     // these tokens determine the task that will be performed
+@@ -7376,7 +7535,8 @@ int whisper_full_with_state(
+                 }
+             }
+ 
+-            for (int i = 0, n_max = whisper_n_text_ctx(ctx)/2 - 4; i < n_max; ++i) {
++            const int n_text_cap = state->max_text_ctx > 0 ? state->max_text_ctx : whisper_n_text_ctx(ctx);
++            for (int i = 0, n_max = std::min(whisper_n_text_ctx(ctx)/2, n_text_cap - (int) prompt.size()) - 4; i < n_max; ++i) {
+                 const int64_t t_start_sample_us = ggml_time_us();
+ 
+                 if (params.strategy == whisper_sampling_strategy::WHISPER_SAMPLING_BEAM_SEARCH) {

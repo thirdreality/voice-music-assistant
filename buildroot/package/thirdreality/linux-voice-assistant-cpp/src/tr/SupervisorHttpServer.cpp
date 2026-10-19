@@ -202,7 +202,6 @@ std::string Md5HexOf(const std::string& s) {
     return m.HexDigest();
 }
 
-// URL-decode (percent-decode + plus → space).
 std::string UrlDecode(const std::string& in) {
     std::string out;
     out.reserve(in.size());
@@ -225,7 +224,6 @@ std::string UrlDecode(const std::string& in) {
 
 std::string Base64Decode(const std::string& in) {
     static const int8_t kTbl[256] = {
-        // populated below
     };
     static int8_t tbl[256];
     static bool init = false;
@@ -256,7 +254,6 @@ std::string Base64Decode(const std::string& in) {
 }
 
 std::string CanonicalSign(const std::map<std::string, std::string>& params) {
-    // std::map iterates in sorted key order, which is what we want.
     std::string s;
     bool first = true;
     for (const auto& [k, v] : params) {
@@ -340,7 +337,6 @@ void SupervisorHttpServer::AcceptLoop() {
 }
 
 void SupervisorHttpServer::HandleConnection(int conn_fd) {
-    // Read until \r\n\r\n or limit.
     std::string buf;
     buf.reserve(1024);
     timeval tv{5, 0};
@@ -362,7 +358,6 @@ void SupervisorHttpServer::HandleConnection(int conn_fd) {
     std::string headers_part = buf.substr(0, split);
     std::string body         = buf.substr(split + 4);
 
-    // Parse request line + headers.
     std::istringstream iss(headers_part);
     std::string request_line;
     std::getline(iss, request_line);
@@ -387,13 +382,11 @@ void SupervisorHttpServer::HandleConnection(int conn_fd) {
         if (colon == std::string::npos) continue;
         std::string k = Lower(line.substr(0, colon));
         std::string v = line.substr(colon + 1);
-        // trim leading whitespace from value
         const auto first = v.find_first_not_of(" \t");
         if (first != std::string::npos) v = v.substr(first);
         hdrs[k] = v;
     }
 
-    // Read body up to Content-Length.
     std::size_t cl = 0;
     if (auto it = hdrs.find("content-length"); it != hdrs.end()) {
         cl = static_cast<std::size_t>(std::strtoull(it->second.c_str(),
@@ -413,7 +406,6 @@ void SupervisorHttpServer::HandleConnection(int conn_fd) {
     }
     body.resize(cl);
 
-    // Strip query string for routing; we don't currently use any.
     std::string clean_path = path;
     if (auto q = clean_path.find('?'); q != std::string::npos) {
         clean_path = clean_path.substr(0, q);
@@ -564,7 +556,7 @@ void SupervisorHttpServer::HandlePost(int conn_fd, const std::string& path,
 
     if (command == "reboot") {
         SendJson(conn_fd, 200, "{\"success\":true}");
-        // Defer 3 s so the response actually reaches the client.
+        // Let the response reach the client first.
         std::thread([] {
             std::this_thread::sleep_for(std::chrono::seconds(3));
             Supervisor::PerformReboot();

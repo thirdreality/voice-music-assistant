@@ -52,7 +52,6 @@ void NumberEntity::OnCommand(const ::google::protobuf::MessageLite& request,
         cfg_.setter(new_value);
     }
 
-    // Echo back the current (possibly clamped) value.
     ::NumberStateResponse resp;
     resp.set_key(key());
     resp.set_state(static_cast<float>(cfg_.getter ? cfg_.getter()

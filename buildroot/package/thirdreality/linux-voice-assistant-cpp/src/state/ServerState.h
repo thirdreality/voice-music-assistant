@@ -23,14 +23,12 @@ namespace lva::state {
 
 class ServerState {
    public:
-    // ---- identity (set at startup, never changes) ----
     std::string name;            // e.g. "3RSPK-A8E291152F53"
     std::string friendly_name;   // human-readable fallback to name
     std::string mac_address;     // colon-separated, lowercase
     std::string version;         // our project version
     std::string esphome_version; // pinned to api.proto's contract
 
-    // ---- preferences (file-backed, hot path mirrors below) ----
     Preferences preferences;
     std::filesystem::path preferences_path;
     std::filesystem::path wakeword_dir;
@@ -47,7 +45,6 @@ class ServerState {
 
     class ::lva::audio::WebRtcProcessor* webrtc_processor = nullptr;
 
-    // Wake-word engine — used to push sensitivity changes at runtime.
     class ::lva::audio::WakeWordEngine* wakeword_engine = nullptr;
 
     class ::lva::tr::MicMuteGpio* mic_mute_gpio = nullptr;
@@ -58,7 +55,6 @@ class ServerState {
 
     class ::lva::audio::IAudioPlayer* announce_player = nullptr;
 
-    // Music player — used by Satellite to duck volume during voice.
     class ::lva::audio::IAudioPlayer* music_player = nullptr;
 
     class ::lva::tr::Supervisor* supervisor = nullptr;
@@ -81,23 +77,19 @@ class ServerState {
 
     void PersistVolume(double new_volume);
 
-    // Bump mute state similarly.
     void PersistMuted(bool new_muted);
 
     void PlayMuteToggleSound(bool muted);
 
-    // Bump thinking_sound similarly (0/1).
     void PersistThinkingSound(bool enabled);
 
-    // Persist the continued-conversation listen delay (seconds) and
-    // apply it to the live satellite timing.
     void PersistContinueConversationDelay(double seconds);
 
-    // Bump wake_word_N_sensitivity (1-based n in {1, 2}).
+    // n is 1-based.
     void PersistWakeWordSensitivity(int n, double value);
     void PersistStopWordSensitivity(double value);
 
-    // Bump mic_* values. Each clamps to its valid range.
+    // Each clamps to its valid range.
     void PersistMicAutoGain(int value);
     void PersistMicNoiseSuppression(int value);
     void PersistMicVolume(int value);

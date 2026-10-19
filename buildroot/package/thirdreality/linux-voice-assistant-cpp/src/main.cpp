@@ -1,5 +1,6 @@
 
 #include <getopt.h>
+#include <malloc.h>
 #include <fcntl.h>
 #include <sys/timerfd.h>
 #include <sys/wait.h>
@@ -30,11 +31,13 @@
 #include <nlohmann/json.hpp>
 
 #include "audio/AudioCapture.h"
+#include "audio/EspeakTts.h"
 #include "audio/LibMpvPlayer.h"
 #include "audio/MicroWakeWord.h"
 #include "audio/OpenWakeWord.h"
 #include "audio/OpenWakeWordFeatures.h"
 #include "audio/PcmRingBuffer.h"
+#include "audio/WhisperStt.h"
 #include "audio/WakeWordEngine.h"
 #include "audio/WebRtcProcessor.h"
 #include "entities/EventEntity.h"
@@ -46,6 +49,7 @@
 #include "entities/UpdateEntity.h"
 #include "protocol/ApiServer.h"
 #include "protocol/MdnsPublisher.h"
+#include "satellite/LocalStt.h"
 #include "satellite/Satellite.h"
 #include "state/Preferences.h"
 #include "state/ServerState.h"
@@ -130,7 +134,24 @@ void PrintUsage(const char* argv0) {
         "                           Seconds to wait after TTS finishes before\n"
         "                           opening the mic for a continued\n"
         "                           conversation (default: 0.5)\n"
-        "  --debug                  Enable debug logging\n"
+        "  --voice-backend <b>      ha|local. ha = stream audio to the HA\n"
+        "                           Assist pipeline (STT/TTS in HA); local =\n"
+        "                           on-device STT + TTS, HA only resolves\n"
+        "                           the intent. (default: ha; local falls\n"
+        "                           back to ha if the STT model is missing)\n"
+        "  --stt-model <path>       whisper.cpp ggml model for local STT\n"
+        "                           (default: /usr/share/thirdreality/stt/\n"
+        "                           ggml-tiny.en-q5_1.bin)\n"
+        "  --stt-threads <n>        Local STT decode threads, 1-4 (default: 4)\n"
+        "  --tts-data-dir <dir>     espeak-ng-data directory\n"
+        "                           (default: /usr/share/thirdreality/tts/espeak-ng-data)\n"
+        "  --conversation-agent <id>\n"
+        "                           HA conversation agent for the local\n"
+        "                           backend (default: HA's default agent)\n"
+        "  --stt-dump-wav <path>    Write each local-STT utterance to a WAV\n"
+        "                           file (mic diagnostics)\n"
+        "  --debug                  Enable debug logging and write it to\n"
+        "                           /usr/share/thirdreality/log/lva.log\n"
         "  --help                   Show this help and exit\n",
         argv0);
 }
@@ -151,6 +172,13 @@ struct CliOptions {
 
     double      continue_conversation_delay = 0.5;  // seconds
 
+    std::string voice_backend      = "ha";
+    std::string stt_model          = "/usr/share/thirdreality/stt/ggml-tiny.en-q5_1.bin";
+    int         stt_threads        = 4;
+    std::string tts_data_dir       = "/usr/share/thirdreality/tts/espeak-ng-data";
+    std::string conversation_agent;
+    std::string stt_dump_wav;
+
     bool debug = false;
 };
 
@@ -168,6 +196,12 @@ bool ParseCli(int argc, char** argv, CliOptions& out) {
         {"capture-mic-channel",   required_argument, nullptr, 'M'},
         {"capture-ref-channels",  required_argument, nullptr, 'R'},
         {"continue-conversation-delay", required_argument, nullptr, 'C'},
+        {"voice-backend",         required_argument, nullptr, 'V'},
+        {"stt-model",             required_argument, nullptr, 'S'},
+        {"stt-threads",           required_argument, nullptr, 'J'},
+        {"tts-data-dir",          required_argument, nullptr, 'T'},
+        {"conversation-agent",    required_argument, nullptr, 'G'},
+        {"stt-dump-wav",          required_argument, nullptr, 'D'},
         {"debug",                 no_argument,       nullptr, 'd'},
         {"help",                  no_argument,       nullptr, 'h'},
         {nullptr,                 0,                 nullptr, 0  },
@@ -187,6 +221,29 @@ bool ParseCli(int argc, char** argv, CliOptions& out) {
             case 'A': out.capture_alsa_device = optarg; break;
             case 'M': out.capture_mic_channel = std::atoi(optarg); break;
             case 'R': out.capture_ref_channels = optarg; break;
+            case 'V':
+                out.voice_backend = optarg;
+                if (out.voice_backend != "local" && out.voice_backend != "ha") {
+                    std::fprintf(stderr, "Invalid --voice-backend: %s\n",
+                                 optarg);
+                    return false;
+                }
+                break;
+            case 'S': out.stt_model = optarg; break;
+            case 'J': {
+                char* end = nullptr;
+                const long v = std::strtol(optarg, &end, 10);
+                if (end == optarg || *end != '\0' || v < 1 || v > 4) {
+                    std::fprintf(stderr, "Invalid --stt-threads: %s\n",
+                                 optarg);
+                    return false;
+                }
+                out.stt_threads = static_cast<int>(v);
+                break;
+            }
+            case 'T': out.tts_data_dir = optarg; break;
+            case 'G': out.conversation_agent = optarg; break;
+            case 'D': out.stt_dump_wav = optarg; break;
             case 'C': {
                 char* end = nullptr;
                 const double v = std::strtod(optarg, &end);
@@ -261,6 +318,12 @@ std::string ReadMacFromDeviceJson(const std::filesystem::path& path) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Per-thread arenas keep freed memory after each voice turn. Must run
+    // before any thread is created.
+    ::mallopt(M_ARENA_MAX, 1);
+    ::mallopt(M_MMAP_THRESHOLD, 128 * 1024);
+    ::mallopt(M_TRIM_THRESHOLD, 256 * 1024);
+
     CliOptions cli;
     if (!ParseCli(argc, argv, cli)) {
         return 2;
@@ -269,10 +332,9 @@ int main(int argc, char** argv) {
     lva::log::SetLevel(cli.debug ? lva::log::Level::kDebug
                                  : lva::log::Level::kInfo);
 
-    // Mirror logs to a persistent file (in addition to stderr), capped at
-    // 5 MiB; past that the single file is truncated and reused. Non-fatal if
-    // the path is not writable.
-    lva::log::SetLogFile("/usr/share/thirdreality/log/lva.log", 5u << 20);
+    if (cli.debug) {
+        lva::log::SetLogFile("/usr/share/thirdreality/log/lva.log", 5u << 20);
+    }
 
     LVA_LOGI(kTag,
              "linux-voice-assistant-cpp %s starting "
@@ -281,7 +343,6 @@ int main(int argc, char** argv) {
              static_cast<unsigned>(cli.port),
              cli.preferences_file.c_str());
 
-    // Build shared ServerState. Owned by main; ApiServer holds a ref.
     lva::state::ServerState state;
     state.name             = cli.device_name;
     state.friendly_name    = cli.device_name;
@@ -325,8 +386,6 @@ int main(int argc, char** argv) {
                       std::memory_order_relaxed);
     state.mic_volume_live.store(state.preferences.mic_volume,
                                 std::memory_order_relaxed);
-    // Prefer the persisted delay; fall back to the CLI default when it
-    // was never set from HA.
     {
         const double delay_s =
             state.preferences.continue_conversation_delay.value_or(
@@ -349,22 +408,31 @@ int main(int argc, char** argv) {
 
     lva::audio::LibMpvPlayer::Options tts_opts;
     tts_opts.audio_device     = cli.audio_device;
-    tts_opts.cache_secs       = 1;     // smaller for low TTS latency
+    tts_opts.cache_secs       = 1;
     tts_opts.short_sound_safe = true;
     auto announce_player = std::make_unique<lva::audio::LibMpvPlayer>(tts_opts);
 
-    // Primary detector: normal post-WebRTC/APM microphone stream.
     auto wake_ring = std::make_unique<lva::audio::PcmRingBuffer>(
         16'000 * 2);
 
-    // Shadow detector: independent continuous linear-AEC stream.
+    // Shadow detector input: WebRTC linear-AEC output.
     auto linear_wake_ring = std::make_unique<lva::audio::PcmRingBuffer>(
         16'000 * 2);
 
     auto satellite_ring = std::make_unique<lva::audio::PcmRingBuffer>(
         16'000 * 2);
 
-    // Parse capture backend + ref channels.
+    // The STT tap must be registered before capture starts.
+    bool use_local_voice = (cli.voice_backend == "local");
+    if (use_local_voice && !std::filesystem::exists(cli.stt_model)) {
+        LVA_LOGW(kTag, "local STT model %s not found; using ha voice "
+                       "backend", cli.stt_model.c_str());
+        use_local_voice = false;
+    }
+    auto local_stt_ring = use_local_voice
+        ? std::make_unique<lva::audio::PcmRingBuffer>(16'000 * 4)
+        : nullptr;
+
     lva::audio::AudioCapture::Options cap_opts;
     const bool use_alsa_backend = (cli.capture_backend == "alsa");
     if (use_alsa_backend) {
@@ -373,8 +441,8 @@ int main(int argc, char** argv) {
         cap_opts.alsa_channels      = 4;
         cap_opts.mic_channel        =
             static_cast<unsigned>(std::max(0, cli.capture_mic_channel));
-        cap_opts.frames_per_read    = 160;   // 10 ms; matches WebRTC frame
-        // Parse "a,b" / "a" / "" / "none" into ref_channels[2].
+        cap_opts.frames_per_read    = 160;   // one WebRTC frame
+        // "a,b" / "a" / "" / "none"
         std::array<int, 2> refs = {-1, -1};
         if (!cli.capture_ref_channels.empty() &&
             cli.capture_ref_channels != "none") {
@@ -395,7 +463,7 @@ int main(int argc, char** argv) {
         cap_opts.ref_channels = refs;
     } else if (cli.capture_backend == "pulse") {
         cap_opts.backend            = lva::audio::AudioCapture::Backend::kPulse;
-        cap_opts.frames_per_read    = 1600;   // 100 ms (legacy default)
+        cap_opts.frames_per_read    = 1600;
         cap_opts.buffer_latency_us  = 100'000;
     } else {
         LVA_LOGE(kTag, "unknown --capture-backend '%s'; expected alsa|pulse",
@@ -407,10 +475,10 @@ int main(int argc, char** argv) {
         cap_opts, *satellite_ring);
     audio_capture->AddWakeTap(*wake_ring);
     audio_capture->AddLinearWakeTap(*linear_wake_ring);
+    if (local_stt_ring) audio_capture->AddTap(*local_stt_ring);
 
-    // Tracks whether we materialized any first-boot default into
-    // preferences; if so we persist once below so /data/conf/sound.json
-    // becomes a complete snapshot of every setting on first run.
+    // Set when a first-boot default is filled in, so sound.json is saved
+    // once with every setting.
     bool prefs_dirty = false;
     if (state.preferences.mic_auto_gain == 0) {
         state.preferences.mic_auto_gain = 10;
@@ -449,9 +517,6 @@ int main(int argc, char** argv) {
     state.webrtc_processor = webrtc_processor.get();
     state.announce_player  = announce_player.get();
     state.music_player     = music_player.get();
-
-    // Shadow-detector guard. Armed on Sendspin playback start (fed via the
-    // lva control socket from sendspin-client); suppresses the linear-AEC
 
     std::uint32_t next_key = 0;
 
@@ -535,9 +600,6 @@ int main(int argc, char** argv) {
             },
         }));
 
-    // Continued-conversation listen delay (seconds). Persisted so it
-    // survives a cold reboot; getter falls back to the CLI-derived
-    // default when never set.
     state.entities.push_back(std::make_unique<lva::entities::NumberEntity>(
         next_key++,
         lva::entities::NumberEntity::Config{
@@ -575,7 +637,6 @@ int main(int argc, char** argv) {
             },
         }));
 
-    // Mic noise suppression: 5-level select. Maps label ↔ int 0..4.
     {
         static const std::vector<std::string> kNoiseOptions = {
             "Off", "Low", "Medium", "High", "Max",
@@ -671,7 +732,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // mDNS: register _esphomelib._tcp so HA auto-discovers us.
     lva::proto::MdnsPublisher mdns;
     {
         lva::proto::MdnsPublisher::Options mdns_opts;
@@ -707,8 +767,6 @@ int main(int argc, char** argv) {
         std::make_unique<lva::audio::WakeWordEngine>(*wake_ring);
 
     {
-        // Prefer the persisted selection (survives cold reboot); fall
-        // back to the CLI default only when nothing was ever saved.
         std::vector<std::string> ids;
         for (const auto& slot : state.preferences.active_wake_words) {
             if (slot.has_value() && !slot->empty()) ids.push_back(*slot);
@@ -762,7 +820,7 @@ int main(int argc, char** argv) {
     }
 
     if (!use_openwakeword) {
-        // Stop word only for micro mode (micro-specific model)
+        // The stop model only exists for microWakeWord.
         const std::filesystem::path micro_dir =
             "/usr/share/thirdreality/wakewords/microwakeword";
         const auto stop_json = micro_dir / "stop.json";
@@ -774,12 +832,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Apply persisted sensitivities to the freshly loaded models. The
-    // model files carry a built-in default cutoff; without this the
-    // user's saved wake/stop sensitivities are silently ignored after a
-    // (cold) reboot even though HA shows the stored slider value. Slot
-    // ordering mirrors PersistWakeWordSensitivity(): non-stop micro
-    // models first, then open models; the stop model is separate.
+    // Models load with their built-in cutoff; apply the saved ones. Slot
+    // order must match PersistWakeWordSensitivity(): micro, then open.
     {
         std::size_t wake_idx = 0;
         const auto micro_models = wakeword_engine->SnapshotModels();
@@ -811,12 +865,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Materialize first-boot defaults for the optional settings so that
-    // /data/conf/sound.json ends up holding an explicit value for every
-    // configuration item, not just the ones the user has touched. Only
-    // fill slots that have a real wake-word model loaded; the stop-word
-    // default is only meaningful in micro mode (where a stop model
-    // exists). Anything already set (loaded from disk) is left as-is.
+    // First-boot defaults, only for slots with a loaded model.
     {
         const double wake_default = use_openwakeword
             ? kDefaultOpenWakeSensitivity
@@ -849,8 +898,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Persist once if any first-boot default was materialized above, so
-    // the on-disk config is complete after the very first run.
     if (prefs_dirty) {
         if (state.SavePreferences()) {
             LVA_LOGI(kTag, "persisted complete config to %s",
@@ -861,20 +908,46 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Shared dispatch gate. Only one detector is allowed to hand a
-    // wake to Satellite inside this interval. This prevents the two wake
-    // threads from concurrently writing Satellite's pending-wake payload.
+    // Only one of the two wake threads may hand a wake to Satellite at a
+    // time; they would otherwise race on the pending-wake payload.
     std::atomic<std::int64_t> last_wake_dispatch_ns{0};
 
-    // Voice satellite state machine.
     auto satellite = std::make_unique<lva::satellite::Satellite>(
         state, *satellite_ring, *wakeword_engine, announce_player.get());
     state.satellite = satellite.get();
 
-    // The shadow wake engine owns a completely independent
-    // MicroFeatures instance, TFLite runtime, and probability history.
-    // It is intentionally not exposed through state.wakeword_engine:
-    // Home Assistant continues to manage only the primary engine.
+    std::unique_ptr<lva::satellite::LocalStt> local_stt;
+    std::unique_ptr<lva::audio::EspeakTts>    local_tts;
+    if (use_local_voice) {
+        lva::audio::WhisperStt::Config wcfg;
+        wcfg.model_path  = cli.stt_model;
+        wcfg.num_threads = cli.stt_threads;
+
+        lva::satellite::LocalStt::Options stt_opts;
+        stt_opts.dump_wav_path = cli.stt_dump_wav;
+        local_stt = std::make_unique<lva::satellite::LocalStt>(
+            std::make_unique<lva::audio::WhisperStt>(wcfg),
+            *local_stt_ring, stt_opts);
+        local_stt->Start();
+
+        lva::audio::EspeakTts::Config tts_cfg;
+        tts_cfg.data_dir = cli.tts_data_dir;
+        local_tts = std::make_unique<lva::audio::EspeakTts>(tts_cfg);
+        if (!local_tts->Start()) {
+            LVA_LOGW(kTag, "local TTS unavailable; replies will be silent");
+            local_tts.reset();
+        }
+
+        lva::satellite::LocalVoiceConfig voice_cfg;
+        voice_cfg.stt                = local_stt.get();
+        voice_cfg.tts                = local_tts.get();
+        voice_cfg.conversation_agent = cli.conversation_agent;
+        satellite->EnableLocalVoice(std::move(voice_cfg));
+    }
+    LVA_LOGI(kTag, "voice backend=%s", use_local_voice ? "local" : "ha");
+
+    // Independent shadow engine; deliberately not in state.wakeword_engine,
+    // HA only manages the primary one.
     auto linear_wakeword_engine =
         std::make_unique<lva::audio::WakeWordEngine>(*linear_wake_ring);
 
@@ -893,14 +966,8 @@ int main(int argc, char** argv) {
                 lva::audio::MicroWakeWord::FromConfig(json_path);
 
             if (shadow_model && shadow_model->Ok()) {
-                // The shadow path runs on WebRTC's clean linear-AEC output,
-                // which is only available during far-end playback -- exactly
-                // the strong-echo case where the primary (post-APM) path is
-                // suppressed below threshold. Field telemetry shows the
-                // shadow mean peaks around 0.4 for a real wake during music,
-                // far under the 0.85 primary cutoff, so give it an
-                // independent, much lower threshold. The primary path keeps
-                // 0.85 to guard against false wakes while idle.
+                // Linear-AEC output only exists during playback, where real
+                // wakes score far below the primary cutoff.
                 constexpr float kShadowProbabilityCutoff = 0.40f;
                 shadow_model->SetProbabilityCutoff(kShadowProbabilityCutoff);
                 shadow_model->SetSourceTag("linear_aec");
@@ -924,7 +991,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    // When HA disconnects, reset satellite state.
     state.on_client_disconnected = [&satellite] {
         satellite->OnDisconnected();
     };
@@ -1006,10 +1072,6 @@ int main(int argc, char** argv) {
                     std::chrono::steady_clock::now()
                         .time_since_epoch()).count();
 
-            // Resume guard is owned by WebRtcProcessor and armed on any
-            // echo-canceller idle->active transition (Sendspin or internal
-            // media/TTS), so the shadow path is protected during AEC3's
-            // dirty post-start convergence regardless of the far-end source.
             const auto guard_until_ns =
                 state.webrtc_processor != nullptr
                     ? state.webrtc_processor->LinearGuardUntilNs()
@@ -1109,7 +1171,6 @@ int main(int argc, char** argv) {
                 std::uint64_t expirations = 0;
                 while (::read(satellite_tick_fd,
                               &expirations, sizeof(expirations)) > 0) {
-                    // drain — we don't care about the count
                 }
                 satellite->OnLoopTick();
                 mic_mute_gpio->Poll();
@@ -1127,9 +1188,7 @@ int main(int argc, char** argv) {
     bool tap_playback_pending = false;
     bool tap_ha_was_playing = false;
 
-    // Button control socket: tr-buttond owns /dev/input/event0 and forwards
-    // tap/home gestures here over a Unix datagram socket. lva no longer reads
-    // the input device.
+    // tr-buttond owns the input device and forwards gestures here.
     auto control_listener = std::make_unique<lva::tr::ControlListener>(
         [&state, home_button_entity, &satellite,
          &tap_playback_pending, &tap_ha_was_playing](const std::string& cmd) {
@@ -1176,16 +1235,10 @@ int main(int argc, char** argv) {
                 if (*value != 0 && *value != 1) return false;
                 const bool active = (*value == 1);
 
-                // Gate the AEC echo canceller on external Sendspin / Music
-                // Assistant playback. lva's own media_player state does not
-                // track the independent Sendspin pipeline, so this socket
-                // signal is the authoritative far-end source for that path.
+                // Sendspin playback is not visible to our media player.
                 if (state.webrtc_processor != nullptr) {
                     state.webrtc_processor->SetExternalFarEndActive(active);
                 }
-                // Far-end state for score telemetry only. The shadow guard
-                // is armed inside WebRtcProcessor on the AEC transition that
-                // SetExternalFarEndActive() triggers, so nothing to arm here.
                 lva::audio::MicroWakeWord::SetFarEndTelemetry(active);
                 LVA_LOGD(kTag, "sendspin playback %s -> external far-end %s",
                          active ? "started" : "stopped",
@@ -1227,6 +1280,7 @@ int main(int argc, char** argv) {
     mdns.Stop();
     wakeword_engine->Stop();
     linear_wakeword_engine->Stop();
+    if (local_stt) local_stt->Stop();
     audio_capture->Stop();
 
     const int signo = g_shutdown_signal.load(std::memory_order_relaxed);

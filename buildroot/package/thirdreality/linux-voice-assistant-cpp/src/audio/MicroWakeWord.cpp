@@ -65,7 +65,6 @@ std::unique_ptr<MicroWakeWord> MicroWakeWord::FromConfig(
     }
     cfg.sliding_window_size = std::clamp(cfg.sliding_window_size, 1, kMaxSlidingWindow);
 
-    // Load .tflite + cache tensor metadata.
     if (!out->runtime_.Ok()) {
         LVA_LOGE(kTag, "TFLite runtime not available: %s",
                  out->runtime_.LastError().c_str());
@@ -125,7 +124,6 @@ std::unique_ptr<MicroWakeWord> MicroWakeWord::FromConfig(
              out->input_scale_, out->input_zero_point_,
              out->output_scale_, out->output_zero_point_);
 
-    // Seed the live (atomic) cutoff from the parsed config value.
     out->cutoff_live_.store(cfg.probability_cutoff,
                             std::memory_order_relaxed);
     out->ok_ = true;
@@ -198,13 +196,11 @@ bool MicroWakeWord::Process(const float* frames,
     if (!ok_) return false;
 
     for (std::size_t f = 0; f < frame_count; ++f) {
-        // Append one frame to the accumulator.
         features_buffer_.insert(
             features_buffer_.end(),
             frames + f * MicroFeatures::kFeatureSize,
             frames + (f + 1) * MicroFeatures::kFeatureSize);
 
-        // Once we have `stride_` frames, run an invoke and clear.
         const std::size_t target =
             static_cast<std::size_t>(stride_) * MicroFeatures::kFeatureSize;
         if (features_buffer_.size() < target) continue;
@@ -212,7 +208,6 @@ bool MicroWakeWord::Process(const float* frames,
         const float prob = InvokeOnce(features_buffer_.data());
         features_buffer_.clear();
 
-        // Sliding-window smoothing.
         probabilities_.push_back(prob);
         if (static_cast<int>(probabilities_.size()) > cfg_.sliding_window_size) {
             probabilities_.pop_front();
@@ -228,8 +223,7 @@ bool MicroWakeWord::Process(const float* frames,
                           / static_cast<float>(probabilities_.size());
         const float cutoff = cutoff_live_.load(std::memory_order_relaxed);
 
-        // Diagnostic score telemetry. Skip quiet frames so the log is not
-        // flooded with mean=0.000; a sparse heartbeat still shows liveness.
+        // Skip quiet frames; a sparse heartbeat still shows liveness.
         {
             const bool far_end =
                 far_end_telemetry_.load(std::memory_order_relaxed);
@@ -253,9 +247,8 @@ bool MicroWakeWord::Process(const float* frames,
         }
 
         if (mean > cutoff) {
-            // Per-frame hit: fires on every frame above cutoff for the whole
-            // ~0.5 s utterance. DEBUG only; the single wake event is logged
-            // upstream ("starting voice pipeline").
+            // Fires on every frame of the utterance; the wake itself is
+            // logged by Satellite.
             LVA_LOGD(kTag,
                      "[%s/%s] far_end=%d DETECTED mean=%.3f cutoff=%.3f raw=%.3f",
                      source_tag_.empty() ? "?" : source_tag_.c_str(),

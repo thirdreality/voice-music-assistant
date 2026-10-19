@@ -5,7 +5,6 @@
 
 namespace lva::proto {
 
-// Connection lifecycle (see api_server.py).
 inline constexpr std::uint32_t kIdHelloRequest                          = 1;
 inline constexpr std::uint32_t kIdHelloResponse                         = 2;
 inline constexpr std::uint32_t kIdAuthenticationRequest                 = 3;
@@ -17,7 +16,6 @@ inline constexpr std::uint32_t kIdPingResponse                          = 8;
 inline constexpr std::uint32_t kIdDeviceInfoRequest                     = 9;
 inline constexpr std::uint32_t kIdDeviceInfoResponse                    = 10;
 
-// Entity discovery (see entity.py).
 inline constexpr std::uint32_t kIdListEntitiesRequest                   = 11;
 inline constexpr std::uint32_t kIdListEntitiesDoneResponse              = 19;
 inline constexpr std::uint32_t kIdSubscribeStatesRequest                = 20;
@@ -49,10 +47,13 @@ inline constexpr std::uint32_t kIdListEntitiesUpdateResponse            = 116;
 inline constexpr std::uint32_t kIdUpdateStateResponse                   = 117;
 inline constexpr std::uint32_t kIdUpdateCommandRequest                  = 118;
 
+inline constexpr std::uint32_t kIdSubscribeHomeassistantServicesRequest = 34;
+inline constexpr std::uint32_t kIdHomeassistantActionRequest            = 35;
+inline constexpr std::uint32_t kIdHomeassistantActionResponse           = 130;
+
 inline constexpr std::uint32_t kIdGetTimeRequest                        = 36;
 inline constexpr std::uint32_t kIdGetTimeResponse                       = 37;
 
-// Voice assistant pipeline (see satellite.py).
 inline constexpr std::uint32_t kIdSubscribeVoiceAssistantRequest         = 89;
 inline constexpr std::uint32_t kIdVoiceAssistantRequest                 = 90;
 inline constexpr std::uint32_t kIdVoiceAssistantEventResponse           = 92;

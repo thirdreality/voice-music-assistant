@@ -18,16 +18,13 @@ namespace lva::audio {
 class MicroWakeWord {
    public:
     struct Config {
-        // Wake word identifier (e.g. "okay_nabu") + display name.
         std::string id;
         std::string wake_word;        // e.g. "Okay Nabu"
         std::vector<std::string> trained_languages;
 
-        // Path to the .tflite (resolved by Load()).
         std::filesystem::path model_path;
 
-        // From the per-model JSON. Initial value only; the live
-        // threshold is cutoff_live_ (atomic).
+        // Initial value; the live threshold is cutoff_live_.
         float    probability_cutoff   = 0.85f;
         int      sliding_window_size  = 5;
     };
@@ -41,19 +38,14 @@ class MicroWakeWord {
     static std::unique_ptr<MicroWakeWord> FromConfig(
         const std::filesystem::path& json_path);
 
-    // Returns true if the model and its TFLite runtime are ready.
     bool Ok() const noexcept { return ok_; }
 
     const Config& config() const noexcept { return cfg_; }
 
-    // Live probability threshold. Written from the main thread,
-    // read from the wake-word thread in Process(); atomic to avoid
-    // a data race.
-    // Diagnostic: tag this detector's score logs (post_apm / linear_aec).
+    // Tags score logs (post_apm / linear_aec).
     void SetSourceTag(const std::string& tag) { source_tag_ = tag; }
 
-    // Diagnostic only: annotates score logs with far-end playback state.
-    // Does not affect detection.
+    // Log annotation only; does not affect detection.
     static void SetFarEndTelemetry(bool active) {
         far_end_telemetry_.store(active, std::memory_order_relaxed);
     }
@@ -80,7 +72,7 @@ class MicroWakeWord {
     std::string source_tag_;
     bool   ok_ = false;
 
-    // Live, thread-safe copy of cfg_.probability_cutoff.
+    // Set on the main thread, read on the wake-word thread.
     std::atomic<float> cutoff_live_{0.85f};
 
     TfliteRuntime runtime_;
@@ -101,11 +93,9 @@ class MicroWakeWord {
 
     float last_prob_ = 0.0f;
 
-    // Per-instance log-pacing counter (must not be shared across models on
-    // the same engine thread, or the heartbeat fires for only one of them).
+    // Per instance, or the heartbeat fires for only one model.
     unsigned int score_log_counter_ = 0;
 
-    // Shared across all detector instances; see SetFarEndTelemetry().
     static std::atomic<bool> far_end_telemetry_;
 };
 

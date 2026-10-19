@@ -44,17 +44,11 @@ class TfliteRuntime {
 
     const std::string& LastError() const noexcept { return last_error_; }
 
-    // -------------- model + interpreter lifecycle --------------
-
     bool LoadModel(const std::string& model_path);
 
-    // Free the current model + interpreter (no-op if nothing loaded).
     void Unload();
 
-    // True between a successful LoadModel() and an Unload() / dtor.
     bool ModelLoaded() const noexcept { return interpreter_ != nullptr; }
-
-    // -------------- tensor access --------------
 
     int InputCount()  const noexcept;
     int OutputCount() const noexcept;
@@ -77,7 +71,6 @@ class TfliteRuntime {
     bool        allocated_    = false;
     std::string last_error_;
 
-    // Opaque, owned. nullptr when no model loaded.
     void*       model_        = nullptr;
     void*       interpreter_  = nullptr;
 };

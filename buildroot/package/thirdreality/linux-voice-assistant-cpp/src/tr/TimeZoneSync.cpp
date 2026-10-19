@@ -95,7 +95,6 @@ bool ApplyTimezone(const std::string& zone_arg) {
         return false;
     }
 
-    // No-op if already set.
     if (ReadEtcTimezone() == iana_name) {
         return true;
     }
@@ -128,7 +127,6 @@ bool ApplyTimezone(const std::string& zone_arg) {
         return false;
     }
 
-    // Mirror /etc/timezone (text file).
     {
         const std::string tz_tmp = std::string(kEtcTimezone) + ".tmp";
         std::ofstream f(tz_tmp);

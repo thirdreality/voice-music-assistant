@@ -14,7 +14,6 @@ namespace {
 
 constexpr const char* kTag = "tflite";
 
-// Mirror of the C API's TfLiteQuantizationParams struct.
 struct TfLiteQuantizationParamsC {
     float    scale;
     int32_t  zero_point;

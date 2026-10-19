@@ -3,18 +3,24 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+
+#include <malloc.h>
 #include <optional>
 #include <utility>
 #include <vector>
 
 #include "audio/ExternalWakeWord.h"
 #include "audio/IAudioPlayer.h"
+#include "audio/ITextToSpeech.h"
 #include "audio/MicroWakeWord.h"
 #include "audio/OpenWakeWord.h"
 #include "audio/PcmRingBuffer.h"
 #include "audio/WakeWordEngine.h"
 #include "audio/WakeWordScanner.h"
+#include "audio/WavFile.h"
 #include "protocol/MessageRegistry.h"
+#include "satellite/ConversationReply.h"
+#include "satellite/LocalStt.h"
 #include "state/ServerState.h"
 #include "tr/LedRing.h"
 #include "tr/SendspinControl.h"
@@ -55,6 +61,18 @@ constexpr const char* kTimerFinishedSoundPath =
 
 constexpr int kTimerMaxRingSeconds = 900;
 
+constexpr const char* kTtsDir = "/tmp/lva-tts";
+// LLM conversation agents can take several seconds.
+constexpr auto kIntentTimeout = std::chrono::seconds(15);
+
+constexpr const char* kLocalSttUnavailable =
+    "Local speech recognition is still loading.";
+constexpr const char* kLocalNoConnection =
+    "I am not connected to Home Assistant.";
+constexpr const char* kLocalIntentFailed =
+    "Sorry, something went wrong.";
+
+
 }  // namespace
 
 Satellite::Satellite(lva::state::ServerState& state,
@@ -78,19 +96,14 @@ void Satellite::OnWakeDetected(const std::string& model_id, float prob) {
 }
 
 void Satellite::OnStopDetected() {
-    // Called on the wake-word engine thread. Do not touch non-atomic
-    // members here; just post the event and let OnLoopTick handle it on
-    // the main thread (mirrors the pending_wake_ pattern).
+    // Wake-word thread: only post the event; OnLoopTick handles it.
     pending_stop_.store(true, std::memory_order_release);
 }
 
 void Satellite::ProcessStopDetected() {
     if (!pipeline_active_ && !timer_ringing_) return;
 
-    // Timer stop must always remain immediate. For an ordinary voice
-    // pipeline, however, ignore stop detections during the first second
-    // after a wake, while the wake chime is still transitioning into
-    // HA streaming.
+    // Ignore stop words during the wake chime, except to stop a timer.
     if (!timer_ringing_) {
         const auto now_ns =
             std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -127,6 +140,7 @@ void Satellite::ProcessStopDetected() {
             FinishSpeech(false);
         } else {
             wake_sound_pending_ = false;
+            CancelLocalTurn();
             pipeline_active_ = false;
             Unduck();
             lva::tr::Show(lva::tr::LedState::Idle);
@@ -153,6 +167,7 @@ bool Satellite::AbortSpeechIfSpeaking() {
     if (!speech_active_) {
         continue_conversation_ = false;
         continue_listen_at_ns_.store(0, std::memory_order_relaxed);
+        CancelLocalTurn();
         if (is_streaming_audio_) {
             StopAudioStreaming();
             if (state_.broadcast) {
@@ -182,6 +197,7 @@ void Satellite::PrepareForMediaAnnouncement() {
     }
     if (wake_sound_pending_.exchange(false, std::memory_order_acq_rel)) {
         if (announce_player_ != nullptr) announce_player_->Stop();
+        CancelLocalTurn();
         pipeline_active_ = false;
         Unduck();
         lva::tr::Show(lva::tr::LedState::Idle);
@@ -225,7 +241,6 @@ void Satellite::StartPipeline(const std::string& wake_word_phrase) {
     LVA_LOGI(kTag, "starting voice pipeline (wake='%s')",
              wake_word_phrase.c_str());
 
-    // Refractory window mirrors Python LVA's `refractory_seconds=2.0`.
     refractory_until_ns_.store(now_ns + 2'000'000'000LL,
                                std::memory_order_relaxed);
 
@@ -270,6 +285,10 @@ void Satellite::OpenStreamToHa(const std::string& wake_word_phrase) {
         LVA_LOGD(kTag, "OpenStreamToHa: pipeline no longer active; skip");
         return;
     }
+    if (LocalVoiceEnabled()) {
+        BeginLocalListening();
+        return;
+    }
     is_streaming_audio_ = true;
 
     {
@@ -302,15 +321,9 @@ void Satellite::OpenStreamToHa(const std::string& wake_word_phrase) {
 void Satellite::PumpAudioToHa() {
     std::vector<std::int16_t> chunk(kAudioPumpSamples);
 
-    // The capture thread writes mic audio into mic_ring_ unconditionally,
-    // but this ring is an on-demand consumer: HA only wants it while a voice
-    // pipeline is streaming. When idle, drain and discard so the ring never
-    // backs up (otherwise it fills within ~2 s and the capture thread logs a
-    // perpetual "ring overrun"). Draining here keeps a real overrun signal
-    // meaningful: if it ever fires again it means streaming could not keep up.
+    // Drain while idle, so an overrun only means streaming fell behind.
     if (!is_streaming_audio_ || !state_.broadcast) {
         while (mic_ring_.Read(chunk.data(), chunk.size()) > 0) {
-            // discard
         }
         return;
     }
@@ -334,6 +347,11 @@ void Satellite::StopAudioStreaming() {
 }
 
 void Satellite::BeginListening() {
+    if (LocalVoiceEnabled()) {
+        pipeline_active_ = true;
+        BeginLocalListening();
+        return;
+    }
     // Drain stale mic audio captured during TTS playback before re-streaming.
     {
         std::int16_t scratch[1024];
@@ -377,7 +395,8 @@ void Satellite::PlayTts() {
 void Satellite::FinishSpeech(bool success) {
     if (!speech_active_.exchange(false, std::memory_order_acq_rel)) return;
 
-    if (state_.broadcast) {
+    const bool was_local = std::exchange(local_speech_, false);
+    if (state_.broadcast && !was_local) {
         ::VoiceAssistantAnnounceFinished done;
         done.set_success(success);
         state_.broadcast(lva::proto::kIdVoiceAssistantAnnounceFinished, done);
@@ -397,14 +416,23 @@ void Satellite::FinishSpeech(bool success) {
         pipeline_active_ = false;
         lva::tr::Show(lva::tr::LedState::Idle);
         Unduck();
+        ::malloc_trim(0);
     }
 }
 
 void Satellite::PlayAnnounce(const std::string& media_id,
                              const std::string& preannounce_media_id,
+                             const std::string& text,
                              bool start_conversation) {
     if (announce_player_ == nullptr) return;
-    if (media_id.empty()) return;
+
+    // Speak announcement text locally; media without text plays as-is.
+    std::string play_id = media_id;
+    if (LocalVoiceEnabled() && local_.tts != nullptr && !text.empty()) {
+        const std::string path = SynthesizeToFile(text);
+        if (!path.empty()) play_id = path;
+    }
+    if (play_id.empty()) return;
 
     if (timer_ringing_) StopTimerRing();
     pipeline_active_ = true;
@@ -412,8 +440,9 @@ void Satellite::PlayAnnounce(const std::string& media_id,
     continue_conversation_ = start_conversation;
 
     speech_active_ = true;
-    auto play_main = [this, media_id]() {
-        announce_player_->Play(media_id, [this]() {
+    local_speech_  = false;
+    auto play_main = [this, play_id]() {
+        announce_player_->Play(play_id, [this]() {
             FinishSpeech(true);
         });
     };
@@ -476,7 +505,6 @@ void Satellite::StopTimerRing() {
 void Satellite::OnTimerSoundEof() {
     if (!timer_ringing_) return;  // user cancelled
 
-    // Auto-stop after kTimerMaxRingSeconds.
     const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::steady_clock::now() - timer_ring_start_).count();
     if (elapsed >= kTimerMaxRingSeconds) {
@@ -520,7 +548,6 @@ void Satellite::OnVoiceEvent(
             pipeline_active_       = false;
             continue_conversation_ = false;
             wake_sound_pending_    = false;
-            // Pair the duck() from StartPipeline.
             Unduck();
             break;
         }
@@ -596,14 +623,12 @@ void Satellite::OnVoiceEvent(
 }
 
 void Satellite::OnLoopTick() {
-    // Consume pending wake-word event, if any.
     if (pending_wake_.load(std::memory_order_acquire)) {
         const PendingWake snap = pending_wake_data_;
         pending_wake_.store(false, std::memory_order_relaxed);
         StartPipeline(snap.model_id);
     }
 
-    // Consume pending stop-word event, if any.
     if (pending_stop_.exchange(false, std::memory_order_acq_rel)) {
         ProcessStopDetected();
     }
@@ -628,13 +653,15 @@ void Satellite::OnLoopTick() {
         }
     }
 
-    // Pump mic audio to HA while pipeline is active.
+    PollLocalVoice();
+
     PumpAudioToHa();
 }
 
 void Satellite::OnDisconnected() {
     LVA_LOGI(kTag, "HA disconnected — resetting pipeline state");
     StopAudioStreaming();
+    CancelLocalTurn();
     StopTimerRing();
     pipeline_active_       = false;
     continue_conversation_ = false;
@@ -651,6 +678,7 @@ void Satellite::OnDisconnected() {
 
 void Satellite::OnMuted() {
     StopAudioStreaming();
+    CancelLocalTurn();
     continue_listen_at_ns_.store(0, std::memory_order_relaxed);
     if (pipeline_active_ && announce_player_) {
         announce_player_->Stop();
@@ -661,6 +689,198 @@ void Satellite::OnMuted() {
         Unduck();
         lva::tr::Show(lva::tr::LedState::Idle);
     }
+}
+
+void Satellite::EnableLocalVoice(LocalVoiceConfig cfg) {
+    local_ = std::move(cfg);
+    LVA_LOGI(kTag, "local voice backend enabled (stt=%s tts=%s agent=%s)",
+             local_.stt != nullptr ? "yes" : "no",
+             local_.tts != nullptr ? "yes" : "no",
+             local_.conversation_agent.empty()
+                 ? "(default)" : local_.conversation_agent.c_str());
+}
+
+void Satellite::BeginLocalListening() {
+    if (!local_.stt->Ready()) {
+        LVA_LOGW(kTag, "local STT not ready yet");
+        SpeakLocal(kLocalSttUnavailable);
+        return;
+    }
+    LVA_LOGI(kTag, "local STT listening");
+    lva::tr::Show(lva::tr::LedState::Listening);
+    local_.stt->BeginUtterance();
+    local_phase_ = LocalPhase::kListening;
+}
+
+void Satellite::PollLocalVoice() {
+    if (!LocalVoiceEnabled()) return;
+
+    if (local_phase_ == LocalPhase::kListening) {
+        auto text = local_.stt->TakeResult();
+        if (!text) return;
+        if (text->empty()) {
+            LVA_LOGI(kTag, "local STT heard nothing; ending turn");
+            local_phase_ = LocalPhase::kIdle;
+            continue_conversation_ = false;
+            FinishLocalTurn();
+            return;
+        }
+        lva::tr::Show(lva::tr::LedState::Thinking);
+        if (state_.preferences.thinking_sound != 0 &&
+            announce_player_ != nullptr) {
+            announce_player_->Play(kThinkingSoundPath, {});
+        }
+        SendConversationRequest(*text);
+        return;
+    }
+
+    if (local_phase_ == LocalPhase::kWaitingIntent &&
+        std::chrono::steady_clock::now() >= intent_deadline_) {
+        LVA_LOGW(kTag, "conversation.process timed out (call_id=%u); check "
+                       "that 'Allow the device to perform Home Assistant "
+                       "actions' is enabled for this device in HA",
+                 pending_call_id_);
+        pending_call_id_ = 0;
+        local_phase_     = LocalPhase::kIdle;
+        continue_conversation_ = false;
+        SpeakLocal(kLocalIntentFailed);
+    }
+}
+
+void Satellite::SendConversationRequest(const std::string& text) {
+    if (!state_.broadcast) {
+        LVA_LOGW(kTag, "no HA connection; cannot process '%s'", text.c_str());
+        local_phase_ = LocalPhase::kIdle;
+        continue_conversation_ = false;
+        SpeakLocal(kLocalNoConnection);
+        return;
+    }
+
+    ::HomeassistantActionRequest req;
+    req.set_service("conversation.process");
+    auto add = [&req](const char* key, const std::string& value) {
+        auto* kv = req.add_data();
+        kv->set_key(key);
+        kv->set_value(value);
+    };
+    add("text", text);
+    add("language", local_.language);
+    if (!local_.conversation_agent.empty()) {
+        add("agent_id", local_.conversation_agent);
+    }
+    if (!conversation_id_.empty()) {
+        add("conversation_id", conversation_id_);
+    }
+
+    pending_call_id_ = next_call_id_++;
+    if (next_call_id_ == 0) next_call_id_ = 1;  // 0 means "no response"
+    req.set_call_id(pending_call_id_);
+    req.set_wants_response(true);
+
+    local_phase_     = LocalPhase::kWaitingIntent;
+    intent_deadline_ = std::chrono::steady_clock::now() + kIntentTimeout;
+    LVA_LOGI(kTag, "conversation.process '%s' (call_id=%u)", text.c_str(),
+             pending_call_id_);
+    state_.broadcast(lva::proto::kIdHomeassistantActionRequest, req);
+}
+
+void Satellite::OnActionResponse(std::uint32_t call_id, bool success,
+                                 const std::string& error_message,
+                                 const std::string& response_data) {
+    if (call_id == 0 || call_id != pending_call_id_ ||
+        local_phase_ != LocalPhase::kWaitingIntent) {
+        LVA_LOGD(kTag, "ignoring action response call_id=%u", call_id);
+        return;
+    }
+    pending_call_id_ = 0;
+    local_phase_     = LocalPhase::kIdle;
+
+    if (!success) {
+        LVA_LOGW(kTag, "conversation.process failed: %s",
+                 error_message.c_str());
+        continue_conversation_ = false;
+        SpeakLocal(kLocalIntentFailed);
+        return;
+    }
+
+    const ConversationReply reply = ParseConversationReply(response_data);
+    if (!reply.conversation_id.empty()) {
+        conversation_id_ = reply.conversation_id;
+    }
+    continue_conversation_ = reply.continue_conversation;
+    LVA_LOGI(kTag, "conversation reply (continue=%d): '%s'",
+             reply.continue_conversation ? 1 : 0, reply.speech.c_str());
+
+    if (reply.speech.empty()) {
+        FinishLocalTurn();
+        return;
+    }
+    SpeakLocal(reply.speech);
+}
+
+std::string Satellite::SynthesizeToFile(const std::string& text) {
+    if (local_.tts == nullptr) return {};
+
+    std::vector<std::int16_t> pcm;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!local_.tts->Synthesize(text, pcm)) return {};
+    const double synth_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+
+    std::error_code ec;
+    std::filesystem::create_directories(kTtsDir, ec);
+    // Two files, so a new reply never overwrites one mpv is still reading.
+    const std::string path = std::string(kTtsDir) + "/reply-" +
+                             std::to_string(tts_file_seq_++ % 2) + ".wav";
+    if (!lva::audio::WriteWavS16Mono(path, pcm, local_.tts->SampleRate())) {
+        LVA_LOGW(kTag, "failed to write %s", path.c_str());
+        return {};
+    }
+    LVA_LOGI(kTag, "local TTS: %.2f s audio in %.0f ms -> %s",
+             static_cast<double>(pcm.size()) / local_.tts->SampleRate(),
+             synth_s * 1000.0, path.c_str());
+    return path;
+}
+
+void Satellite::SpeakLocal(const std::string& text) {
+    const std::string path = SynthesizeToFile(text);
+    if (path.empty() || announce_player_ == nullptr) {
+        FinishLocalTurn();
+        return;
+    }
+    if (timer_ringing_) StopTimerRing();
+    lva::tr::Show(lva::tr::LedState::Speaking);
+    speech_active_ = true;
+    local_speech_  = true;
+    announce_player_->Play(path, [this]() { FinishSpeech(true); });
+}
+
+void Satellite::FinishLocalTurn() {
+    if (continue_conversation_) {
+        const auto now_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        continue_listen_at_ns_.store(
+            now_ns + state_.continue_conversation_delay_ns,
+            std::memory_order_release);
+        return;
+    }
+    conversation_id_.clear();
+    pipeline_active_ = false;
+    lva::tr::Show(lva::tr::LedState::Idle);
+    Unduck();
+    ::malloc_trim(0);
+}
+
+void Satellite::CancelLocalTurn() {
+    if (!LocalVoiceEnabled()) return;
+    if (local_phase_ != LocalPhase::kIdle) {
+        LVA_LOGI(kTag, "local turn cancelled");
+    }
+    local_.stt->Cancel();
+    local_phase_     = LocalPhase::kIdle;
+    pending_call_id_ = 0;
+    conversation_id_.clear();
 }
 
 std::filesystem::path Satellite::ResolveWakeWordConfig(
@@ -690,7 +910,6 @@ bool Satellite::HandleMessage(std::uint32_t msg_type_id,
             ::VoiceAssistantConfigurationResponse resp;
             resp.set_max_active_wake_words(2);
 
-            // Available: scan .json files in wakeword_dir (no TFLite load).
             for (const auto& info :
                  lva::audio::ScanAvailableWakeWords(state_.wakeword_dir)) {
                 auto* ww = resp.add_available_wake_words();
@@ -732,9 +951,7 @@ bool Satellite::HandleMessage(std::uint32_t msg_type_id,
                 external_wake_words_.emplace(eww.id(), std::move(info));
             }
 
-            // Active: currently loaded in engine (micro + open). Snapshot
-            // under the engine's lock so concurrent SetActive* won't
-            // invalidate iterators here.
+            // Snapshot under the engine lock; SetActive* may run concurrently.
             {
                 const auto micro = engine_.SnapshotModels();
                 for (const auto& m : micro) {
@@ -830,11 +1047,8 @@ bool Satellite::HandleMessage(std::uint32_t msg_type_id,
                     apply_default(m->config().probability_cutoff);
                 }
 
-                // Persist the selection so it survives a cold reboot.
-                // Store the ids actually loaded, in slot order (micro
-                // first, then open), matching how GetConfiguration
-                // reports the active wake words. Must run before the
-                // std::move below empties the vectors.
+                // Persist loaded ids in slot order (micro, then open), before
+                // the std::move below empties the vectors.
                 std::vector<std::optional<std::string>> selected;
                 selected.reserve(new_micro.size() + new_open.size());
                 for (const auto& m : new_micro) {
@@ -848,7 +1062,6 @@ bool Satellite::HandleMessage(std::uint32_t msg_type_id,
                 engine_.SetActiveModels(std::move(new_micro));
                 engine_.SetActiveOpenModels(std::move(new_open));
                 state_.SavePreferences();
-                // Broadcast updated entity states to HA.
                 if (state_.broadcast) {
                     const auto sink = [&](std::uint32_t id,
                                           const ::google::protobuf::MessageLite& m) {
@@ -900,7 +1113,15 @@ bool Satellite::HandleMessage(std::uint32_t msg_type_id,
                      ann.media_id().c_str(),
                      ann.preannounce_media_id().c_str());
             PlayAnnounce(ann.media_id(), ann.preannounce_media_id(),
-                         ann.start_conversation());
+                         ann.text(), ann.start_conversation());
+            return true;
+        }
+
+        case kIdHomeassistantActionResponse: {
+            const auto& r =
+                static_cast<const ::HomeassistantActionResponse&>(msg);
+            OnActionResponse(r.call_id(), r.success(), r.error_message(),
+                             r.response_data());
             return true;
         }
 

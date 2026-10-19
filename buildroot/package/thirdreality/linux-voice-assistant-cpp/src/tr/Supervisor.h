@@ -28,15 +28,12 @@ class Supervisor {
     Supervisor(const Supervisor&)            = delete;
     Supervisor& operator=(const Supervisor&) = delete;
 
-    // Threadsafe.
     OtaState GetOtaState() const;
 
     std::string StartOtaUpdateAsync(const OtaRelease& release);
 
-    // True iff an OTA is currently in progress.
     bool IsOtaRunning() const;
 
-    // Synchronous helpers used by the HTTP server.
     static void PerformReboot();
     static void PerformFactoryReset();
 

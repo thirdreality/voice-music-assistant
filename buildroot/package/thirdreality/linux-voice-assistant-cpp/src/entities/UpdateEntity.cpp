@@ -99,7 +99,7 @@ void UpdateEntity::OnCommand(const ::google::protobuf::MessageLite& request,
 }
 
 void UpdateEntity::OnPeriodicTick() {
-    // Compute device-specific offset once (deterministic from name).
+    // Per-device offset spreads the daily check.
     if (daily_check_offset_min_ < 0) {
         const std::size_t h = std::hash<std::string>{}(state_.name);
         daily_check_offset_min_ = static_cast<int>(h % 60);
@@ -111,10 +111,8 @@ void UpdateEntity::OnPeriodicTick() {
     struct std::tm tm{};
     if (::localtime_r(&now, &tm) == nullptr) return;
 
-    // Already checked today?
     if (tm.tm_yday == last_check_yday_) return;
 
-    // Target: 02:00 + offset
     const int target_min = 2 * 60 + daily_check_offset_min_;
     const int now_min    = tm.tm_hour * 60 + tm.tm_min;
     if (now_min < target_min) return;

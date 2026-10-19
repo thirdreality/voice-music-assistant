@@ -21,16 +21,13 @@ class IAudioPlayer {
     virtual void Play(const std::string& url,
                       std::function<void()> done_callback = {}) = 0;
 
-    // Pause / resume. No-op if not currently playing.
     virtual void Pause()  = 0;
     virtual void Resume() = 0;
 
-    // Stop playback and clear the playlist. Safe to call when idle.
     virtual void Stop() = 0;
 
     virtual void SetGain(double normalized) = 0;
 
-    // Current high-level state.
     virtual PlayerState State() const = 0;
 };
 

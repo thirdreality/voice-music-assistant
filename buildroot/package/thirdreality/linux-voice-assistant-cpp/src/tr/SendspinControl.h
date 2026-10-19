@@ -2,21 +2,14 @@
 
 namespace lva::tr {
 
-// Control channel to sendspin-client over a Unix domain datagram socket.
-//
-// lva owns the tap key and forwards tap-derived commands here. sendspin-client
-// binds the socket and acts on the datagrams in its main loop. Fire-and-forget
-// and best-effort: a datagram sent while sendspin-client is down is dropped.
-//
-// Socket path: /tmp/sendspin-control.sock
+// Fire-and-forget datagrams to sendspin-client on
+// /tmp/sendspin-control.sock; dropped while it is not running.
 
 void SendspinMusicToggle();
 void SendspinPause();
 
-// Toggle the sendspin LED effect.
 void SendspinLedToggle();
 
-// Duck / unduck sendspin playback volume during voice interaction.
 void SendspinDuck();
 void SendspinUnduck();
 

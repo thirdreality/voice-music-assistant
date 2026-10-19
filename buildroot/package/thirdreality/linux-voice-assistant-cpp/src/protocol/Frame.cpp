@@ -47,7 +47,6 @@ VarUintResult ReadVarUint32(std::span<const std::uint8_t> input,
         ++bytes;
 
         if ((byte & 0x80) == 0) {
-            // Last byte of the varuint.
             result.value = value;
             result.bytes_consumed = bytes;
             result.invalid = false;
@@ -70,7 +69,6 @@ ParseStatus ParseFrame(std::span<const std::uint8_t> input,
         return ParseStatus::kBadPreamble;
     }
 
-    // Parse the length varuint immediately after the preamble.
     auto length_res = ReadVarUint32(input, 1);
     if (length_res.invalid) {
         return ParseStatus::kBadVarint;
@@ -81,7 +79,6 @@ ParseStatus ParseFrame(std::span<const std::uint8_t> input,
     const std::uint32_t payload_len = *length_res.value;
     const std::size_t after_length = 1 + length_res.bytes_consumed;
 
-    // Parse the type-id varuint.
     auto type_res = ReadVarUint32(input, after_length);
     if (type_res.invalid) {
         return ParseStatus::kBadVarint;
@@ -92,7 +89,6 @@ ParseStatus ParseFrame(std::span<const std::uint8_t> input,
     const std::uint32_t msg_type_id = *type_res.value;
     const std::size_t after_type = after_length + type_res.bytes_consumed;
 
-    // Need the full payload still in the buffer.
     const std::size_t end = after_type + payload_len;
     if (input.size() < end) {
         return ParseStatus::kNeedMore;
@@ -108,7 +104,6 @@ ParseStatus ParseFrame(std::span<const std::uint8_t> input,
 std::vector<std::uint8_t> EncodeFrame(std::uint32_t msg_type_id,
                                       std::span<const std::uint8_t> payload) {
     std::vector<std::uint8_t> out;
-    // Preamble + 2 varuints (worst case 5 bytes each) + payload.
     out.reserve(1 + kMaxVarintBytes + kMaxVarintBytes + payload.size());
 
     out.push_back(kPreamble);

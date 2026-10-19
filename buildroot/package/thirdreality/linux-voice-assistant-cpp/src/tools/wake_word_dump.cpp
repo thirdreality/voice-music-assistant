@@ -109,7 +109,6 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "WAV: %s\n", err.c_str()); return 1;
     }
 
-    // Extract all features up front ( verified bit-exact).
     lva::audio::MicroFeatures mf;
     if (!mf.Ok()) {
         std::fprintf(stderr, "MicroFeatures init failed\n"); return 1;

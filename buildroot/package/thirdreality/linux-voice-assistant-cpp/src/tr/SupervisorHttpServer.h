@@ -18,10 +18,8 @@ class SupervisorHttpServer {
     SupervisorHttpServer(const SupervisorHttpServer&)            = delete;
     SupervisorHttpServer& operator=(const SupervisorHttpServer&) = delete;
 
-    // Bind + listen + spawn accept loop. Returns false on bind error.
     bool Start();
 
-    // Close listening socket, signal accept loop, join.
     void Stop();
 
    private:

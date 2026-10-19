@@ -48,7 +48,6 @@ std::string DeviceInfo::normalized_mac() const {
 DeviceInfo ReadDeviceInfo() {
     struct stat st{};
     if (::stat(kDevicePath, &st) != 0) {
-        // No file — return a default-constructed (empty) struct.
         std::lock_guard<std::mutex> lk(g_cache_mtx);
         g_cache_mtime = {0, 0};
         g_cache       = DeviceInfo();

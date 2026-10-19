@@ -105,7 +105,6 @@ bool LoadWav(std::istream& in, WavData& out, std::string& err) {
             }
             got_data = true;
         } else {
-            // Skip unknown chunks (LIST, fact, ...).
             in.ignore(chunk_size);
         }
     }
