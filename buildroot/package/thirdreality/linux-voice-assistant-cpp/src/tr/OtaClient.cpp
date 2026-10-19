@@ -361,8 +361,6 @@ void OtaClient::DownloadFirmware(const OtaRelease& release,
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);   // 1 KB/s
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME,  60L);     // for 60 s
     curl_easy_setopt(curl, CURLOPT_CAINFO,         kCaCertPath);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
     curl_easy_setopt(curl, CURLOPT_BUFFERSIZE,     32L * 1024L);
 
     LVA_LOGI(kTag, "downloading %s -> %s", release.url.c_str(),
