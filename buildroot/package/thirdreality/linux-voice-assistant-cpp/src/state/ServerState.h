@@ -93,6 +93,18 @@ class ServerState {
     void PersistMicAutoGain(int value);
     void PersistMicNoiseSuppression(int value);
     void PersistMicVolume(int value);
+
+    // "ha" or "local".
+    void PersistVoiceBackend(const std::string& backend);
+
+    // Shows a notification in HA (persistent_notification.create). The id
+    // replaces an earlier notification with the same id.
+    void NotifyHa(const std::string& id, const std::string& title,
+                  const std::string& message) const;
+
+    // eSpeak-NG voice name and words per minute for the local TTS.
+    void PersistTtsVoice(const std::string& voice);
+    void PersistTtsRate(int rate_wpm);
 };
 
 }  // namespace lva::state

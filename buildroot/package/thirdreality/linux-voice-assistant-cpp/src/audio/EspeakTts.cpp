@@ -70,6 +70,23 @@ void EspeakTts::Stop() {
     LVA_LOGI(kTag, "stopped");
 }
 
+bool EspeakTts::SetVoice(const std::string& voice, int rate_wpm) {
+    if (started_ && espeak_SetVoiceByName(voice.c_str()) != EE_OK) {
+        LVA_LOGW(kTag, "voice '%s' not found; keeping '%s'", voice.c_str(),
+                 config_.voice.c_str());
+        return false;
+    }
+    config_.voice    = voice;
+    config_.rate_wpm = rate_wpm;
+    if (started_) {
+        espeak_SetParameter(espeakRATE, config_.rate_wpm, 0);
+        espeak_SetParameter(espeakPITCH, config_.pitch, 0);
+        LVA_LOGI(kTag, "voice=%s wpm=%d", config_.voice.c_str(),
+                 config_.rate_wpm);
+    }
+    return true;
+}
+
 bool EspeakTts::Synthesize(const std::string& text,
                            std::vector<std::int16_t>& out_pcm) {
     out_pcm.clear();

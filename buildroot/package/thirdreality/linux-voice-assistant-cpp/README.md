@@ -73,9 +73,13 @@ All options:
                            the mic for a continued conversation (default: 0.5)
 --voice-backend <b>        ha|local (default: ha). ha = stream audio to the HA
                            Assist pipeline; local = on-device STT + TTS.
-                           local falls back to ha if --stt-model is missing.
---stt-model <path>         whisper.cpp ggml model
-                           (default: /usr/share/thirdreality/stt/ggml-tiny.en-q5_1.bin)
+                           Default only; the HA select overrides it. local
+                           uses ha until the STT model is downloaded.
+--stt-model <path>         whisper.cpp ggml model (default: downloaded to
+                           /data/models/stt/ggml-tiny.en-q5_1.bin; a custom
+                           path is used as is, never downloaded)
+--stt-model-url <url>      Download URL for the default STT model (testing a
+                           mirror; size and sha256 must still match)
 --stt-threads <n>          STT decode threads, 1-4 (default: 4)
 --tts-data-dir <dir>       espeak-ng-data directory
                            (default: /usr/share/thirdreality/tts/espeak-ng-data)
@@ -134,8 +138,25 @@ linked) and liblva_speech.so (built here, installed to /usr/lib).
 
 ## Local voice backend
 
-Enabled with `--voice-backend local`. Models ship in `models/` (see
-`models/README.md`) and install to `/usr/share/thirdreality/{stt,tts}`.
+Selected in HA with the "Speech Processing" select (`Home Assistant` /
+`3R Speaker`), saved as `voice_backend` in `/data/conf/sound.json`.
+`--voice-backend` only sets the default.
+
+- The espeak-ng data ships in `/usr/share/thirdreality/tts`. The STT
+  model (31 MB) is downloaded to `/data/models/stt` from the `v1.2.4`
+  GitHub release; see `models/README.md`. LVA starts the download on
+  every start until the model is installed, whatever the backend. The
+  download resumes after a drop and the file is installed only after its
+  sha256 matches.
+- Picking `3R Speaker` before the model is installed keeps HA in use and
+  shows an HA notification with the download progress. When the
+  download finishes (or fails) another notification replaces it.
+- Switching backend restarts LVA (once the current voice turn ends);
+  the init script's monitor starts it again within ~10 s.
+- "Speech Voice (Local TTS)" (US/UK/Scottish male and female, soft,
+  whisper) and "Speech Rate (Local TTS)" (100-250 wpm) apply to the
+  next reply without a restart. They only affect the local backend;
+  with `Home Assistant` the voice is set in the HA Assist pipeline.
 
 ```
 wake -> LocalStt (whisper.cpp) -> HA conversation.process -> EspeakTts -> mpv

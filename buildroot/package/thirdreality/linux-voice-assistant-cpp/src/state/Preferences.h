@@ -36,6 +36,14 @@ class Preferences {
 
     int mic_volume = 1600;
 
+    // "ha" or "local"; nullopt = CLI default.
+    std::optional<std::string> voice_backend;
+
+    // Local TTS (eSpeak-NG) voice name and speed in words per minute;
+    // nullopt = built-in default.
+    std::optional<std::string> tts_voice;
+    std::optional<int>         tts_rate;
+
     // sound.json-only fields. Round-tripped verbatim.
     int mic_gain = 30;   // analog gain knob, 0..100, hardware-defined
     int mic_mute = 1;    // 0 = muted, 1 = unmuted (matches GPIO 438)

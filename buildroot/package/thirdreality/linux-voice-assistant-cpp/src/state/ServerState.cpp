@@ -195,4 +195,29 @@ void ServerState::PersistMicVolume(int value) {
     }
 }
 
+void ServerState::PersistVoiceBackend(const std::string& backend) {
+    if (preferences.voice_backend == backend) return;
+    preferences.voice_backend = backend;
+    if (!SavePreferences()) {
+        LVA_LOGW(kTag, "PersistVoiceBackend(%s): save failed",
+                 backend.c_str());
+    }
+}
+
+void ServerState::PersistTtsVoice(const std::string& voice) {
+    if (preferences.tts_voice == voice) return;
+    preferences.tts_voice = voice;
+    if (!SavePreferences()) {
+        LVA_LOGW(kTag, "PersistTtsVoice(%s): save failed", voice.c_str());
+    }
+}
+
+void ServerState::PersistTtsRate(int rate_wpm) {
+    if (preferences.tts_rate == rate_wpm) return;
+    preferences.tts_rate = rate_wpm;
+    if (!SavePreferences()) {
+        LVA_LOGW(kTag, "PersistTtsRate(%d): save failed", rate_wpm);
+    }
+}
+
 }  // namespace lva::state

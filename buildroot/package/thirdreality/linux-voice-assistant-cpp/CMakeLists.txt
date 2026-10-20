@@ -163,6 +163,7 @@ add_executable(linux-voice-assistant-cpp
     src/protocol/MdnsPublisher.cpp
     src/state/Preferences.cpp
     src/state/ServerState.cpp
+    src/state/ServerState_Notify.cpp
     src/audio/LibMpvPlayer.cpp
     src/audio/PcmRingBuffer.cpp
     src/audio/AudioCapture.cpp
@@ -182,6 +183,7 @@ add_executable(linux-voice-assistant-cpp
     src/tr/ControlListener.cpp
     src/tr/LedRing.cpp
     src/tr/MicMuteGpio.cpp
+    src/tr/ModelDownloader.cpp
     src/tr/OtaClient.cpp
     src/tr/SendspinControl.cpp
     src/tr/SoundConfWatcher.cpp
@@ -199,6 +201,7 @@ add_executable(linux-voice-assistant-cpp
     src/entities/UpdateEntity.cpp
     src/entities/UpdateEntity_Ota.cpp
     src/util/Log.cpp
+    src/util/Sha256.cpp
 )
 
 target_include_directories(linux-voice-assistant-cpp

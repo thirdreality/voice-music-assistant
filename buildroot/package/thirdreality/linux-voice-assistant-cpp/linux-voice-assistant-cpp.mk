@@ -46,11 +46,9 @@ endef
 LINUX_VOICE_ASSISTANT_CPP_POST_INSTALL_TARGET_HOOKS += \
 	LINUX_VOICE_ASSISTANT_CPP_INSTALL_SOUNDS
 
-# Models for --voice-backend local.
+# TTS data for the local voice backend. The STT model is not installed: LVA
+# downloads it to /data/models/stt when the backend is first selected.
 define LINUX_VOICE_ASSISTANT_CPP_INSTALL_VOICE_MODELS
-	$(INSTALL) -D -m 0644 \
-	    $(LINUX_VOICE_ASSISTANT_CPP_PKGDIR)/models/stt/ggml-tiny.en-q5_1.bin \
-	    $(TARGET_DIR)/usr/share/thirdreality/stt/ggml-tiny.en-q5_1.bin
 	$(INSTALL) -d $(TARGET_DIR)/usr/share/thirdreality/tts
 	cp -rf $(LINUX_VOICE_ASSISTANT_CPP_PKGDIR)/models/tts/espeak-ng-data \
 	      $(TARGET_DIR)/usr/share/thirdreality/tts/

@@ -60,6 +60,13 @@ class Satellite {
     // Call once at startup, before the first wake.
     void EnableLocalVoice(LocalVoiceConfig cfg);
 
+    // No voice turn, reply or timer in progress.
+    bool IsIdle() const {
+        return !pipeline_active_.load(std::memory_order_acquire) &&
+               !speech_active_.load(std::memory_order_acquire) &&
+               !timer_ringing_ && local_phase_ == LocalPhase::kIdle;
+    }
+
    private:
     void StartPipeline(const std::string& wake_word_phrase);
     void OpenStreamToHa(const std::string& wake_word_phrase);

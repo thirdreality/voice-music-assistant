@@ -55,6 +55,7 @@
 #include "state/ServerState.h"
 #include "tr/ControlListener.h"
 #include "tr/MicMuteGpio.h"
+#include "tr/ModelDownloader.h"
 #include "tr/SendspinControl.h"
 #include "tr/SoundConfWatcher.h"
 #include "tr/Supervisor.h"
@@ -71,6 +72,50 @@ constexpr const char* kVersion = "0.0.1";
 constexpr double kDefaultMicroWakeSensitivity = 0.85;
 constexpr double kDefaultOpenWakeSensitivity  = 0.5;
 constexpr double kDefaultStopSensitivity      = 0.5;
+
+// The on-device STT model is downloaded to /data instead of shipping in the
+// rootfs. It is an asset of the v1.2.4 GitHub release; later firmware keeps
+// this URL until the model changes. Never delete or replace that asset.
+constexpr const char* kSttModelUrl =
+    "https://github.com/thirdreality/voice-music-assistant/releases/download/"
+    "v1.2.4/ggml-tiny.en-q5_1.bin";
+constexpr std::uintmax_t kSttModelSize = 32168608;
+constexpr const char* kSttModelSha256 =
+    "6f98f0dacb0ed1ab5c1d7eed51d132ca139b5aca8c843a06926362d49e8cb0d0";
+constexpr const char* kSttModelPath =
+    "/data/models/stt/ggml-tiny.en-q5_1.bin";
+
+constexpr const char* kVoiceBackendHa    = "Home Assistant";
+constexpr const char* kVoiceBackendLocal = "3R Speaker";
+
+// Local TTS voices offered in HA: label -> eSpeak-NG voice name. A curated
+// subset of the bundled English accents and variants; the first is the
+// default.
+struct TtsVoiceOption {
+    const char* label;
+    const char* voice;
+};
+constexpr TtsVoiceOption kTtsVoices[] = {
+    {"US Male",       "en-us+m3"},
+    {"US Female",     "en-us+f3"},
+    {"UK Male",       "en-gb-x-rp+m3"},
+    {"UK Female",     "en-gb-x-rp+f3"},
+    {"Scottish Male", "en-gb-scotland+m3"},
+    {"Soft Female",   "en-us+f2"},
+    {"Whisper",       "en-us+whisper"},
+};
+constexpr int kDefaultTtsRate = 165;  // words per minute
+
+constexpr const char* kVoiceNotifyId    = "lva_voice_model";
+constexpr const char* kVoiceNotifyTitle = "Local speech";
+
+std::string TtsVoiceName(const std::optional<std::string>& label) {
+    for (const auto& v : kTtsVoices) {
+        if (label && *label == v.label) return v.voice;
+    }
+    return kTtsVoices[0].voice;
+}
+
 
 std::atomic<int> g_shutdown_signal{0};
 lva::proto::ApiServer* g_server = nullptr;
@@ -137,11 +182,17 @@ void PrintUsage(const char* argv0) {
         "  --voice-backend <b>      ha|local. ha = stream audio to the HA\n"
         "                           Assist pipeline (STT/TTS in HA); local =\n"
         "                           on-device STT + TTS, HA only resolves\n"
-        "                           the intent. (default: ha; local falls\n"
-        "                           back to ha if the STT model is missing)\n"
+        "                           the intent. Default for the HA \"Voice\n"
+        "                           Processing\" select, which overrides it.\n"
+        "                           (default: ha; local uses ha until the\n"
+        "                           STT model is downloaded)\n"
         "  --stt-model <path>       whisper.cpp ggml model for local STT\n"
-        "                           (default: /usr/share/thirdreality/stt/\n"
-        "                           ggml-tiny.en-q5_1.bin)\n"
+        "                           (default: downloaded to /data/models/stt/\n"
+        "                           ggml-tiny.en-q5_1.bin; a custom path is\n"
+        "                           used as is and never downloaded)\n"
+        "  --stt-model-url <url>    Download URL for the default STT model\n"
+        "                           (testing a mirror; size and sha256 must\n"
+        "                           still match)\n"
         "  --stt-threads <n>        Local STT decode threads, 1-4 (default: 4)\n"
         "  --tts-data-dir <dir>     espeak-ng-data directory\n"
         "                           (default: /usr/share/thirdreality/tts/espeak-ng-data)\n"
@@ -173,7 +224,8 @@ struct CliOptions {
     double      continue_conversation_delay = 0.5;  // seconds
 
     std::string voice_backend      = "ha";
-    std::string stt_model          = "/usr/share/thirdreality/stt/ggml-tiny.en-q5_1.bin";
+    std::string stt_model          = kSttModelPath;
+    std::string stt_model_url      = kSttModelUrl;
     int         stt_threads        = 4;
     std::string tts_data_dir       = "/usr/share/thirdreality/tts/espeak-ng-data";
     std::string conversation_agent;
@@ -198,6 +250,7 @@ bool ParseCli(int argc, char** argv, CliOptions& out) {
         {"continue-conversation-delay", required_argument, nullptr, 'C'},
         {"voice-backend",         required_argument, nullptr, 'V'},
         {"stt-model",             required_argument, nullptr, 'S'},
+        {"stt-model-url",         required_argument, nullptr, 'U'},
         {"stt-threads",           required_argument, nullptr, 'J'},
         {"tts-data-dir",          required_argument, nullptr, 'T'},
         {"conversation-agent",    required_argument, nullptr, 'G'},
@@ -230,6 +283,7 @@ bool ParseCli(int argc, char** argv, CliOptions& out) {
                 }
                 break;
             case 'S': out.stt_model = optarg; break;
+            case 'U': out.stt_model_url = optarg; break;
             case 'J': {
                 char* end = nullptr;
                 const long v = std::strtol(optarg, &end, 10);
@@ -422,11 +476,33 @@ int main(int argc, char** argv) {
     auto satellite_ring = std::make_unique<lva::audio::PcmRingBuffer>(
         16'000 * 2);
 
-    // The STT tap must be registered before capture starts.
-    bool use_local_voice = (cli.voice_backend == "local");
-    if (use_local_voice && !std::filesystem::exists(cli.stt_model)) {
+    // The backend is fixed for the life of the process; switching it from
+    // HA restarts LVA. The STT tap must be registered before capture starts.
+    const std::string wanted_backend =
+        state.preferences.voice_backend.value_or(cli.voice_backend);
+    const bool stt_model_is_default = (cli.stt_model == kSttModelPath);
+    std::unique_ptr<lva::tr::ModelDownloader> stt_model_downloader;
+    if (stt_model_is_default) {
+        stt_model_downloader = std::make_unique<lva::tr::ModelDownloader>(
+            lva::tr::ModelSpec{
+                .url    = cli.stt_model_url,
+                .path   = kSttModelPath,
+                .size   = kSttModelSize,
+                .sha256 = kSttModelSha256,
+            });
+    }
+    // Fetch the model on every start until it is installed, so local speech
+    // is ready when the user picks it.
+    if (stt_model_downloader) stt_model_downloader->Start();
+    const auto stt_model_ready = [&]() {
+        return stt_model_downloader ? stt_model_downloader->Installed()
+                                    : std::filesystem::exists(cli.stt_model);
+    };
+    bool use_local_voice = (wanted_backend == "local");
+    if (use_local_voice && !stt_model_ready()) {
         LVA_LOGW(kTag, "local STT model %s not found; using ha voice "
-                       "backend", cli.stt_model.c_str());
+                       "backend%s", cli.stt_model.c_str(),
+                 stt_model_downloader ? " until it is downloaded" : "");
         use_local_voice = false;
     }
     auto local_stt_ring = use_local_voice
@@ -685,6 +761,127 @@ int main(int argc, char** argv) {
             },
         }));
 
+    // Created later if the local backend is in use; the TTS entities below
+    // apply voice changes to it.
+    std::unique_ptr<lva::audio::EspeakTts> local_tts;
+
+    // Set when HA picks another voice backend; main loop restarts LVA.
+    bool restart_for_backend = false;
+    const auto DownloadNotice = [&]() -> std::string {
+        const std::string name = state.name;
+        if (!stt_model_downloader) {
+            return name + ": the speech model is missing; using Home "
+                          "Assistant for voice.";
+        }
+        const auto st = stt_model_downloader->GetStatus();
+        return name + ": the speech model is still downloading (" +
+               std::to_string(st.percent) + "%). The speaker keeps using "
+               "Home Assistant for voice and switches to local speech "
+               "automatically when the download finishes.";
+    };
+    const auto backend_label = [&state, &cli]() -> std::string {
+        return state.preferences.voice_backend.value_or(cli.voice_backend) ==
+                       "local"
+                   ? kVoiceBackendLocal
+                   : kVoiceBackendHa;
+    };
+    auto backend_select = std::make_unique<lva::entities::SelectEntity>(
+        next_key++,
+        lva::entities::SelectEntity::Config{
+            .object_id     = "speech_processing",
+            .display_name  = "Speech Processing",
+            .icon          = "mdi:account-voice",
+            .options       = {kVoiceBackendHa, kVoiceBackendLocal},
+            .getter        = backend_label,
+            .setter        = [&](const std::string& label) {
+                std::string backend;
+                if (label == kVoiceBackendHa)         backend = "ha";
+                else if (label == kVoiceBackendLocal) backend = "local";
+                else {
+                    LVA_LOGW(kTag, "speech_processing: unknown label '%s'",
+                             label.c_str());
+                    return;
+                }
+                state.PersistVoiceBackend(backend);
+                const bool want_local = (backend == "local");
+                if (want_local && !stt_model_ready()) {
+                    // Keep the HA backend until the model is in place. A
+                    // failed download is retried; if it fails again the
+                    // main loop sets the select back to Home Assistant.
+                    if (stt_model_downloader) stt_model_downloader->Start();
+                    state.NotifyHa(kVoiceNotifyId, kVoiceNotifyTitle,
+                             DownloadNotice());
+                    return;
+                }
+                // Picking the running backend again cancels a pending
+                // switch, e.g. back to HA right after the model finished.
+                restart_for_backend = (want_local != use_local_voice);
+                if (restart_for_backend) {
+                    LVA_LOGI(kTag, "voice backend -> %s; restart pending",
+                             backend.c_str());
+                }
+            },
+        });
+    lva::entities::SelectEntity* backend_select_ptr = backend_select.get();
+    state.entities.push_back(std::move(backend_select));
+
+    state.entities.push_back(std::make_unique<lva::entities::SelectEntity>(
+        next_key++,
+        lva::entities::SelectEntity::Config{
+            .object_id     = "speech_voice",
+            .display_name  = "Speech Voice (Local TTS)",
+            .icon          = "mdi:account-voice",
+            .options       = [] {
+                std::vector<std::string> labels;
+                for (const auto& v : kTtsVoices) labels.emplace_back(v.label);
+                return labels;
+            }(),
+            .getter        = [&state]() -> std::string {
+                for (const auto& v : kTtsVoices) {
+                    if (state.preferences.tts_voice == v.label) return v.label;
+                }
+                return kTtsVoices[0].label;
+            },
+            .setter        = [&](const std::string& label) {
+                for (const auto& v : kTtsVoices) {
+                    if (label != v.label) continue;
+                    state.PersistTtsVoice(label);
+                    if (local_tts) {
+                        local_tts->SetVoice(
+                            v.voice, state.preferences.tts_rate.value_or(
+                                         kDefaultTtsRate));
+                    }
+                    return;
+                }
+                LVA_LOGW(kTag, "speech_voice: unknown label '%s'",
+                         label.c_str());
+            },
+        }));
+
+    state.entities.push_back(std::make_unique<lva::entities::NumberEntity>(
+        next_key++,
+        lva::entities::NumberEntity::Config{
+            .object_id     = "speech_rate",
+            .display_name  = "Speech Rate (Local TTS)",
+            .icon          = "mdi:speedometer",
+            .min_value     = 100.0,
+            .max_value     = 250.0,
+            .step          = 5.0,
+            .mode_enum     = 2,  // SLIDER
+            .getter        = [&state] {
+                return static_cast<double>(
+                    state.preferences.tts_rate.value_or(kDefaultTtsRate));
+            },
+            .setter        = [&](double v) {
+                const int rate = static_cast<int>(v);
+                state.PersistTtsRate(rate);
+                if (local_tts) {
+                    local_tts->SetVoice(
+                        TtsVoiceName(state.preferences.tts_voice), rate);
+                }
+            },
+        }));
+
     const std::uint32_t home_button_entity_key = next_key++;
     lva::entities::EventEntity* home_button_entity = nullptr;
     {
@@ -917,7 +1114,6 @@ int main(int argc, char** argv) {
     state.satellite = satellite.get();
 
     std::unique_ptr<lva::satellite::LocalStt> local_stt;
-    std::unique_ptr<lva::audio::EspeakTts>    local_tts;
     if (use_local_voice) {
         lva::audio::WhisperStt::Config wcfg;
         wcfg.model_path  = cli.stt_model;
@@ -932,6 +1128,9 @@ int main(int argc, char** argv) {
 
         lva::audio::EspeakTts::Config tts_cfg;
         tts_cfg.data_dir = cli.tts_data_dir;
+        tts_cfg.voice    = TtsVoiceName(state.preferences.tts_voice);
+        tts_cfg.rate_wpm =
+            state.preferences.tts_rate.value_or(kDefaultTtsRate);
         local_tts = std::make_unique<lva::audio::EspeakTts>(tts_cfg);
         if (!local_tts->Start()) {
             LVA_LOGW(kTag, "local TTS unavailable; replies will be silent");
@@ -1167,7 +1366,10 @@ int main(int argc, char** argv) {
         if (::timerfd_settime(satellite_tick_fd, 0, &ts, nullptr) == 0) {
             server.AddAuxFd(satellite_tick_fd,
                             [&satellite, &mic_mute_gpio, &sound_watcher,
-                             update_entity_ptr, satellite_tick_fd] {
+                             update_entity_ptr, satellite_tick_fd,
+                             &stt_model_downloader, &restart_for_backend,
+                             &use_local_voice, &state, &cli, &server,
+                             backend_select_ptr]() {
                 std::uint64_t expirations = 0;
                 while (::read(satellite_tick_fd,
                               &expirations, sizeof(expirations)) > 0) {
@@ -1176,6 +1378,44 @@ int main(int argc, char** argv) {
                 mic_mute_gpio->Poll();
                 sound_watcher->Poll();
                 if (update_entity_ptr) update_entity_ptr->OnPeriodicTick();
+
+                const bool want_local =
+                    state.preferences.voice_backend.value_or(
+                        cli.voice_backend) == "local";
+                if (stt_model_downloader && want_local && !use_local_voice &&
+                    !restart_for_backend) {
+                    using Phase = lva::tr::ModelDownloader::Phase;
+                    const auto st = stt_model_downloader->GetStatus();
+                    if (st.phase == Phase::kReady) {
+                        state.NotifyHa(kVoiceNotifyId, kVoiceNotifyTitle,
+                                       state.name + ": the speech model is "
+                                       "ready. Switching to local speech.");
+                        restart_for_backend = true;
+                    } else if (st.phase == Phase::kFailed) {
+                        // Local speech cannot work; show HA as the backend
+                        // again instead of a choice that is not in effect.
+                        LVA_LOGW(kTag, "STT model download failed (%s); "
+                                       "voice backend back to ha",
+                                 st.error.c_str());
+                        state.PersistVoiceBackend("ha");
+                        if (state.broadcast) {
+                            backend_select_ptr->OnSubscribeStates(
+                                state.broadcast);
+                        }
+                        state.NotifyHa(kVoiceNotifyId, kVoiceNotifyTitle,
+                                       state.name + ": the speech model "
+                                       "download failed (" + st.error +
+                                       "). Speech Processing is set back to "
+                                       "Home Assistant; pick 3R Speaker to "
+                                       "try again.");
+                    }
+                }
+                if (restart_for_backend && satellite->IsIdle()) {
+                    // The init script's monitor starts LVA again.
+                    LVA_LOGI(kTag, "restarting to apply the voice backend");
+                    restart_for_backend = false;
+                    server.Stop();
+                }
             });
         } else {
             LVA_LOGW(kTag, "timerfd_settime failed; satellite ticks disabled");
@@ -1281,6 +1521,7 @@ int main(int argc, char** argv) {
     wakeword_engine->Stop();
     linear_wakeword_engine->Stop();
     if (local_stt) local_stt->Stop();
+    if (stt_model_downloader) stt_model_downloader->Cancel();
     audio_capture->Stop();
 
     const int signo = g_shutdown_signal.load(std::memory_order_relaxed);

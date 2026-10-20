@@ -131,6 +131,19 @@ void PopulateFromJson(Preferences& out,
     out.stop_word_sensitivity   = load_optional_double("stop_word_sensitivity");
     out.continue_conversation_delay =
         load_optional_double("continue_conversation_delay");
+
+    if (auto it = obj.find("voice_backend");
+        it != obj.end() && it->is_string()) {
+        const auto v = it->get<std::string>();
+        if (v == "ha" || v == "local") out.voice_backend = v;
+    }
+    if (auto it = obj.find("tts_voice"); it != obj.end() && it->is_string()) {
+        out.tts_voice = it->get<std::string>();
+    }
+    if (auto it = obj.find("tts_rate");
+        it != obj.end() && it->is_number_integer()) {
+        out.tts_rate = it->get<int>();
+    }
 }
 
 void ApplyToJson(const Preferences& prefs, nlohmann::json& obj) {
@@ -179,6 +192,22 @@ void ApplyToJson(const Preferences& prefs, nlohmann::json& obj) {
     store_optional_double("stop_word_sensitivity",   prefs.stop_word_sensitivity);
     store_optional_double("continue_conversation_delay",
                           prefs.continue_conversation_delay);
+
+    if (prefs.voice_backend.has_value()) {
+        obj["voice_backend"] = *prefs.voice_backend;
+    } else {
+        obj.erase("voice_backend");
+    }
+    if (prefs.tts_voice.has_value()) {
+        obj["tts_voice"] = *prefs.tts_voice;
+    } else {
+        obj.erase("tts_voice");
+    }
+    if (prefs.tts_rate.has_value()) {
+        obj["tts_rate"] = *prefs.tts_rate;
+    } else {
+        obj.erase("tts_rate");
+    }
 }
 
 }  // namespace

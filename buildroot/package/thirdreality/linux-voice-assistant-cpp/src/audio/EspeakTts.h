@@ -26,6 +26,9 @@ class EspeakTts final : public ITextToSpeech {
                     std::vector<std::int16_t>& out_pcm) override;
     int SampleRate() const override { return sample_rate_; }
 
+    // Takes effect from the next Synthesize(). Same thread as Synthesize().
+    bool SetVoice(const std::string& voice, int rate_wpm);
+
    private:
     Config config_;
     bool   started_     = false;
