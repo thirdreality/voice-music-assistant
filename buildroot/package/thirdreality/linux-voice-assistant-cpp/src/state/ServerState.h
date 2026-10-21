@@ -102,8 +102,7 @@ class ServerState {
     void NotifyHa(const std::string& id, const std::string& title,
                   const std::string& message) const;
 
-    // eSpeak-NG voice name and words per minute for the local TTS.
-    void PersistTtsVoice(const std::string& voice);
+    // Words per minute for the local TTS.
     void PersistTtsRate(int rate_wpm);
 };
 

@@ -137,9 +137,6 @@ void PopulateFromJson(Preferences& out,
         const auto v = it->get<std::string>();
         if (v == "ha" || v == "local") out.voice_backend = v;
     }
-    if (auto it = obj.find("tts_voice"); it != obj.end() && it->is_string()) {
-        out.tts_voice = it->get<std::string>();
-    }
     if (auto it = obj.find("tts_rate");
         it != obj.end() && it->is_number_integer()) {
         out.tts_rate = it->get<int>();
@@ -198,11 +195,7 @@ void ApplyToJson(const Preferences& prefs, nlohmann::json& obj) {
     } else {
         obj.erase("voice_backend");
     }
-    if (prefs.tts_voice.has_value()) {
-        obj["tts_voice"] = *prefs.tts_voice;
-    } else {
-        obj.erase("tts_voice");
-    }
+    obj.erase("tts_voice");  // removed setting (single TTS voice)
     if (prefs.tts_rate.has_value()) {
         obj["tts_rate"] = *prefs.tts_rate;
     } else {

@@ -39,9 +39,7 @@ class Preferences {
     // "ha" or "local"; nullopt = CLI default.
     std::optional<std::string> voice_backend;
 
-    // Local TTS (eSpeak-NG) voice name and speed in words per minute;
-    // nullopt = built-in default.
-    std::optional<std::string> tts_voice;
+    // Local TTS speed in words per minute; nullopt = built-in default.
     std::optional<int>         tts_rate;
 
     // sound.json-only fields. Round-tripped verbatim.

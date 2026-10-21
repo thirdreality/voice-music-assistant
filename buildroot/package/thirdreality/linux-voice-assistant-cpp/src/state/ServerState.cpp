@@ -204,14 +204,6 @@ void ServerState::PersistVoiceBackend(const std::string& backend) {
     }
 }
 
-void ServerState::PersistTtsVoice(const std::string& voice) {
-    if (preferences.tts_voice == voice) return;
-    preferences.tts_voice = voice;
-    if (!SavePreferences()) {
-        LVA_LOGW(kTag, "PersistTtsVoice(%s): save failed", voice.c_str());
-    }
-}
-
 void ServerState::PersistTtsRate(int rate_wpm) {
     if (preferences.tts_rate == rate_wpm) return;
     preferences.tts_rate = rate_wpm;

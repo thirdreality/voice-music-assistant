@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 project(linux-voice-assistant-cpp
         VERSION 0.0.1
-        LANGUAGES CXX)
+        LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -142,12 +142,28 @@ target_link_libraries(espeak_ng INTERFACE
     "${ESPEAK_NG_DIR}/lib/libucd.a"
 )
 
+# sanoTTS piperlite runtime (third_party/sanotts/README.md).
+set(SANOTTS_DIR "${CMAKE_SOURCE_DIR}/third_party/sanotts")
+add_library(sanotts STATIC
+    ${SANOTTS_DIR}/src/snt_front_f32.c
+    ${SANOTTS_DIR}/src/snt_piperlite.c
+)
+set_target_properties(sanotts PROPERTIES
+    LINKER_LANGUAGE C
+    POSITION_INDEPENDENT_CODE ON
+    C_STANDARD 99
+)
+target_include_directories(sanotts PUBLIC ${SANOTTS_DIR}/include)
+target_compile_options(sanotts PRIVATE -O3 -ffast-math -Wno-pedantic)
+target_link_libraries(sanotts PUBLIC m)
+
 add_library(lva_speech SHARED
     src/audio/WhisperStt.cpp
-    src/audio/EspeakTts.cpp
+    src/audio/SanoTts.cpp
 )
 target_include_directories(lva_speech PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(lva_speech PRIVATE whisper_cpp espeak_ng)
+target_link_libraries(lva_speech PRIVATE whisper_cpp espeak_ng sanotts
+    Threads::Threads)
 target_link_options(lva_speech PRIVATE
     -Wl,--exclude-libs,ALL
     -Wl,-Bsymbolic
@@ -311,3 +327,13 @@ add_executable(stt_wav_test
 target_include_directories(stt_wav_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(stt_wav_test PRIVATE lva_speech Threads::Threads)
 install(TARGETS stt_wav_test RUNTIME DESTINATION bin)
+
+# Dev tool: synthesize text with SanoTts to WAV files.
+add_executable(tts_wav_test
+    src/tools/tts_wav_test.cpp
+    src/audio/WavFile.cpp
+    src/util/Log.cpp
+)
+target_include_directories(tts_wav_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(tts_wav_test PRIVATE lva_speech Threads::Threads)
+install(TARGETS tts_wav_test RUNTIME DESTINATION bin)

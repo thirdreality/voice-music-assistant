@@ -31,7 +31,7 @@
 #include <nlohmann/json.hpp>
 
 #include "audio/AudioCapture.h"
-#include "audio/EspeakTts.h"
+#include "audio/SanoTts.h"
 #include "audio/LibMpvPlayer.h"
 #include "audio/MicroWakeWord.h"
 #include "audio/OpenWakeWord.h"
@@ -88,32 +88,16 @@ constexpr const char* kSttModelPath =
 constexpr const char* kVoiceBackendHa    = "Home Assistant";
 constexpr const char* kVoiceBackendLocal = "3R Speaker";
 
-// Local TTS voices offered in HA: label -> eSpeak-NG voice name. A curated
-// subset of the bundled English accents and variants; the first is the
-// default.
-struct TtsVoiceOption {
-    const char* label;
-    const char* voice;
-};
-constexpr TtsVoiceOption kTtsVoices[] = {
-    {"US Male",       "en-us+m3"},
-    {"US Female",     "en-us+f3"},
-    {"UK Male",       "en-gb-x-rp+m3"},
-    {"UK Female",     "en-gb-x-rp+f3"},
-    {"Scottish Male", "en-gb-scotland+m3"},
-    {"Soft Female",   "en-us+f2"},
-    {"Whisper",       "en-us+whisper"},
-};
-constexpr int kDefaultTtsRate = 165;  // words per minute
+constexpr int kDefaultTtsRate = 165;  // words per minute = speed 1.0
+
+constexpr const char* kTtsVoiceDir = "/usr/share/thirdreality/tts/amy";
 
 constexpr const char* kVoiceNotifyId    = "lva_voice_model";
 constexpr const char* kVoiceNotifyTitle = "Local speech";
 
-std::string TtsVoiceName(const std::optional<std::string>& label) {
-    for (const auto& v : kTtsVoices) {
-        if (label && *label == v.label) return v.voice;
-    }
-    return kTtsVoices[0].voice;
+// Speech Rate (wpm) -> TTS speed factor.
+float TtsSpeed(int rate_wpm) {
+    return static_cast<float>(rate_wpm) / static_cast<float>(kDefaultTtsRate);
 }
 
 
@@ -194,6 +178,7 @@ void PrintUsage(const char* argv0) {
         "                           (testing a mirror; size and sha256 must\n"
         "                           still match)\n"
         "  --stt-threads <n>        Local STT decode threads, 1-4 (default: 4)\n"
+        "  --tts-threads <n>        Local TTS decode threads, 1-4 (default: 2)\n"
         "  --tts-data-dir <dir>     espeak-ng-data directory\n"
         "                           (default: /usr/share/thirdreality/tts/espeak-ng-data)\n"
         "  --conversation-agent <id>\n"
@@ -227,6 +212,7 @@ struct CliOptions {
     std::string stt_model          = kSttModelPath;
     std::string stt_model_url      = kSttModelUrl;
     int         stt_threads        = 4;
+    int         tts_threads        = 2;
     std::string tts_data_dir       = "/usr/share/thirdreality/tts/espeak-ng-data";
     std::string conversation_agent;
     std::string stt_dump_wav;
@@ -252,6 +238,7 @@ bool ParseCli(int argc, char** argv, CliOptions& out) {
         {"stt-model",             required_argument, nullptr, 'S'},
         {"stt-model-url",         required_argument, nullptr, 'U'},
         {"stt-threads",           required_argument, nullptr, 'J'},
+        {"tts-threads",           required_argument, nullptr, 'K'},
         {"tts-data-dir",          required_argument, nullptr, 'T'},
         {"conversation-agent",    required_argument, nullptr, 'G'},
         {"stt-dump-wav",          required_argument, nullptr, 'D'},
@@ -293,6 +280,17 @@ bool ParseCli(int argc, char** argv, CliOptions& out) {
                     return false;
                 }
                 out.stt_threads = static_cast<int>(v);
+                break;
+            }
+            case 'K': {
+                char* end = nullptr;
+                const long v = std::strtol(optarg, &end, 10);
+                if (end == optarg || *end != '\0' || v < 1 || v > 4) {
+                    std::fprintf(stderr, "Invalid --tts-threads: %s\n",
+                                 optarg);
+                    return false;
+                }
+                out.tts_threads = static_cast<int>(v);
                 break;
             }
             case 'T': out.tts_data_dir = optarg; break;
@@ -761,9 +759,9 @@ int main(int argc, char** argv) {
             },
         }));
 
-    // Created later if the local backend is in use; the TTS entities below
-    // apply voice changes to it.
-    std::unique_ptr<lva::audio::EspeakTts> local_tts;
+    // Created later if the local backend is in use; the rate entity below
+    // applies changes to it.
+    std::unique_ptr<lva::audio::SanoTts> local_tts;
 
     // Set when HA picks another voice backend; main loop restarts LVA.
     bool restart_for_backend = false;
@@ -825,39 +823,6 @@ int main(int argc, char** argv) {
     lva::entities::SelectEntity* backend_select_ptr = backend_select.get();
     state.entities.push_back(std::move(backend_select));
 
-    state.entities.push_back(std::make_unique<lva::entities::SelectEntity>(
-        next_key++,
-        lva::entities::SelectEntity::Config{
-            .object_id     = "speech_voice",
-            .display_name  = "Speech Voice (Local TTS)",
-            .icon          = "mdi:account-voice",
-            .options       = [] {
-                std::vector<std::string> labels;
-                for (const auto& v : kTtsVoices) labels.emplace_back(v.label);
-                return labels;
-            }(),
-            .getter        = [&state]() -> std::string {
-                for (const auto& v : kTtsVoices) {
-                    if (state.preferences.tts_voice == v.label) return v.label;
-                }
-                return kTtsVoices[0].label;
-            },
-            .setter        = [&](const std::string& label) {
-                for (const auto& v : kTtsVoices) {
-                    if (label != v.label) continue;
-                    state.PersistTtsVoice(label);
-                    if (local_tts) {
-                        local_tts->SetVoice(
-                            v.voice, state.preferences.tts_rate.value_or(
-                                         kDefaultTtsRate));
-                    }
-                    return;
-                }
-                LVA_LOGW(kTag, "speech_voice: unknown label '%s'",
-                         label.c_str());
-            },
-        }));
-
     state.entities.push_back(std::make_unique<lva::entities::NumberEntity>(
         next_key++,
         lva::entities::NumberEntity::Config{
@@ -875,10 +840,7 @@ int main(int argc, char** argv) {
             .setter        = [&](double v) {
                 const int rate = static_cast<int>(v);
                 state.PersistTtsRate(rate);
-                if (local_tts) {
-                    local_tts->SetVoice(
-                        TtsVoiceName(state.preferences.tts_voice), rate);
-                }
+                if (local_tts) local_tts->SetSpeed(TtsSpeed(rate));
             },
         }));
 
@@ -1126,12 +1088,13 @@ int main(int argc, char** argv) {
             *local_stt_ring, stt_opts);
         local_stt->Start();
 
-        lva::audio::EspeakTts::Config tts_cfg;
-        tts_cfg.data_dir = cli.tts_data_dir;
-        tts_cfg.voice    = TtsVoiceName(state.preferences.tts_voice);
-        tts_cfg.rate_wpm =
-            state.preferences.tts_rate.value_or(kDefaultTtsRate);
-        local_tts = std::make_unique<lva::audio::EspeakTts>(tts_cfg);
+        lva::audio::SanoTts::Config tts_cfg;
+        tts_cfg.espeak_data_dir = cli.tts_data_dir;
+        tts_cfg.voice_dir       = kTtsVoiceDir;
+        tts_cfg.speed           = TtsSpeed(
+            state.preferences.tts_rate.value_or(kDefaultTtsRate));
+        tts_cfg.threads         = cli.tts_threads;
+        local_tts = std::make_unique<lva::audio::SanoTts>(tts_cfg);
         if (!local_tts->Start()) {
             LVA_LOGW(kTag, "local TTS unavailable; replies will be silent");
             local_tts.reset();

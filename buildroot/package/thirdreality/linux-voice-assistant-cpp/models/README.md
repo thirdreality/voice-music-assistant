@@ -14,4 +14,20 @@ Used by the local voice backend.
   mmap the weights.
 - `tts/espeak-ng-data/` -> `/usr/share/thirdreality/tts/espeak-ng-data/`
   English subset of espeak-ng-data (GPL-3.0+): phontab, phondata,
-  phonindex, intonations, en_dict, lang/gmw, voices.
+  phonindex, intonations, en_dict, lang/gmw. Used only to turn text into
+  phonemes for the TTS voice.
+- `tts/amy/{front_f32,dec_q8}.bin` -> `/usr/share/thirdreality/tts/amy/`
+  (2.8 MB). sanoTTS piperlite voice "amy" (`third_party/sanotts/README.md`),
+  generated from upstream `web/voices/amy/{front,dec}_f32.bin` at the same
+  revision by `third_party/sanotts/tools/make_voice_files.py`. Both files
+  are mmapped and used in place; nothing is written to `/data`.
+  - `front_f32.bin`: duration + acoustic students, upstream bytes
+    unchanged. Kept fp32: int8 here changes predicted durations.
+  - `dec_q8.bin`: decoder, conv weights int8 per output channel, biases
+    fp32. Waveform corr >= 0.9995 (SNR ~30 dB) vs fp32; whisper
+    transcripts unchanged.
+
+  Upstream fp32 sha256: front
+  `9bc304dd1db30b17a2efb751795137c6d26f25aaf9c96f05bc1dec7c86e0ce23`,
+  dec `f520bcbf278607343e68170a06619a465a333d2d67476c6823d130e91580281b`.
+  Voice data licence: see the repo root `todo.md`.

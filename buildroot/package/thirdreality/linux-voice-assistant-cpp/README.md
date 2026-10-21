@@ -81,7 +81,8 @@ All options:
 --stt-model-url <url>      Download URL for the default STT model (testing a
                            mirror; size and sha256 must still match)
 --stt-threads <n>          STT decode threads, 1-4 (default: 4)
---tts-data-dir <dir>       espeak-ng-data directory
+--tts-threads <n>          TTS decode threads, 1-4 (default: 2)
+--tts-data-dir <dir>       espeak-ng-data directory (TTS phonemizer)
                            (default: /usr/share/thirdreality/tts/espeak-ng-data)
 --conversation-agent <id>  HA conversation agent, e.g. conversation.home_assistant
                            (default: HA's default agent)
@@ -115,13 +116,16 @@ src/tr/                     ThirdReality integration (LED, GPIO, home
                             timezone sync, sound.json watcher)
 src/tools/                  Dev tools (micro_features_dump, tflite_inspect,
                             wake_word_dump, aec_loopback_test, stt_wav_test,
-                            conversation_reply_test)
+                            tts_wav_test, conversation_reply_test)
 src/util/                   Log helper
 third_party/microfrontend/  TFLM microfrontend + kissfft sources
 third_party/tflite_c/       Prebuilt libtensorflowlite_c.so (GLIBC≤2.29)
 third_party/whisper.cpp/    Prebuilt whisper.cpp + ggml static libs (A113X),
                             memory patch, model alignment script
-third_party/espeak-ng/      Prebuilt eSpeak-NG static libs (A113X)
+third_party/espeak-ng/      Prebuilt eSpeak-NG static libs (A113X), used as
+                            the TTS phonemizer
+third_party/sanotts/        sanoTTS piperlite runtime (neural TTS), NEON
+                            kernels, voice file converter
 wakewords/microwakeword/    MicroWakeWord .tflite + .json models
 wakewords/openwakeword/     OpenWakeWord .tflite + .json (+ mel/embedding)
 sounds/                     UI feedback sounds (wake_word_triggered,
@@ -142,7 +146,8 @@ Selected in HA with the "Speech Processing" select (`Home Assistant` /
 `3R Speaker`), saved as `voice_backend` in `/data/conf/sound.json`.
 `--voice-backend` only sets the default.
 
-- The espeak-ng data ships in `/usr/share/thirdreality/tts`. The STT
+- The TTS voice (`amy`, 2.8 MB) and the espeak-ng phonemizer data ship
+  in `/usr/share/thirdreality/tts`; see `models/README.md`. The STT
   model (31 MB) is downloaded to `/data/models/stt` from the `v1.2.4`
   GitHub release; see `models/README.md`. LVA starts the download on
   every start until the model is installed, whatever the backend. The
@@ -153,18 +158,21 @@ Selected in HA with the "Speech Processing" select (`Home Assistant` /
   download finishes (or fails) another notification replaces it.
 - Switching backend restarts LVA (once the current voice turn ends);
   the init script's monitor starts it again within ~10 s.
-- "Speech Voice (Local TTS)" (US/UK/Scottish male and female, soft,
-  whisper) and "Speech Rate (Local TTS)" (100-250 wpm) apply to the
-  next reply without a restart. They only affect the local backend;
-  with `Home Assistant` the voice is set in the HA Assist pipeline.
+- "Speech Rate (Local TTS)" (100-250 wpm, 165 = normal speed) applies
+  to the next reply without a restart. It only affects the local
+  backend; with `Home Assistant` the voice is set in the HA Assist
+  pipeline.
 
 ```
-wake -> LocalStt (whisper.cpp) -> HA conversation.process -> EspeakTts -> mpv
+wake -> LocalStt (whisper.cpp) -> HA conversation.process -> SanoTts -> mpv
 ```
 
 - Input is the post-APM, post-mic-gain capture tap.
-- ~16 MB anonymous memory between turns, ~85 MB peak during a decode.
-- Engines: `third_party/whisper.cpp/README.md`, `third_party/espeak-ng/README.md`.
+- ~16 MB anonymous memory between turns, ~85 MB peak during an STT
+  decode; TTS adds ~13 MB while synthesizing. TTS takes about as long as
+  the reply it speaks (RTF ~1.0 on 2 threads).
+- Engines: `third_party/whisper.cpp/README.md`,
+  `third_party/sanotts/README.md`, `third_party/espeak-ng/README.md`.
 
 ### HA setup: allow device actions
 
