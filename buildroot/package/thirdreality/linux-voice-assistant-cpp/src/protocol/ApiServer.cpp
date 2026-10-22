@@ -74,7 +74,23 @@ void ApiServer::AddAuxFd(int fd, std::function<void()> on_readable) {
 }
 
 bool ApiServer::Start() {
-    listen_fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    const bool bind_any =
+        options_.bind_address == "0.0.0.0" || options_.bind_address.empty();
+
+    // On the wildcard address, listen dual-stack (IPv6 socket with
+    // IPV6_V6ONLY=0) so HA can connect over either family. avahi also
+    // advertises the device's IPv6 addresses, and HA may pick one of them.
+    if (bind_any) {
+        listen_fd_ = ::socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (listen_fd_ < 0) {
+            LVA_LOGW(kTag, "IPv6 socket() failed (%s), falling back to IPv4",
+                     std::strerror(errno));
+        }
+    }
+    const bool dual_stack = listen_fd_ >= 0;
+    if (!dual_stack) {
+        listen_fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    }
     if (listen_fd_ < 0) {
         LVA_LOGE(kTag, "socket() failed: %s", std::strerror(errno));
         return false;
@@ -85,18 +101,36 @@ bool ApiServer::Start() {
         LVA_LOGW(kTag, "setsockopt(SO_REUSEADDR) failed: %s", std::strerror(errno));
     }
 
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port   = htons(options_.port);
-    if (options_.bind_address == "0.0.0.0" || options_.bind_address.empty()) {
-        addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    } else if (::inet_pton(AF_INET, options_.bind_address.c_str(),
-                           &addr.sin_addr) != 1) {
-        LVA_LOGE(kTag, "inet_pton(%s) failed", options_.bind_address.c_str());
-        return false;
+    sockaddr_storage addr{};
+    socklen_t addr_len = 0;
+    if (dual_stack) {
+        int zero = 0;
+        if (::setsockopt(listen_fd_, IPPROTO_IPV6, IPV6_V6ONLY, &zero,
+                         sizeof(zero)) < 0) {
+            LVA_LOGE(kTag, "setsockopt(IPV6_V6ONLY=0) failed: %s",
+                     std::strerror(errno));
+            return false;
+        }
+        auto* a6 = reinterpret_cast<sockaddr_in6*>(&addr);
+        a6->sin6_family = AF_INET6;
+        a6->sin6_port   = htons(options_.port);
+        a6->sin6_addr   = in6addr_any;
+        addr_len = sizeof(sockaddr_in6);
+    } else {
+        auto* a4 = reinterpret_cast<sockaddr_in*>(&addr);
+        a4->sin_family = AF_INET;
+        a4->sin_port   = htons(options_.port);
+        if (bind_any) {
+            a4->sin_addr.s_addr = htonl(INADDR_ANY);
+        } else if (::inet_pton(AF_INET, options_.bind_address.c_str(),
+                               &a4->sin_addr) != 1) {
+            LVA_LOGE(kTag, "inet_pton(%s) failed", options_.bind_address.c_str());
+            return false;
+        }
+        addr_len = sizeof(sockaddr_in);
     }
 
-    if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+    if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), addr_len) < 0) {
         LVA_LOGE(kTag, "bind(%s:%u) failed: %s", options_.bind_address.c_str(),
                  options_.port, std::strerror(errno));
         return false;
@@ -145,8 +179,9 @@ bool ApiServer::Start() {
         }
     }
 
-    LVA_LOGI(kTag, "listening on %s:%u (device_name=%s)",
-             options_.bind_address.c_str(), options_.port,
+    LVA_LOGI(kTag, "listening on %s:%u%s (device_name=%s)",
+             dual_stack ? "[::]" : options_.bind_address.c_str(),
+             options_.port, dual_stack ? " (IPv4+IPv6)" : "",
              state_.name.c_str());
 
     state_.broadcast = [this](std::uint32_t msg_type_id,
@@ -163,7 +198,7 @@ bool ApiServer::Start() {
 }
 
 bool ApiServer::AcceptOne() {
-    sockaddr_in peer{};
+    sockaddr_storage peer{};
     socklen_t peer_len = sizeof(peer);
     const int fd = ::accept4(listen_fd_, reinterpret_cast<sockaddr*>(&peer),
                              &peer_len, SOCK_CLOEXEC | SOCK_NONBLOCK);
@@ -179,11 +214,25 @@ bool ApiServer::AcceptOne() {
         LVA_LOGW(kTag, "setsockopt(TCP_NODELAY) failed: %s", std::strerror(errno));
     }
 
-    char ip_str[INET_ADDRSTRLEN] = {0};
-    ::inet_ntop(AF_INET, &peer.sin_addr, ip_str, sizeof(ip_str));
-    char peer_label[64];
-    std::snprintf(peer_label, sizeof(peer_label), "%s:%u", ip_str,
-                  ntohs(peer.sin_port));
+    char ip_str[INET6_ADDRSTRLEN] = {0};
+    unsigned port = 0;
+    if (peer.ss_family == AF_INET6) {
+        const auto* p6 = reinterpret_cast<const sockaddr_in6*>(&peer);
+        if (IN6_IS_ADDR_V4MAPPED(&p6->sin6_addr)) {
+            // Show IPv4 clients on the dual-stack socket as a.b.c.d.
+            ::inet_ntop(AF_INET, &p6->sin6_addr.s6_addr[12], ip_str,
+                        sizeof(ip_str));
+        } else {
+            ::inet_ntop(AF_INET6, &p6->sin6_addr, ip_str, sizeof(ip_str));
+        }
+        port = ntohs(p6->sin6_port);
+    } else {
+        const auto* p4 = reinterpret_cast<const sockaddr_in*>(&peer);
+        ::inet_ntop(AF_INET, &p4->sin_addr, ip_str, sizeof(ip_str));
+        port = ntohs(p4->sin_port);
+    }
+    char peer_label[80];
+    std::snprintf(peer_label, sizeof(peer_label), "%s:%u", ip_str, port);
 
     auto conn = std::make_unique<Connection>(fd, state_,
                                              std::string(peer_label));
