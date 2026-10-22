@@ -351,6 +351,20 @@ bool Connection::DispatchFrame(const InboundFrame& frame) {
             LVA_LOGI(kTag, "[%s] VoiceAssistant subscribe=%d flags=%u",
                      peer_label_.c_str(), m.subscribe() ? 1 : 0,
                      m.flags());
+            voice_subscribed_ = m.subscribe();
+            return true;
+        }
+        case kIdVoiceAssistantResponse: {
+            ::VoiceAssistantResponse m;
+            if (!m.ParseFromArray(frame.payload.data(),
+                                  static_cast<int>(frame.payload.size()))) {
+                LVA_LOGE(kTag, "[%s] VoiceAssistantResponse parse failed",
+                         peer_label_.c_str());
+                return false;
+            }
+            if (state_.satellite) {
+                state_.satellite->HandleMessage(kIdVoiceAssistantResponse, m);
+            }
             return true;
         }
         case kIdVoiceAssistantConfigurationRequest: {

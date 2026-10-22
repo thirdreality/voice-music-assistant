@@ -34,6 +34,9 @@ class Connection {
 
     bool closed() const noexcept { return closed_; }
 
+    // Set by SubscribeVoiceAssistantRequest; voice traffic goes only here.
+    bool voice_subscribed() const noexcept { return voice_subscribed_; }
+
     bool OnReadable();
 
     bool OnWritable();
@@ -57,6 +60,7 @@ class Connection {
 
     int fd_;
     bool closed_ = false;
+    bool voice_subscribed_ = false;
     lva::state::ServerState& state_;
     std::string peer_label_;
 

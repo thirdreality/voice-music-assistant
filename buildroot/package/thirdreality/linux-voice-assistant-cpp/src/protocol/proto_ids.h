@@ -56,6 +56,7 @@ inline constexpr std::uint32_t kIdGetTimeResponse                       = 37;
 
 inline constexpr std::uint32_t kIdSubscribeVoiceAssistantRequest         = 89;
 inline constexpr std::uint32_t kIdVoiceAssistantRequest                 = 90;
+inline constexpr std::uint32_t kIdVoiceAssistantResponse                = 91;
 inline constexpr std::uint32_t kIdVoiceAssistantEventResponse           = 92;
 inline constexpr std::uint32_t kIdVoiceAssistantAudio                   = 106;
 inline constexpr std::uint32_t kIdVoiceAssistantTimerEventResponse      = 115;

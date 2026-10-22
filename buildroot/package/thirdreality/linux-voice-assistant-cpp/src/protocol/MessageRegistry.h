@@ -44,6 +44,7 @@ class UpdateCommandRequest;
 
 class SubscribeVoiceAssistantRequest;
 class VoiceAssistantRequest;
+class VoiceAssistantResponse;
 class VoiceAssistantEventResponse;
 class VoiceAssistantAudio;
 class VoiceAssistantTimerEventResponse;
@@ -111,6 +112,7 @@ LVA_DECLARE_MESSAGE_ID(::UpdateStateResponse,        kIdUpdateStateResponse)
 LVA_DECLARE_MESSAGE_ID(::UpdateCommandRequest,       kIdUpdateCommandRequest)
 
 LVA_DECLARE_MESSAGE_ID(::VoiceAssistantRequest,                kIdVoiceAssistantRequest)
+LVA_DECLARE_MESSAGE_ID(::VoiceAssistantResponse,               kIdVoiceAssistantResponse)
 LVA_DECLARE_MESSAGE_ID(::VoiceAssistantEventResponse,          kIdVoiceAssistantEventResponse)
 LVA_DECLARE_MESSAGE_ID(::VoiceAssistantAudio,                  kIdVoiceAssistantAudio)
 LVA_DECLARE_MESSAGE_ID(::VoiceAssistantTimerEventResponse,     kIdVoiceAssistantTimerEventResponse)

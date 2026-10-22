@@ -15,6 +15,7 @@
 #include <cstring>
 #include <utility>
 
+#include "protocol/proto_ids.h"
 #include "state/ServerState.h"
 #include "util/Log.h"
 
@@ -23,6 +24,14 @@ namespace lva::proto {
 namespace {
 
 constexpr const char* kTag = "api";
+
+// Pipeline traffic is only meaningful to the client that subscribed to
+// voice (HA). Other API clients would just get a second mic stream.
+bool IsVoiceMessage(std::uint32_t msg_type_id) {
+    return msg_type_id == kIdVoiceAssistantRequest ||
+           msg_type_id == kIdVoiceAssistantAudio ||
+           msg_type_id == kIdVoiceAssistantAnnounceFinished;
+}
 
 bool SetNonBlocking(int fd) {
     int flags = ::fcntl(fd, F_GETFL, 0);
@@ -186,9 +195,10 @@ bool ApiServer::Start() {
 
     state_.broadcast = [this](std::uint32_t msg_type_id,
                               const ::google::protobuf::MessageLite& msg) {
+        const bool voice = IsVoiceMessage(msg_type_id);
         for (auto& [fd, conn] : connections_) {
             (void)fd;
-            if (conn) {
+            if (conn && (!voice || conn->voice_subscribed())) {
                 conn->SendSerializedMessage(msg_type_id, msg);
             }
         }

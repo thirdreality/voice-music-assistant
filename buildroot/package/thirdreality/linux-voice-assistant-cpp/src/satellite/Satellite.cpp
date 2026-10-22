@@ -65,6 +65,12 @@ constexpr const char* kTtsDir = "/tmp/lva-tts";
 // LLM conversation agents can take several seconds.
 constexpr auto kIntentTimeout = std::chrono::seconds(15);
 
+// HA sends RUN_START right after VoiceAssistantRequest(start=true). If it
+// does not, the run was never created and the mic would stream forever.
+constexpr auto kHaStartTimeout = std::chrono::seconds(8);
+// Longest gap between HA voice events (e.g. a slow LLM intent).
+constexpr auto kHaEventTimeout = std::chrono::seconds(60);
+
 constexpr const char* kLocalSttUnavailable =
     "Local speech recognition is still loading.";
 constexpr const char* kLocalNoConnection =
@@ -257,6 +263,7 @@ void Satellite::StartPipeline(const std::string& wake_word_phrase) {
 
     pipeline_active_       = true;
     is_streaming_audio_    = false;  // not yet — wakeup sound first
+    DisarmHaWatchdog();
     tts_url_.clear();
     tts_played_            = false;
     continue_conversation_ = false;
@@ -316,6 +323,7 @@ void Satellite::OpenStreamToHa(const std::string& wake_word_phrase) {
     req.set_start(true);
     req.set_wake_word_phrase(wake_word_phrase);
     state_.broadcast(lva::proto::kIdVoiceAssistantRequest, req);
+    ArmHaWatchdog(kHaStartTimeout);
 }
 
 void Satellite::PumpAudioToHa() {
@@ -365,6 +373,7 @@ void Satellite::BeginListening() {
         req.set_start(true);
         state_.broadcast(lva::proto::kIdVoiceAssistantRequest, req);
     }
+    ArmHaWatchdog(kHaStartTimeout);
 }
 
 void Satellite::PlayTts() {
@@ -382,6 +391,7 @@ void Satellite::PlayTts() {
     }
 
     tts_played_ = true;
+    DisarmHaWatchdog();  // FinishSpeech ends the turn from here
     LVA_LOGI(kTag, "playing TTS: %s", tts_url_.c_str());
     lva::tr::Show(lva::tr::LedState::Speaking);
 
@@ -436,6 +446,7 @@ void Satellite::PlayAnnounce(const std::string& media_id,
 
     if (timer_ringing_) StopTimerRing();
     pipeline_active_ = true;
+    DisarmHaWatchdog();
     Duck();
     continue_conversation_ = start_conversation;
 
@@ -523,6 +534,10 @@ void Satellite::OnTimerSoundEof() {
 void Satellite::OnVoiceEvent(
     int event_type,
     const std::vector<std::pair<std::string, std::string>>& data) {
+    // HA is alive and driving this run.
+    if (ha_deadline_ != std::chrono::steady_clock::time_point{}) {
+        ArmHaWatchdog(kHaEventTimeout);
+    }
     switch (event_type) {
         case kEvtRunStart:
             LVA_LOGD(kTag, "RUN_START");
@@ -545,6 +560,7 @@ void Satellite::OnVoiceEvent(
                      message.empty() ? "(none)" : message.c_str());
             lva::tr::Show(lva::tr::LedState::Error);
             StopAudioStreaming();
+            DisarmHaWatchdog();
             pipeline_active_       = false;
             continue_conversation_ = false;
             wake_sound_pending_    = false;
@@ -609,6 +625,7 @@ void Satellite::OnVoiceEvent(
                 if (continue_conversation_) {
                     lva::tr::Show(lva::tr::LedState::Listening);
                 } else {
+                    DisarmHaWatchdog();
                     pipeline_active_ = false;
                     lva::tr::Show(lva::tr::LedState::Idle);
                     Unduck();
@@ -655,12 +672,47 @@ void Satellite::OnLoopTick() {
 
     PollLocalVoice();
 
+    CheckHaWatchdog();
+
     PumpAudioToHa();
+}
+
+void Satellite::ArmHaWatchdog(std::chrono::steady_clock::duration timeout) {
+    ha_deadline_ = std::chrono::steady_clock::now() + timeout;
+}
+
+void Satellite::CheckHaWatchdog() {
+    if (ha_deadline_ == std::chrono::steady_clock::time_point{}) return;
+    if (!pipeline_active_ || speech_active_) {
+        DisarmHaWatchdog();
+        return;
+    }
+    if (std::chrono::steady_clock::now() < ha_deadline_) return;
+    ResetHaPipeline("no voice event from HA");
+}
+
+void Satellite::ResetHaPipeline(const char* reason) {
+    LVA_LOGW(kTag, "resetting voice pipeline: %s", reason);
+    DisarmHaWatchdog();
+    StopAudioStreaming();
+    // Ask HA to drop the run in case it exists but stopped talking to us.
+    if (state_.broadcast) {
+        ::VoiceAssistantRequest req;
+        req.set_start(false);
+        state_.broadcast(lva::proto::kIdVoiceAssistantRequest, req);
+    }
+    pipeline_active_       = false;
+    continue_conversation_ = false;
+    wake_sound_pending_    = false;
+    continue_listen_at_ns_.store(0, std::memory_order_relaxed);
+    Unduck();
+    lva::tr::Show(lva::tr::LedState::Idle);
 }
 
 void Satellite::OnDisconnected() {
     LVA_LOGI(kTag, "HA disconnected — resetting pipeline state");
     StopAudioStreaming();
+    DisarmHaWatchdog();
     CancelLocalTurn();
     StopTimerRing();
     pipeline_active_       = false;
@@ -678,6 +730,7 @@ void Satellite::OnDisconnected() {
 
 void Satellite::OnMuted() {
     StopAudioStreaming();
+    DisarmHaWatchdog();
     CancelLocalTurn();
     continue_listen_at_ns_.store(0, std::memory_order_relaxed);
     if (pipeline_active_ && announce_player_) {
@@ -1114,6 +1167,15 @@ bool Satellite::HandleMessage(std::uint32_t msg_type_id,
                      ann.preannounce_media_id().c_str());
             PlayAnnounce(ann.media_id(), ann.preannounce_media_id(),
                          ann.text(), ann.start_conversation());
+            return true;
+        }
+
+        case kIdVoiceAssistantResponse: {
+            const auto& r = static_cast<const ::VoiceAssistantResponse&>(msg);
+            if (r.error() && pipeline_active_ && !speech_active_ &&
+                !LocalVoiceEnabled()) {
+                ResetHaPipeline("HA could not start the pipeline");
+            }
             return true;
         }
 

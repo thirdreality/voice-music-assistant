@@ -54,6 +54,7 @@ std::string_view MessageName(std::uint32_t id) noexcept {
 
         case kIdSubscribeVoiceAssistantRequest:        return "SubscribeVoiceAssistantRequest";
         case kIdVoiceAssistantRequest:                 return "VoiceAssistantRequest";
+        case kIdVoiceAssistantResponse:                return "VoiceAssistantResponse";
         case kIdVoiceAssistantEventResponse:           return "VoiceAssistantEventResponse";
         case kIdVoiceAssistantAudio:                   return "VoiceAssistantAudio";
         case kIdVoiceAssistantTimerEventResponse:      return "VoiceAssistantTimerEventResponse";

@@ -98,6 +98,12 @@ class Satellite {
 
     void ProcessStopDetected();
 
+    // HA pipeline watchdog; main thread only.
+    void ArmHaWatchdog(std::chrono::steady_clock::duration timeout);
+    void DisarmHaWatchdog() { ha_deadline_ = {}; }
+    void CheckHaWatchdog();
+    void ResetHaPipeline(const char* reason);
+
     void StartTimerRing();
     void StopTimerRing();
     void OnTimerSoundEof();
@@ -132,6 +138,9 @@ class Satellite {
     bool   tts_played_         = false;
 
     std::atomic<std::int64_t> continue_listen_at_ns_{0};
+
+    // Reset the turn if HA sends no voice event before this time.
+    std::chrono::steady_clock::time_point ha_deadline_{};
 
     bool                                  timer_ringing_ = false;
     std::chrono::steady_clock::time_point timer_ring_start_{};
