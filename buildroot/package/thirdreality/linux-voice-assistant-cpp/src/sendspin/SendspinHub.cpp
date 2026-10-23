@@ -612,6 +612,9 @@ class LedColorController {
 
 class PulseSink {
    public:
+    // PA target length; also the latency reported when PA has none yet.
+    static constexpr pa_usec_t kTargetLatencyUs = 100000;
+
     PulseSink() {
         mainloop_ = pa_threaded_mainloop_new();
         if (mainloop_ == nullptr) {
@@ -687,7 +690,7 @@ class PulseSink {
             if (shutting_down_.load(std::memory_order_acquire)) return 0;
 
             std::size_t written = 0;
-            *latency_us = 20000;
+            *latency_us = kTargetLatencyUs;
 
             pa_threaded_mainloop_lock(mainloop_);
             if (stream_active_ && EnsureStreamLocked()) {
@@ -715,7 +718,7 @@ class PulseSink {
                             if (pa_stream_get_latency(stream_, latency_us,
                                                       &negative) < 0 ||
                                 negative) {
-                                *latency_us = 20000;
+                                *latency_us = kTargetLatencyUs;
                             }
                         }
                     }
@@ -810,11 +813,12 @@ class PulseSink {
             return false;
         }
 
-        const std::uint32_t bytes_per_frame =
-            static_cast<std::uint32_t>(pa_frame_size(&spec));
-        const std::uint32_t target_length =
-            spec.rate * bytes_per_frame * 20 / 1000;
-        pa_buffer_attr attr{target_length * 2, target_length, 0,
+        // 100 ms keeps the ALSA sink near 25 ms. 20 ms drove it to ~5 ms
+        // and caused underruns on the first play after PulseAudio start.
+        // Sync is unaffected: notify_audio_played() reports real latency.
+        const std::uint32_t target_length = static_cast<std::uint32_t>(
+            pa_usec_to_bytes(kTargetLatencyUs, &spec));
+        pa_buffer_attr attr{static_cast<std::uint32_t>(-1), target_length, 0,
                             static_cast<std::uint32_t>(-1),
                             static_cast<std::uint32_t>(-1)};
         const auto flags = static_cast<pa_stream_flags_t>(
@@ -958,7 +962,7 @@ struct SendspinHub::Impl : public PlayerRoleListener,
             return 0;
         }
         std::size_t frame_size = 1;
-        pa_usec_t latency_us = 20000;
+        pa_usec_t latency_us = PulseSink::kTargetLatencyUs;
         const std::size_t written =
             sink.Write(data, length, timeout_ms, &frame_size, &latency_us);
         if (written > 0) {
