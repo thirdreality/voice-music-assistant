@@ -1,11 +1,14 @@
 #include "entities/MediaPlayerEntity.h"
 
 #include <algorithm>
+#include <cstring>
 
 #include "audio/LibMpvPlayer.h"
+#include "audio/MicroWakeWord.h"
 #include "audio/WebRtcProcessor.h"
 #include "protocol/MessageRegistry.h"
 #include "satellite/Satellite.h"
+#include "sendspin/SendspinHub.h"
 #include "state/ServerState.h"
 #include "util/Log.h"
 
@@ -19,9 +22,27 @@ constexpr const char* kTag         = "media";
 constexpr const char* kObjectId    = "linux_voice_assistant_media_player";
 constexpr const char* kDisplayName = "Media Player";
 
+// aioesphomeapi MediaPlayerEntityFeature. HA ignores this below API 1.11
+// and uses the same fixed set; keep them equal.
+constexpr std::uint32_t kFeaturePause         = 1u << 0;
+constexpr std::uint32_t kFeatureVolumeSet     = 1u << 2;
+constexpr std::uint32_t kFeatureVolumeMute    = 1u << 3;
+constexpr std::uint32_t kFeaturePlayMedia     = 1u << 9;
+constexpr std::uint32_t kFeatureStop          = 1u << 12;
+constexpr std::uint32_t kFeaturePlay          = 1u << 14;
+constexpr std::uint32_t kFeatureBrowseMedia   = 1u << 17;
+constexpr std::uint32_t kFeatureMediaAnnounce = 1u << 20;
 constexpr std::uint32_t kFeatureFlags =
-    (1u <<  0) | (1u <<  1) | (1u <<  2) | (1u <<  3) |
-    (1u << 11) | (1u << 14) | (1u << 23);
+    kFeaturePause | kFeatureVolumeSet | kFeatureVolumeMute |
+    kFeaturePlayMedia | kFeatureStop | kFeaturePlay | kFeatureBrowseMedia |
+    kFeatureMediaAnnounce;
+
+constexpr const char* kSendspinUriPrefix = "sendspin://";
+
+bool IsActiveState(lva::audio::PlayerState state) {
+    return state == lva::audio::PlayerState::kLoading ||
+           state == lva::audio::PlayerState::kPlaying;
+}
 
 }  // namespace
 
@@ -77,13 +98,33 @@ void MediaPlayerEntity::OnPlayerStateChanged(lva::audio::PlayerState s) {
     const auto announce_state = state_.announce_player != nullptr
         ? state_.announce_player->State()
         : lva::audio::PlayerState::kIdle;
-    const auto is_playing = [](lva::audio::PlayerState state) {
-        return state == lva::audio::PlayerState::kLoading ||
-               state == lva::audio::PlayerState::kPlaying;
-    };
+    if (IsActiveState(music_state)) last_source_ = Source::kMpv;
+    const bool music_finished =
+        music_state == lva::audio::PlayerState::kIdle &&
+        last_music_state_ != lva::audio::PlayerState::kIdle;
+    last_music_state_ = music_state;
+    if (sendspin_ != nullptr) {
+        if (music_finished) {
+            // mpv took the speaker from an open Sendspin stream; give it
+            // back if the server never ended that stream.
+            sendspin_->Reactivate();
+        } else if (IsActiveState(music_state)) {
+            sendspin_->CancelReactivate();
+        }
+    }
 
+    // Duck Sendspin under an HA announcement, like ESPHome's on_announcement
+    // mixer ducking. Voice turns duck through the satellite.
+    if (sendspin_ != nullptr) {
+        sendspin_->SetAnnouncementDucked(CommandPlayer() != player_);
+    }
+
+    // Same priority as ESPHome's speaker_source: the active media source
+    // decides, Sendspin being one of them. Sendspin has no paused state on
+    // the wire; a stopped group reads as idle.
     PlayState new_local = PlayState::kIdle;
-    if (is_playing(music_state) || is_playing(announce_state)) {
+    if (IsActiveState(music_state) || IsActiveState(announce_state) ||
+        SendspinActive()) {
         new_local = PlayState::kPlaying;
     } else if (music_state == lva::audio::PlayerState::kPaused ||
                announce_state == lva::audio::PlayerState::kPaused) {
@@ -105,8 +146,20 @@ bool MediaPlayerEntity::IsPlaying() const {
                state == lva::audio::PlayerState::kPlaying;
     };
     if (is_playing(player_)) return true;
+    if (SendspinActive()) return true;
     auto* command_player = CommandPlayer();
     return command_player != player_ && is_playing(command_player);
+}
+
+bool MediaPlayerEntity::SendspinActive() const {
+    return sendspin_ != nullptr && sendspin_->IsActive();
+}
+
+// speaker_source's target: the active source, else the last one.
+bool MediaPlayerEntity::SendspinIsCommandTarget() const {
+    if (sendspin_ == nullptr) return false;
+    if (CommandPlayer() != player_) return false;  // HA announcement first
+    return SendspinActive() || last_source_ == Source::kSendspin;
 }
 
 lva::audio::IAudioPlayer* MediaPlayerEntity::CommandPlayer() const {
@@ -137,10 +190,85 @@ void MediaPlayerEntity::PausePlayback() {
     if (command_player != player_ && is_playing(command_player)) {
         command_player->Pause();
     }
+    if (SendspinActive()) sendspin_->Pause();
     const auto state = command_player != nullptr
         ? command_player->State()
         : lva::audio::PlayerState::kIdle;
     OnPlayerStateChanged(state);
+}
+
+void MediaPlayerEntity::ResumePlayback() {
+    if (player_ != nullptr &&
+        player_->State() == lva::audio::PlayerState::kPaused &&
+        last_source_ != Source::kSendspin) {
+        player_->Resume();
+        return;
+    }
+    if (sendspin_ != nullptr) sendspin_->Play();
+}
+
+void MediaPlayerEntity::OnSendspinActiveChanged(bool active) {
+    if (active) {
+        // Sendspin takes the media pipeline; stop mpv music like the
+        // orchestrator stops the active source before play_uri().
+        last_source_ = Source::kSendspin;
+        if (player_ != nullptr &&
+            player_->State() != lva::audio::PlayerState::kIdle) {
+            LVA_LOGI(kTag, "sendspin stream: stopping mpv music");
+            player_->Stop();
+        }
+    }
+    if (state_.webrtc_processor != nullptr) {
+        state_.webrtc_processor->SetExternalFarEndActive(active);
+    }
+    lva::audio::MicroWakeWord::SetFarEndTelemetry(active);
+    const auto music_state = player_ != nullptr
+        ? player_->State()
+        : lva::audio::PlayerState::kIdle;
+    OnPlayerStateChanged(music_state);
+}
+
+void MediaPlayerEntity::OnSendspinMuteRequest(bool muted) {
+    if (muted == muted_) return;
+    LVA_LOGI(kTag, "sendspin: mute -> %d", muted ? 1 : 0);
+    ApplyMute(muted);
+    BroadcastState();
+}
+
+// LVA mutes by setting the volume to 0. Sendspin gets a real mute flag
+// first, so the server keeps the pre-mute volume (the hub ignores volume
+// updates while muted).
+void MediaPlayerEntity::ApplyMute(bool mute) {
+    if (mute == muted_) return;
+    muted_ = mute;
+    if (sendspin_ != nullptr) sendspin_->SetMuted(mute);
+    if (mute) {
+        pre_mute_volume_ = state_.volume.load(std::memory_order_relaxed);
+        state_.PersistVolume(0.0);
+    } else {
+        state_.PersistVolume(pre_mute_volume_);
+    }
+}
+
+void MediaPlayerEntity::PlaySendspinUri(const std::string& uri) {
+    if (sendspin_ == nullptr) {
+        LVA_LOGW(kTag, "PLAY_MEDIA %s: Sendspin disabled", uri.c_str());
+        return;
+    }
+    const std::string target = uri.substr(std::strlen(kSendspinUriPrefix));
+    if (target.empty()) {
+        LVA_LOGW(kTag, "PLAY_MEDIA: invalid URI '%s'", uri.c_str());
+        return;
+    }
+    if (player_ != nullptr &&
+        player_->State() != lva::audio::PlayerState::kIdle) {
+        player_->Stop();
+    }
+    if (target == "current") {
+        sendspin_->Play();
+    } else {
+        sendspin_->ConnectTo("ws://" + target);
+    }
 }
 
 void MediaPlayerEntity::BroadcastState() {
@@ -225,14 +353,38 @@ void MediaPlayerEntity::OnCommand(
         const auto command = cmd.command();
         switch (command) {
             case ::MEDIA_PLAYER_COMMAND_PLAY: {
-                LVA_LOGI(kTag, "command: PLAY (resume)");
+                // Back to the last media source, like speaker_source's
+                // fallback to last_source. With no paused mpv media to
+                // resume, PLAY goes to the Sendspin group.
                 auto* command_player = CommandPlayer();
-                if (command_player != nullptr) command_player->Resume();
+                const bool mpv_paused =
+                    player_ != nullptr &&
+                    player_->State() == lva::audio::PlayerState::kPaused;
+                if (command_player == player_ && sendspin_ != nullptr &&
+                    (last_source_ == Source::kSendspin || !mpv_paused)) {
+                    LVA_LOGI(kTag, "command: PLAY (sendspin group)");
+                    sendspin_->Play();
+                    break;  // state follows the stream
+                }
+                if (command_player == nullptr ||
+                    command_player->State() !=
+                        lva::audio::PlayerState::kPaused) {
+                    LVA_LOGI(kTag, "command: PLAY ignored (nothing to resume)");
+                    break;
+                }
+                LVA_LOGI(kTag, "command: PLAY (resume)");
+                command_player->Resume();
                 play_state_ = PlayState::kPlaying;
                 state_changed = true;
                 break;
             }
             case ::MEDIA_PLAYER_COMMAND_PAUSE: {
+                if (SendspinIsCommandTarget()) {
+                    // Group wide, as in ESPHome's sendspin media source.
+                    LVA_LOGI(kTag, "command: PAUSE (sendspin group)");
+                    sendspin_->Pause();
+                    break;
+                }
                 LVA_LOGI(kTag, "command: PAUSE");
                 auto* command_player = CommandPlayer();
                 if (command_player != nullptr) command_player->Pause();
@@ -241,6 +393,12 @@ void MediaPlayerEntity::OnCommand(
                 break;
             }
             case ::MEDIA_PLAYER_COMMAND_STOP: {
+                if (SendspinIsCommandTarget()) {
+                    // This speaker only: leave the group.
+                    LVA_LOGI(kTag, "command: STOP (leave sendspin group)");
+                    sendspin_->LeaveGroup();
+                    break;
+                }
                 LVA_LOGI(kTag, "command: STOP");
                 auto* command_player = CommandPlayer();
                 if (command_player != nullptr) command_player->Stop();
@@ -250,18 +408,14 @@ void MediaPlayerEntity::OnCommand(
             }
             case ::MEDIA_PLAYER_COMMAND_MUTE:
                 if (!muted_) {
-                    pre_mute_volume_ = state_.volume.load(
-                        std::memory_order_relaxed);
-                    state_.PersistVolume(0.0);
-                    muted_ = true;
+                    ApplyMute(true);
                     state_changed = true;
                 }
                 LVA_LOGI(kTag, "command: MUTE");
                 break;
             case ::MEDIA_PLAYER_COMMAND_UNMUTE:
                 if (muted_) {
-                    state_.PersistVolume(pre_mute_volume_);
-                    muted_ = false;
+                    ApplyMute(false);
                     state_changed = true;
                 }
                 LVA_LOGI(kTag, "command: UNMUTE -> %.3f", pre_mute_volume_);
@@ -278,18 +432,28 @@ void MediaPlayerEntity::OnCommand(
             cmd.has_announcement() && cmd.announcement();
         LVA_LOGI(kTag, "command: PLAY_MEDIA url=%s announcement=%d",
                  cmd.media_url().c_str(), announcement ? 1 : 0);
-        lva::audio::IAudioPlayer* target =
-            announcement && state_.announce_player != nullptr
-                ? state_.announce_player
-                : player_;
-        if (announcement && state_.satellite != nullptr) {
-            state_.satellite->PrepareForMediaAnnouncement();
+        if (!announcement &&
+            cmd.media_url().rfind(kSendspinUriPrefix, 0) == 0) {
+            PlaySendspinUri(cmd.media_url());  // state follows the stream
+        } else {
+            if (!announcement && sendspin_ != nullptr) {
+                // mpv takes the media pipeline: drop Sendspin audio and
+                // leave the group (ESPHome stops the active source first).
+                sendspin_->Deactivate();
+            }
+            lva::audio::IAudioPlayer* target =
+                announcement && state_.announce_player != nullptr
+                    ? state_.announce_player
+                    : player_;
+            if (announcement && state_.satellite != nullptr) {
+                state_.satellite->PrepareForMediaAnnouncement();
+            }
+            if (target != nullptr) {
+                target->Play(cmd.media_url());
+            }
+            play_state_ = PlayState::kPlaying;
+            state_changed = true;
         }
-        if (target != nullptr) {
-            target->Play(cmd.media_url());
-        }
-        play_state_ = PlayState::kPlaying;
-        state_changed = true;
     }
 
     if (state_changed) {

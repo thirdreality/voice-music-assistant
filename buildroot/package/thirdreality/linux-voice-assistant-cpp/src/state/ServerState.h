@@ -18,6 +18,7 @@ namespace lva::audio    { class AudioCapture; class WebRtcProcessor; class IAudi
 namespace lva::satellite { class Satellite; }
 namespace lva::tr       { class MicMuteGpio; class Supervisor; }
 namespace lva::entities { class MediaPlayerEntity; class MuteSwitchEntity; }
+namespace lva::sendspin { class SendspinHub; }
 
 namespace lva::state {
 
@@ -56,6 +57,9 @@ class ServerState {
     class ::lva::audio::IAudioPlayer* announce_player = nullptr;
 
     class ::lva::audio::IAudioPlayer* music_player = nullptr;
+
+    // In-process Sendspin player; null while disabled.
+    class ::lva::sendspin::SendspinHub* sendspin = nullptr;
 
     class ::lva::tr::Supervisor* supervisor = nullptr;
 
@@ -96,6 +100,8 @@ class ServerState {
 
     // "ha" or "local".
     void PersistVoiceBackend(const std::string& backend);
+
+    void PersistSendspinEnabled(bool enabled);
 
     // Shows a notification in HA (persistent_notification.create). The id
     // replaces an earlier notification with the same id.

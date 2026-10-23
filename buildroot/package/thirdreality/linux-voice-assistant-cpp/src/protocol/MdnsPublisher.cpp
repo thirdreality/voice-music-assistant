@@ -5,10 +5,13 @@
 #include <avahi-common/alternative.h>
 #include <avahi-common/error.h>
 #include <avahi-common/simple-watch.h>
+#include <avahi-common/strlst.h>
 #include <avahi-common/malloc.h>
 
 #include <atomic>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include "util/Log.h"
 
@@ -62,24 +65,25 @@ struct MdnsPublisher::Impl {
             }
         }
         if (avahi_entry_group_is_empty(group)) {
-            const std::string mac_txt   = "mac=" + opts.mac;
-            const std::string ver_txt   = "version=" + opts.version;
-            const char* board_txt       = "board=aarch64";
-            const char* platform_txt    = "platform=ThirdReality";
-            const char* network_txt     = "network=wifi";
+            std::vector<std::string> txt = opts.txt;
+            if (txt.empty()) {
+                txt = {"mac=" + opts.mac, "version=" + opts.version,
+                       "board=aarch64", "platform=ThirdReality",
+                       "network=wifi"};
+            }
+            AvahiStringList* strlst = nullptr;
+            for (auto it = txt.rbegin(); it != txt.rend(); ++it) {
+                strlst = avahi_string_list_add(strlst, it->c_str());
+            }
 
-            int ret = avahi_entry_group_add_service(
+            int ret = avahi_entry_group_add_service_strlst(
                 group, AVAHI_IF_UNSPEC, AVAHI_PROTO_UNSPEC,
                 static_cast<AvahiPublishFlags>(0),
                 opts.name.c_str(),
-                "_esphomelib._tcp", nullptr, nullptr,
+                opts.type.c_str(), nullptr, nullptr,
                 opts.port,
-                mac_txt.c_str(),
-                ver_txt.c_str(),
-                board_txt,
-                platform_txt,
-                network_txt,
-                nullptr);
+                strlst);
+            avahi_string_list_free(strlst);
             if (ret < 0) {
                 LVA_LOGE(kTag, "add_service failed: %s",
                          avahi_strerror(ret));
@@ -133,7 +137,7 @@ bool MdnsPublisher::Start(const Options& opts) {
     });
 
     impl_ = p;
-    LVA_LOGI(kTag, "started (_esphomelib._tcp, name=%s, port=%u)",
+    LVA_LOGI(kTag, "started (%s, name=%s, port=%u)", opts.type.c_str(),
              opts.name.c_str(), static_cast<unsigned>(opts.port));
     return true;
 }

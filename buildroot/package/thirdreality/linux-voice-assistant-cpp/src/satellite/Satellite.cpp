@@ -23,7 +23,7 @@
 #include "satellite/LocalStt.h"
 #include "state/ServerState.h"
 #include "tr/LedRing.h"
-#include "tr/SendspinControl.h"
+#include "sendspin/SendspinHub.h"
 #include "util/Log.h"
 
 #include "api.pb.h"
@@ -469,7 +469,7 @@ void Satellite::PlayAnnounce(const std::string& media_id,
 void Satellite::Duck() {
     if (ducked_) return;
     ducked_ = true;
-    lva::tr::SendspinDuck();
+    if (state_.sendspin != nullptr) state_.sendspin->SetDucked(true);
     if (state_.music_player) {
         state_.music_player->SetGain(kDuckFactor);
     }
@@ -478,7 +478,7 @@ void Satellite::Duck() {
 void Satellite::Unduck() {
     if (!ducked_) return;
     ducked_ = false;
-    lva::tr::SendspinUnduck();
+    if (state_.sendspin != nullptr) state_.sendspin->SetDucked(false);
     if (state_.music_player) {
         state_.music_player->SetGain(1.0);
     }

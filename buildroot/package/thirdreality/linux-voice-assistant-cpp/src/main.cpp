@@ -45,18 +45,19 @@
 #include "entities/MuteSwitchEntity.h"
 #include "entities/NumberEntity.h"
 #include "entities/SelectEntity.h"
+#include "entities/SendspinSwitchEntity.h"
 #include "entities/ThinkingSoundEntity.h"
 #include "entities/UpdateEntity.h"
 #include "protocol/ApiServer.h"
 #include "protocol/MdnsPublisher.h"
 #include "satellite/LocalStt.h"
 #include "satellite/Satellite.h"
+#include "sendspin/SendspinHub.h"
 #include "state/Preferences.h"
 #include "state/ServerState.h"
 #include "tr/ControlListener.h"
 #include "tr/MicMuteGpio.h"
 #include "tr/ModelDownloader.h"
-#include "tr/SendspinControl.h"
 #include "tr/SoundConfWatcher.h"
 #include "tr/Supervisor.h"
 #include "tr/SupervisorHttpServer.h"
@@ -601,6 +602,64 @@ int main(int argc, char** argv) {
         state.entities.push_back(std::move(media));
     }
 
+    // In-process Sendspin player: a second media source behind the HA
+    // media player (ESPHome sendspin hub + media_source).
+    auto sendspin_hub = std::make_unique<lva::sendspin::SendspinHub>(
+        lva::sendspin::SendspinHub::Config{
+            .name             = state.friendly_name,
+            .product_name     = "Voice & Music Assistant",
+            .manufacturer     = "ThirdReality",
+            .software_version = state.version,
+            .mac_address      = state.mac_address,
+            .initial_volume   = static_cast<int>(
+                state.volume.load(std::memory_order_relaxed) * 100.0 + 0.5),
+        },
+        lva::sendspin::SendspinHub::Callbacks{
+            // state.sendspin is cleared before Stop(), so callbacks fired
+            // while stopping (e.g. at shutdown) are dropped here.
+            .on_active_changed = [&state](bool active) {
+                if (state.sendspin == nullptr) return;
+                state.media_player_entity->OnSendspinActiveChanged(active);
+            },
+            .on_volume_request = [&state](int percent) {
+                if (state.sendspin == nullptr) return;
+                state.PersistVolume(static_cast<double>(percent) / 100.0);
+            },
+            .on_mute_request = [&state](bool muted) {
+                if (state.sendspin == nullptr) return;
+                state.media_player_entity->OnSendspinMuteRequest(muted);
+            },
+        });
+    // _sendspin._tcp is published only while the client runs, like
+    // ESPHome's enabled switch, so Music Assistant does not keep finding a
+    // speaker it cannot connect to.
+    lva::proto::MdnsPublisher sendspin_mdns;
+    // Returns whether the client runs afterwards. The switch shows the
+    // stored preference; a failed start is retried from the main loop.
+    const auto set_sendspin_running = [&state, &sendspin_hub,
+                                       &sendspin_mdns](bool run) -> bool {
+        if (run) {
+            if (!sendspin_hub->Start()) return false;
+            state.sendspin = sendspin_hub.get();
+            state.media_player_entity->SetSendspin(sendspin_hub.get());
+            lva::proto::MdnsPublisher::Options opts;
+            opts.name = state.name;
+            opts.type = "_sendspin._tcp";
+            opts.port = 8928;  // SendspinClientConfig::DEFAULT_SERVER_PORT
+            opts.txt  = {"path=/sendspin"};
+            if (!sendspin_mdns.Start(opts)) {
+                LVA_LOGW(kTag, "_sendspin._tcp mDNS registration failed");
+            }
+            return true;
+        }
+        sendspin_mdns.Stop();
+        state.sendspin = nullptr;
+        state.media_player_entity->SetSendspin(nullptr);
+        sendspin_hub->Stop();
+        state.media_player_entity->OnSendspinActiveChanged(false);
+        return false;
+    };
+
     {
         auto mute = std::make_unique<lva::entities::MuteSwitchEntity>(
             next_key++, state);
@@ -843,6 +902,20 @@ int main(int argc, char** argv) {
                 if (local_tts) local_tts->SetSpeed(TtsSpeed(rate));
             },
         }));
+
+    state.entities.push_back(
+        std::make_unique<lva::entities::SendspinSwitchEntity>(
+            next_key++,
+            [&state] { return state.preferences.sendspin_enabled; },
+            [&state, &sendspin_hub, set_sendspin_running](bool on) {
+                state.PersistSendspinEnabled(on);
+                if (on == sendspin_hub->IsStarted()) return;
+                if (on && !set_sendspin_running(true)) {
+                    LVA_LOGW(kTag, "Sendspin start failed; retrying");
+                } else if (!on) {
+                    set_sendspin_running(false);
+                }
+            }));
 
     const std::uint32_t home_button_entity_key = next_key++;
     lva::entities::EventEntity* home_button_entity = nullptr;
@@ -1393,7 +1466,7 @@ int main(int argc, char** argv) {
 
     // tr-buttond owns the input device and forwards gestures here.
     auto control_listener = std::make_unique<lva::tr::ControlListener>(
-        [&state, home_button_entity, &satellite,
+        [&state, home_button_entity, &satellite, &sendspin_hub,
          &tap_playback_pending, &tap_ha_was_playing](const std::string& cmd) {
             if (cmd == "TAP_DOWN") {
                 if (satellite) satellite->OnTapPressed();
@@ -1415,11 +1488,14 @@ int main(int argc, char** argv) {
                     return true;
                 }
                 if (ha_was_playing) {
-                    lva::tr::SendspinPause();
                     state.media_player_entity->PausePlayback();
                 } else {
-                    lva::tr::SendspinMusicToggle();
+                    state.media_player_entity->ResumePlayback();
                 }
+                return true;
+            }
+            if (cmd == "LED_TOGGLE") {
+                sendspin_hub->ToggleLed();
                 return true;
             }
             if (cmd == "HOME_SINGLE" || cmd == "HOME_DOUBLE" ||
@@ -1431,21 +1507,6 @@ int main(int argc, char** argv) {
                                                  : "triple_press";
                     home_button_entity->Trigger(event_type, state.broadcast);
                 }
-                return true;
-            }
-            if (const auto value =
-                    ParseControlInteger(cmd, "SENDSPIN_PLAYING:")) {
-                if (*value != 0 && *value != 1) return false;
-                const bool active = (*value == 1);
-
-                // Sendspin playback is not visible to our media player.
-                if (state.webrtc_processor != nullptr) {
-                    state.webrtc_processor->SetExternalFarEndActive(active);
-                }
-                lva::audio::MicroWakeWord::SetFarEndTelemetry(active);
-                LVA_LOGD(kTag, "sendspin playback %s -> external far-end %s",
-                         active ? "started" : "stopped",
-                         active ? "active" : "idle");
                 return true;
             }
             if (const auto value =
@@ -1475,8 +1536,53 @@ int main(int argc, char** argv) {
         }
     }
 
+    // sendspin-cpp delivers its callbacks from loop() on this thread.
+    if (state.preferences.sendspin_enabled && !set_sendspin_running(true)) {
+        LVA_LOGW(kTag, "Sendspin start failed; retrying");
+    }
+    const int sendspin_tick_fd = ::timerfd_create(CLOCK_MONOTONIC,
+                                                  TFD_CLOEXEC | TFD_NONBLOCK);
+    if (sendspin_tick_fd >= 0) {
+        itimerspec ts{};
+        ts.it_value.tv_nsec    = 33'000'000;
+        ts.it_interval.tv_nsec = 33'000'000;
+        if (::timerfd_settime(sendspin_tick_fd, 0, &ts, nullptr) == 0) {
+            server.AddAuxFd(sendspin_tick_fd,
+                            [sendspin_tick_fd, &sendspin_hub, &state,
+                             set_sendspin_running] {
+                std::uint64_t expirations = 0;
+                while (::read(sendspin_tick_fd, &expirations,
+                              sizeof(expirations)) > 0) {
+                }
+                // Enabled but not running (e.g. PulseAudio was not up yet):
+                // retry every 5 s.
+                static auto next_retry = std::chrono::steady_clock::now();
+                if (state.preferences.sendspin_enabled &&
+                    !sendspin_hub->IsStarted() &&
+                    std::chrono::steady_clock::now() >= next_retry) {
+                    next_retry = std::chrono::steady_clock::now() +
+                                 std::chrono::seconds(5);
+                    if (set_sendspin_running(true)) {
+                        LVA_LOGI(kTag, "Sendspin started on retry");
+                    }
+                }
+                sendspin_hub->Loop();
+            });
+        } else {
+            LVA_LOGE(kTag, "sendspin timerfd_settime failed");
+        }
+    } else {
+        LVA_LOGE(kTag, "sendspin timerfd_create failed");
+    }
+
     const int rc = server.Run();
     g_server = nullptr;
+
+    // client/goodbye to the Sendspin server before the process exits.
+    sendspin_mdns.Stop();
+    state.sendspin = nullptr;
+    state.media_player_entity->SetSendspin(nullptr);
+    sendspin_hub->Stop();
     g_wakeword_engine = nullptr;
 
     if (supervisor_http) supervisor_http->Stop();

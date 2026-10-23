@@ -18,7 +18,7 @@ LINUX_VOICE_ASSISTANT_CPP_LICENSE_FILES = \
 	third_party/microfrontend/LICENSE \
 	third_party/microfrontend/LICENSE.kissfft
 
-LINUX_VOICE_ASSISTANT_CPP_DEPENDENCIES = host-protobuf protobuf json-for-modern-cpp mpv webrtc-audio-processing libcurl avahi alsa-lib tr-volume
+LINUX_VOICE_ASSISTANT_CPP_DEPENDENCIES = host-protobuf protobuf json-for-modern-cpp mpv webrtc-audio-processing libcurl avahi alsa-lib tr-volume sendspin-cpp pulseaudio
 
 LINUX_VOICE_ASSISTANT_CPP_CONF_OPTS =
 
@@ -83,5 +83,13 @@ define LINUX_VOICE_ASSISTANT_CPP_INSTALL_LICENSES
 endef
 LINUX_VOICE_ASSISTANT_CPP_POST_INSTALL_TARGET_HOOKS += \
 	LINUX_VOICE_ASSISTANT_CPP_INSTALL_LICENSES
+
+# _sendspin._tcp is published by LVA itself while the Sendspin client runs
+# (MdnsPublisher). Drop the static file older images installed.
+define LINUX_VOICE_ASSISTANT_CPP_REMOVE_STATIC_SENDSPIN_SERVICE
+	rm -f $(TARGET_DIR)/etc/avahi/services/sendspin.service
+endef
+LINUX_VOICE_ASSISTANT_CPP_POST_INSTALL_TARGET_HOOKS += \
+	LINUX_VOICE_ASSISTANT_CPP_REMOVE_STATIC_SENDSPIN_SERVICE
 
 $(eval $(cmake-package))

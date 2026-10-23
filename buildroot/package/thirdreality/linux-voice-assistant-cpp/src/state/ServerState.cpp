@@ -11,6 +11,7 @@
 #include "entities/MediaPlayerEntity.h"
 #include "entities/MuteSwitchEntity.h"
 #include "satellite/Satellite.h"
+#include "sendspin/SendspinHub.h"
 #include "tr/LedRing.h"
 #include "tr/MicMuteGpio.h"
 #include "tr/SystemVolume.h"
@@ -42,6 +43,9 @@ void ServerState::PersistVolume(double new_volume) {
     preferences.volume = clamped;
     lva::tr::SetSystemVolume(static_cast<int>(clamped * 100.0 + 0.5));
     lva::tr::ShowVolumeChanged();
+    if (sendspin != nullptr) {
+        sendspin->SetVolume(static_cast<int>(clamped * 100.0 + 0.5));
+    }
     if (media_player_entity != nullptr) {
         media_player_entity->BroadcastState();
     }
@@ -81,6 +85,15 @@ void ServerState::PlayMuteToggleSound(bool muted) {
         ? "/usr/share/thirdreality/sounds/mute_switch_on.flac"
         : "/usr/share/thirdreality/sounds/mute_switch_off.flac",
         {});
+}
+
+void ServerState::PersistSendspinEnabled(bool enabled) {
+    if (preferences.sendspin_enabled == enabled) return;
+    preferences.sendspin_enabled = enabled;
+    if (!SavePreferences()) {
+        LVA_LOGW(kTag, "PersistSendspinEnabled(%d): save failed",
+                 enabled ? 1 : 0);
+    }
 }
 
 void ServerState::PersistThinkingSound(bool enabled) {

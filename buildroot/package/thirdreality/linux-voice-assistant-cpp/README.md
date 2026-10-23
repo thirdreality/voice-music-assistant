@@ -7,32 +7,40 @@ aarch64, Buildroot).
 
 ## Features
 
-- ESPHome native API server (TCP 6053, plain-text framing, protobuf)
-- mDNS auto-discovery via avahi (_esphomelib._tcp)
-- 11 entities: mute switch, thinking-sound switch, 3× wake-word
-  sensitivity numbers, mic gain, mic volume, mic noise select,
-  media player, home button event, firmware update
-- Voice satellite state machine (wake → STT → intent → TTS playback →
-  timer ring loop)
-- Optional on-device STT + TTS (`--voice-backend local`); HA only
-  resolves the intent. See "Local voice backend".
-- MicroWakeWord inference (TFLM microfrontend + TFLite C runtime,
-  dlopen)
-- OpenWakeWord inference (melspectrogram + embedding TFLite models)
-- WebRTC AGC + noise suppression + AEC (hardware-loopback echo
-  cancellation when using ALSA capture backend with reference channels)
-- ALSA capture backend with multi-channel support (mic + reference
-  channels for AEC)
-- PulseAudio capture backend (legacy fallback)
-- LED ring animations via D-Bus
-- Home button monitor (/dev/input/event0, single/double/triple press)
-- Mic mute GPIO bridge (hardware slider ↔ HA switch)
-- ALSA system volume sync via adckey_function.sh
-- Sendspin duck/unduck (SIGUSR1/2) during voice pipelines
-- sound.json external-change watcher (500 ms poll)
-- Supervisor HTTP API on port 8086 (HMAC-MD5 signed commands)
-- OTA: check version, download, MD5 verify, swupdate install
-- Timezone sync from HA (GetTimeRequest/GetTimeResponse)
+- ESPHome native API server (TCP 6053, plain-text framing, protobuf) and
+  mDNS discovery (`_esphomelib._tcp`)
+- Voice satellite: wake word -> STT -> intent -> TTS, timers, continued
+  conversation. STT/TTS run in HA by default or on the device (see
+  "Local voice backend")
+- MicroWakeWord and OpenWakeWord (TFLite C runtime, dlopen)
+- WebRTC AGC, noise suppression and AEC on the ALSA capture path (mic +
+  hardware loopback reference channels); PulseAudio capture as fallback
+- One HA media player for mpv (HA media, TTS, announcements) and
+  Sendspin (Music Assistant), see "Sendspin"
+- ThirdReality hardware: LED ring (D-Bus), mic mute GPIO, system volume
+  (`tr-volume`), tap/home gestures forwarded by `tr-buttond` over
+  `/tmp/lva-control.sock`
+- `sound.json` watcher (500 ms poll) for changes made by other tools
+- Supervisor HTTP API on port 8086 (HMAC-MD5 signed commands), OTA
+  (version check, download, MD5 verify, swupdate)
+- Timezone sync from HA
+
+### HA entities
+
+| Entity | object_id |
+|---|---|
+| Media Player | `linux_voice_assistant_media_player` |
+| Mute | `mute` |
+| Thinking Sound | `thinking_sound` |
+| Wake Word 1 / 2 Sensitivity | `wake_word_1_sensitivity`, `wake_word_2_sensitivity` |
+| Stop Word Sensitivity | `stop_word_sensitivity` |
+| Continue Conversation Delay | `continue_conversation_delay` |
+| Mic Auto Gain / Mic Noise Suppression / Mic Volume | `mic_gain`, `mic_noise`, `mic_volume` |
+| Speech Processing | `speech_processing` |
+| Speech Rate (Local TTS) | `speech_rate` |
+| Sendspin | `sendspin` |
+| Home Button (event) | `thirdreality_home_button` |
+| Firmware Update | `thirdreality_firmware_update` |
 
 ## Build
 
@@ -44,6 +52,10 @@ Full image:
 ```
 ./go --docker trspk <version>
 ```
+
+sendspin-cpp is linked statically. After changing the `sendspin-cpp`
+package, rebuild it and then this package; Buildroot does not rebuild
+dependents on its own.
 
 ## Runtime invocation
 
@@ -111,15 +123,18 @@ src/audio/                  AudioCapture, LibMpvPlayer, PcmRingBuffer,
                             WebRtcProcessor, IAudioPlayer
 src/satellite/              Voice pipeline state machine, LocalStt worker,
                             conversation.process reply parser
-src/tr/                     ThirdReality integration (LED, GPIO, home
-                            button, volume, sendspin, supervisor, OTA,
-                            timezone sync, sound.json watcher)
+src/sendspin/               SendspinHub: sendspin-cpp client, PulseAudio
+                            sink, identity files, music LED
+src/tr/                     ThirdReality integration (control socket, LED,
+                            mic mute GPIO, volume, model download,
+                            supervisor, OTA, timezone sync, sound.json
+                            watcher)
 src/tools/                  Dev tools (micro_features_dump, tflite_inspect,
                             wake_word_dump, aec_loopback_test, stt_wav_test,
                             tts_wav_test, conversation_reply_test)
 src/util/                   Log helper
 third_party/microfrontend/  TFLM microfrontend + kissfft sources
-third_party/tflite_c/       Prebuilt libtensorflowlite_c.so (GLIBC≤2.29)
+third_party/tflite_c/       Prebuilt libtensorflowlite_c.so (GLIBC <= 2.29)
 third_party/whisper.cpp/    Prebuilt whisper.cpp + ggml static libs (A113X),
                             memory patch, model alignment script
 third_party/espeak-ng/      Prebuilt eSpeak-NG static libs (A113X), used as
@@ -136,9 +151,34 @@ sounds/                     UI feedback sounds (wake_word_triggered,
 ## Dependencies (Buildroot)
 
 host-protobuf, protobuf, json-for-modern-cpp, mpv, pulseaudio,
-alsa-lib, webrtc-audio-processing, libcurl, avahi.
+alsa-lib, webrtc-audio-processing, libcurl, avahi (daemon + libdns_sd
+compatibility), tr-volume, sendspin-cpp (static, staging only).
 Plus the vendored libtensorflowlite_c.so (dlopen'd at runtime, not
 linked) and liblva_speech.so (built here, installed to /usr/lib).
+
+## Sendspin
+
+LVA runs the Sendspin player (sendspin-cpp) in process, following
+ESPHome's sendspin hub + media_source + speaker_source design.
+
+- The HA media player state follows the active source. A Sendspin stream
+  reads PLAYING from stream start to stream end.
+- PAUSE / PLAY go to the whole Sendspin group. STOP leaves the group
+  (this speaker only). `play_media sendspin://current` resumes the group;
+  `sendspin://host:port` connects to that server.
+- mpv and Sendspin take the speaker from each other. Voice turns and HA
+  announcements duck Sendspin (-12 dB).
+- Volume and mute are synced both ways with the server.
+- Tap: abort TTS, else pause / resume. Double tap: music LED on/off
+  (`led_disabled` in `/data/conf/sendspin.json`, off by default).
+- The "Sendspin" switch (`sendspin_enabled` in `sound.json`, default on)
+  starts / stops the client. `_sendspin._tcp` (port 8928, TXT
+  `path=/sendspin`) is published only while it runs. A failed start is
+  retried every 5 s.
+- Identity and pairing live in `/data/conf/sendspin-state/`; keep it to
+  keep the Music Assistant player. The client sends the device MAC, so
+  Music Assistant hides the duplicate HA media player.
+- Requires Music Assistant 2.10.7+ or 2.11.0b4+ (Sendspin 1.0.0-rc1).
 
 ## Local voice backend
 

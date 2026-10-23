@@ -50,7 +50,6 @@ if [ -x $NTPDATE_BIN ] ; then
     fi
     /etc/init.d/S44bluetooth stop
     /etc/init.d/S99ha-speaker voice-assistant start
-    /etc/init.d/S99ha-speaker sendspin-client start
 
     #If the platform have RTC, we will write back to RTC HW
     if [ -e /dev/rtc ] || [ -e /dev/rtc0 ] || [ -e /dev/misc/rtc ]; then

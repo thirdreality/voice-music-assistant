@@ -1,0 +1,9 @@
+prefix=/usr
+libdir=${prefix}/lib/sendspin
+includedir=${prefix}/include
+
+Name: sendspin-cpp
+Description: Sendspin synchronized audio streaming client library
+Version: @VERSION@
+Cflags: -I${includedir} -DSENDSPIN_ENABLE_PLAYER -DSENDSPIN_ENABLE_OPUS -DSENDSPIN_ENABLE_CONTROLLER -DSENDSPIN_ENABLE_METADATA -DSENDSPIN_ENABLE_COLOR -DSENDSPIN_ENABLE_VISUALIZER
+Libs: -L${libdir} -lsendspin -lmicro_flac -lmicro_opus -lmicro_ogg_demuxer -lixwebsocket -lnoise_c -lpthread

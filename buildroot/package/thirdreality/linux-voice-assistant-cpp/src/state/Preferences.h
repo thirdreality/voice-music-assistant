@@ -42,6 +42,9 @@ class Preferences {
     // Local TTS speed in words per minute; nullopt = built-in default.
     std::optional<int>         tts_rate;
 
+    // In-process Sendspin player (Music Assistant).
+    bool sendspin_enabled = true;
+
     // sound.json-only fields. Round-tripped verbatim.
     int mic_gain = 30;   // analog gain knob, 0..100, hardware-defined
     int mic_mute = 1;    // 0 = muted, 1 = unmuted (matches GPIO 438)

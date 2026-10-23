@@ -77,6 +77,14 @@ message(STATUS "Found avahi-client ${AVAHI_CLIENT_VERSION} via pkg-config")
 pkg_check_modules(ALSA REQUIRED IMPORTED_TARGET alsa)
 message(STATUS "Found alsa-lib ${ALSA_VERSION} via pkg-config")
 
+pkg_check_modules(PULSE REQUIRED IMPORTED_TARGET libpulse)
+message(STATUS "Found libpulse ${PULSE_VERSION} via pkg-config")
+
+# Static, staging only. Its Cflags carry the role defines that the public
+# headers depend on.
+pkg_check_modules(SENDSPIN REQUIRED IMPORTED_TARGET sendspin-cpp)
+message(STATUS "Found sendspin-cpp ${SENDSPIN_VERSION} via pkg-config")
+
 find_package(Threads REQUIRED)
 
 # Vendored TFLite Micro microfrontend + kissfft. Separate object library so
@@ -196,12 +204,12 @@ add_executable(linux-voice-assistant-cpp
     src/satellite/ConversationReply.cpp
     src/satellite/LocalStt.cpp
     src/satellite/Satellite.cpp
+    src/sendspin/SendspinHub.cpp
     src/tr/ControlListener.cpp
     src/tr/LedRing.cpp
     src/tr/MicMuteGpio.cpp
     src/tr/ModelDownloader.cpp
     src/tr/OtaClient.cpp
-    src/tr/SendspinControl.cpp
     src/tr/SoundConfWatcher.cpp
     src/tr/Supervisor.cpp
     src/tr/SupervisorHttpServer.cpp
@@ -212,6 +220,7 @@ add_executable(linux-voice-assistant-cpp
     src/entities/ThinkingSoundEntity.cpp
     src/entities/NumberEntity.cpp
     src/entities/SelectEntity.cpp
+    src/entities/SendspinSwitchEntity.cpp
     src/entities/MediaPlayerEntity.cpp
     src/entities/EventEntity.cpp
     src/entities/UpdateEntity.cpp
@@ -242,6 +251,8 @@ target_link_libraries(linux-voice-assistant-cpp
         PkgConfig::WEBRTC_APM
         PkgConfig::LIBCURL
         PkgConfig::AVAHI_CLIENT
+        PkgConfig::PULSE
+        PkgConfig::SENDSPIN
         lva_speech
         Threads::Threads
         ${CMAKE_DL_LIBS}

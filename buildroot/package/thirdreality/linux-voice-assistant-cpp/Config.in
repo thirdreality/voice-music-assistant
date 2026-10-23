@@ -11,11 +11,19 @@ config BR2_PACKAGE_LINUX_VOICE_ASSISTANT_CPP
 	select BR2_PACKAGE_PULSEAUDIO  # default audio output for libmpv
 	select BR2_PACKAGE_TR_VOLUME
 	select BR2_PACKAGE_WEBRTC_AUDIO_PROCESSING  # AGC + NS for the mic
+	select BR2_PACKAGE_SENDSPIN_CPP  # in-process Sendspin player
+	select BR2_PACKAGE_AVAHI
+	select BR2_PACKAGE_AVAHI_DAEMON  # advertises _sendspin._tcp
+	# Was selected by the removed sendspin-client package; ntpdate links
+	# libdns_sd when it is present, so keep the image unchanged.
+	select BR2_PACKAGE_AVAHI_LIBDNSSD_COMPATIBILITY
 	default n
 	help
 	  Native ESPHome-API voice assistant for the ThirdReality
 	  speaker. STT/TTS run in Home Assistant by default;
-	  --voice-backend local runs them on-device.
+	  --voice-backend local runs them on-device. Also plays
+	  Sendspin (Music Assistant) streams in process, behind the
+	  same HA media player.
 
 	  Requires gcc >= 10 (C++20). Do not enable together with
 	  BR2_PACKAGE_LINUX_VOICE_ASSISTANT.

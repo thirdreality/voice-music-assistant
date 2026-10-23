@@ -1,5 +1,5 @@
 # Locally calculated
-sha256  e76e9491db42a8c00d7a978579dbf8a0b2f7459d49396baabf260d12cc7ffc6f  sendspin-client-v0.9.5.tar.gz
+sha256  e76e9491db42a8c00d7a978579dbf8a0b2f7459d49396baabf260d12cc7ffc6f  sendspin-cpp-v0.9.5.tar.gz
 sha256  37deff111f8786efe200466bc2901fad9040b6e1b3e4ff2e57b5a1a4e461bf75  LICENSE
 sha256  ebba0906d6c8b3daa8a1b59acb2d3a416485dd77fc10f6dd4c9ed2cbe467ee2d  third_party/arduinojson/LICENSE.txt
 sha256  37deff111f8786efe200466bc2901fad9040b6e1b3e4ff2e57b5a1a4e461bf75  third_party/micro-flac/LICENSE

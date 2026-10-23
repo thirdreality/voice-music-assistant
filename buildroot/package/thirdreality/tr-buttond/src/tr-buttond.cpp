@@ -15,10 +15,8 @@
 //   Tap  long press                     -> adckey_function.sh longpressTap
 //   Home single / double / triple       -> lva socket HOME_SINGLE/DOUBLE/TRIPLE
 //   Tap  single                         -> lva socket TAP (lva decides: abort
-//                                          TTS, else toggle music); if lva is
-//                                          down, fall back to sendspin
-//                                          MUSIC_TOGGLE
-//   Tap  double                         -> sendspin socket LED_TOGGLE
+//                                          TTS, else toggle music)
+//   Tap  double                         -> lva socket LED_TOGGLE (music LED)
 //
 // Volume and mute updates go to lva, the normal sound.json owner. If lva is
 // unavailable, the existing shell script remains the fallback. Factory reset
@@ -49,7 +47,6 @@ namespace {
 constexpr const char* kInputDeviceName = "gpio_keypad";
 constexpr const char* kAdckeyScript   = "/etc/adckey/adckey_function.sh";
 constexpr const char* kLvaSocket      = "/tmp/lva-control.sock";
-constexpr const char* kSendspinSocket = "/tmp/sendspin-control.sock";
 constexpr const char* kSoundConfig    = "/data/conf/sound.json";
 constexpr const char* kMicMuteGpio    = "/sys/class/gpio/gpio438/value";
 
@@ -256,14 +253,11 @@ bool SendTo(const char* socket_path, const char* cmd) {
 
 void OnTap(int taps) {
     if (taps == 1) {
-        // lva owns the semantics: abort TTS if speaking, else toggle music.
-        // If lva is down the datagram cannot be delivered, so fall back to
-        // telling sendspin to toggle music directly.
-        if (!SendTo(kLvaSocket, "TAP")) {
-            SendTo(kSendspinSocket, "MUSIC_TOGGLE");
-        }
+        // lva owns the semantics: abort TTS if speaking, else toggle music
+        // (mpv or Sendspin, both live in lva).
+        SendTo(kLvaSocket, "TAP");
     } else if (taps >= 2) {
-        SendTo(kSendspinSocket, "LED_TOGGLE");
+        SendTo(kLvaSocket, "LED_TOGGLE");
     }
 }
 

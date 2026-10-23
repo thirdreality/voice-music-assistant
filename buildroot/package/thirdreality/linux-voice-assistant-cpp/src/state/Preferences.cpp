@@ -141,6 +141,8 @@ void PopulateFromJson(Preferences& out,
         it != obj.end() && it->is_number_integer()) {
         out.tts_rate = it->get<int>();
     }
+    out.sendspin_enabled =
+        CoerceInt(obj.value("sendspin_enabled", 1), 1) != 0;
 }
 
 void ApplyToJson(const Preferences& prefs, nlohmann::json& obj) {
@@ -201,6 +203,7 @@ void ApplyToJson(const Preferences& prefs, nlohmann::json& obj) {
     } else {
         obj.erase("tts_rate");
     }
+    obj["sendspin_enabled"] = prefs.sendspin_enabled ? 1 : 0;
 }
 
 }  // namespace

@@ -4,24 +4,21 @@
 #
 # Manages:
 #   - netmonitor       (WiFi/internet connectivity state machine)
-#   - voice-assistant  (/usr/bin/linux-voice-assistant-cpp)
-#   - sendspin-client  (music streaming)
+#   - voice-assistant  (/usr/bin/linux-voice-assistant-cpp, includes the
+#                       Sendspin music player)
 #   - pulseaudio       (reboot device if it dies)
 #
 # Usage:
 #   S99ha-speaker start|stop|restart
 #   S99ha-speaker <service> start|stop|restart
 #
-# Services: netmonitor, voice-assistant, sendspin-client
+# Services: netmonitor, voice-assistant
 
 PIDDIR=/var/run/thirdreality
 MONITOR_PIDFILE=$PIDDIR/ha-speaker.pid
 NETMONITOR_PIDFILE=$PIDDIR/netmonitor.pid
 VOICE_PIDFILE=$PIDDIR/voice-assistant.pid
 DEVICE_CONF="/data/conf/device.json"
-
-SENDSPIN_CLIENT=/usr/bin/sendspin-client
-[ -r /etc/default/sendspin-client ] && . /etc/default/sendspin-client
 
 CHECK_INTERVAL=10
 
@@ -30,7 +27,6 @@ CHECK_INTERVAL=10
 # Removed by:  S99ha-speaker <service> start
 DISABLE_NETMONITOR=/tmp/ha_disable_netmonitor
 DISABLE_VOICE=/tmp/ha_disable_voice
-DISABLE_SENDSPIN=/tmp/ha_disable_sendspin
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -67,6 +63,11 @@ stop_netmonitor() {
 start_voice_assistant() {
     is_running "$VOICE_PIDFILE" && return 0
     rm -f "$VOICE_PIDFILE" "$DISABLE_VOICE"
+
+    # Restart avahi so it picks up the new hostname and sendspin.service.
+    /etc/init.d/S50avahi-daemon stop 2>/dev/null
+    /etc/init.d/S50avahi-daemon start 2>/dev/null
+
     local spk_name
     spk_name=$(jq -r '.device.name // "thirdreality-speaker"' "$DEVICE_CONF")
     /usr/bin/linux-voice-assistant-cpp \
@@ -83,29 +84,6 @@ stop_voice_assistant() {
         kill -9 "$(cat "$VOICE_PIDFILE")" 2>/dev/null
     fi
     rm -f "$VOICE_PIDFILE"
-}
-
-# ---------------------------------------------------------------------------
-# sendspin-client (music streaming)
-# ---------------------------------------------------------------------------
-
-start_sendspin() {
-    pidof sendspin-client > /dev/null 2>&1 && return 0
-
-    /etc/init.d/S50avahi-daemon stop 2>/dev/null
-    /etc/init.d/S50avahi-daemon start 2>/dev/null
-    
-    rm -f "$DISABLE_SENDSPIN"
-    local spk_name
-    spk_name=$(jq -r '.device.name // "3RSPK Speaker"' "$DEVICE_CONF")
-    start-stop-daemon --start --quiet --background --name sendspin-client \
-        --exec "$SENDSPIN_CLIENT" -- $SENDSPIN_CLIENT_OPTS "$spk_name"
-}
-
-stop_sendspin() {
-    touch "$DISABLE_SENDSPIN"
-    start-stop-daemon --stop --quiet --retry=TERM/30/KILL/5 --name sendspin-client
-    start-stop-daemon --stop --quiet --oknodo --retry=0/30/KILL/5 --name sendspin-client
 }
 
 # ---------------------------------------------------------------------------
@@ -126,13 +104,7 @@ monitor_loop() {
             start_voice_assistant
         fi
 
-        # 3. sendspin-client
-        if [ ! -f "$DISABLE_SENDSPIN" ] && ! pidof sendspin-client > /dev/null 2>&1; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] sendspin-client not running, restarting..."
-            start_sendspin
-        fi
-
-        # 4. pulseaudio
+        # 3. pulseaudio
         if ! pidof pulseaudio > /dev/null 2>&1; then
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] pulseaudio died, rebooting..."
             sync
@@ -164,9 +136,9 @@ start() {
         paplay /usr/share/thirdreality/audio/setup_mode.wav &
     fi
 
-    # voice-assistant and sendspin-client require network (NTP sync).
-    # Disable them at boot; ntpdate.sh enables them after first sync.
-    touch "$DISABLE_VOICE" "$DISABLE_SENDSPIN"
+    # voice-assistant requires network (NTP sync). Disable it at boot;
+    # ntpdate.sh enables it after the first sync.
+    touch "$DISABLE_VOICE"
 
     start_netmonitor
 
@@ -186,10 +158,9 @@ stop() {
 
     /etc/init.d/S44bluetooth stop
     stop_voice_assistant
-    stop_sendspin
     stop_netmonitor
     # Clear disable flags so next start brings everything up
-    rm -f "$DISABLE_NETMONITOR" "$DISABLE_VOICE" "$DISABLE_SENDSPIN"
+    rm -f "$DISABLE_NETMONITOR" "$DISABLE_VOICE"
 }
 
 restart() {
@@ -222,17 +193,9 @@ service_cmd() {
                 *) echo "Usage: $0 voice-assistant {start|stop|restart}"; exit 1 ;;
             esac
             ;;
-        sendspin-client)
-            case "$action" in
-                start)   start_sendspin ;;
-                stop)    stop_sendspin ;;
-                restart) stop_sendspin; sleep 1; start_sendspin ;;
-                *) echo "Usage: $0 sendspin-client {start|stop|restart}"; exit 1 ;;
-            esac
-            ;;
         *)
             echo "Unknown service: $svc"
-            echo "Services: netmonitor, voice-assistant, sendspin-client"
+            echo "Services: netmonitor, voice-assistant"
             exit 1
             ;;
     esac
@@ -246,12 +209,12 @@ case "$1" in
     start)   start   ;;
     stop)    stop    ;;
     restart) restart ;;
-    netmonitor|voice-assistant|sendspin-client)
+    netmonitor|voice-assistant)
         service_cmd "$1" "$2"
         ;;
     *)
         echo "Usage: $0 {start|stop|restart}"
-        echo "       $0 {netmonitor|voice-assistant|sendspin-client} {start|stop|restart}"
+        echo "       $0 {netmonitor|voice-assistant} {start|stop|restart}"
         exit 1
         ;;
 esac

@@ -21,6 +21,12 @@ Installed on the device as
 | TFLite Micro microfrontend (wake-word features) | via `OHF-Voice/pymicro-features` v2.0.2 | Apache-2.0 | `third_party/microfrontend/LICENSE` |
 | kissfft, (c) 2003-2010 Mark Borgerding | via `OHF-Voice/pymicro-features` v2.0.2 | BSD-3-Clause | `third_party/microfrontend/LICENSE.kissfft` |
 | ESPHome native API `.proto` | aioesphomeapi v42.7.0 | MIT | upstream repository |
+| sendspin-cpp (Sendspin player, static) | `Sendspin/sendspin-cpp` v0.9.5 | Apache-2.0 | `LICENSE` in the sendspin-cpp package |
+| micro-flac, micro-opus, micro-ogg-demuxer (via sendspin-cpp) | pinned in `sendspin-cpp.mk` | Apache-2.0 | sendspin-cpp package `third_party/` |
+| Opus codec (via micro-opus) | `xiph/opus@22244de` | BSD-3-Clause | sendspin-cpp package `third_party/micro-opus/lib/opus/COPYING` |
+| IXWebSocket (via sendspin-cpp) | `machinezone/IXWebSocket@64fae76` | BSD-3-Clause | sendspin-cpp package `third_party/ixwebsocket/LICENSE.txt` |
+| noise-c (via sendspin-cpp) | `esphome-libs/noise-c@a1e0880` | MIT | sendspin-cpp package `third_party/noise-c/COPYING` |
+| ArduinoJson (header-only, via sendspin-cpp) | `bblanchon/ArduinoJson@3252013` | MIT | sendspin-cpp package `third_party/arduinojson/LICENSE.txt` |
 
 ## Shipped alongside
 
