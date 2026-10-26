@@ -1189,10 +1189,7 @@ int main(int argc, char** argv) {
     if (!use_openwakeword) {
         for (const auto& primary_model :
              wakeword_engine->SnapshotModels()) {
-            if (!primary_model ||
-                primary_model->config().id == "stop") {
-                continue;
-            }
+            if (!primary_model) continue;
 
             const auto json_path =
                 wakeword_dir / (primary_model->config().id + ".json");
@@ -1300,12 +1297,38 @@ int main(int argc, char** argv) {
          &last_wake_dispatch_ns,
          &state](
             const std::string& model_id, float prob) {
-            if (model_id == "stop") return;
-
             const auto now_ns =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now()
                         .time_since_epoch()).count();
+
+            if (model_id == "stop") {
+                const auto guard_until_ns =
+                    state.webrtc_processor != nullptr
+                        ? state.webrtc_processor->LinearGuardUntilNs()
+                        : 0;
+
+                if (guard_until_ns != 0 &&
+                    now_ns < guard_until_ns) {
+                    const auto remaining_ms =
+                        (guard_until_ns - now_ns) / 1'000'000LL;
+
+                    LVA_LOGD(
+                        "wake",
+                        "linear stop guard suppressed "
+                        "prob=%.3f remaining_ms=%lld",
+                        prob,
+                        static_cast<long long>(remaining_ms));
+                    return;
+                }
+
+                LVA_LOGD(
+                    "wake",
+                    "stop word detected source=linear_aec prob=%.3f",
+                    prob);
+                satellite->OnStopDetected();
+                return;
+            }
 
             const auto guard_until_ns =
                 state.webrtc_processor != nullptr

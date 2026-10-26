@@ -225,7 +225,10 @@ void Satellite::StartPipeline(const std::string& wake_word_phrase) {
     const auto now = std::chrono::steady_clock::now();
     const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         now.time_since_epoch()).count();
-    if (now_ns < refractory_until_ns_.load(std::memory_order_relaxed)) {
+    const bool barge_in = pipeline_active_ && speech_active_ &&
+                          announce_player_ != nullptr;
+    if (!barge_in &&
+        now_ns < refractory_until_ns_.load(std::memory_order_relaxed)) {
         const auto remaining_ms =
             (refractory_until_ns_.load(std::memory_order_relaxed) - now_ns)
             / 1'000'000;
@@ -234,8 +237,17 @@ void Satellite::StartPipeline(const std::string& wake_word_phrase) {
         return;
     }
     if (pipeline_active_) {
-        LVA_LOGD(kTag, "wake during active pipeline; ignoring");
-        return;
+        if (barge_in) {
+            LVA_LOGI(kTag,
+                     "wake during speech -> stopping speech and restarting");
+            continue_conversation_ = false;
+            continue_listen_at_ns_.store(0, std::memory_order_relaxed);
+            announce_player_->Stop();
+            FinishSpeech(false);
+        } else {
+            LVA_LOGD(kTag, "wake during active pipeline; ignoring");
+            return;
+        }
     }
     if (timer_ringing_) {
         LVA_LOGI(kTag, "wake during timer ring — stopping ring");
