@@ -47,6 +47,7 @@ ApiServer::ApiServer(lva::state::ServerState& state, Options options)
 
 ApiServer::~ApiServer() {
     state_.broadcast = nullptr;
+    state_.has_voice_client = nullptr;
     if (listen_fd_ >= 0) ::close(listen_fd_);
     if (epoll_fd_  >= 0) ::close(epoll_fd_);
     if (wake_fd_   >= 0) ::close(wake_fd_);
@@ -196,12 +197,25 @@ bool ApiServer::Start() {
     state_.broadcast = [this](std::uint32_t msg_type_id,
                               const ::google::protobuf::MessageLite& msg) {
         const bool voice = IsVoiceMessage(msg_type_id);
+        bool sent = false;
         for (auto& [fd, conn] : connections_) {
             (void)fd;
-            if (conn && (!voice || conn->voice_subscribed())) {
-                conn->SendSerializedMessage(msg_type_id, msg);
+            if (conn && conn->authenticated() &&
+                (!voice || conn->voice_subscribed())) {
+                sent = conn->SendSerializedMessage(msg_type_id, msg) || sent;
             }
         }
+        return sent;
+    };
+    state_.has_voice_client = [this] {
+        for (const auto& [fd, conn] : connections_) {
+            (void)fd;
+            if (conn && conn->authenticated() &&
+                conn->voice_subscribed()) {
+                return true;
+            }
+        }
+        return false;
     };
 
     return true;

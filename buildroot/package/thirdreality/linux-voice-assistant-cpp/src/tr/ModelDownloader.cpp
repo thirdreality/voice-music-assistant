@@ -219,9 +219,10 @@ ModelDownloader::Result ModelDownloader::DownloadOnce() {
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION,   1L);
     curl_easy_setopt(curl, CURLOPT_FAILONERROR,      1L);
     curl_easy_setopt(curl, CURLOPT_CAINFO,           kCaCertPath);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT,   30L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT,   10L);
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT,  1024L);  // 1 KB/s
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME,   60L);    // for 60 s
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL,         1L);
     curl_easy_setopt(curl, CURLOPT_RESUME_FROM_LARGE,
                      static_cast<curl_off_t>(offset));
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,    &WriteCb);
@@ -230,10 +231,18 @@ ModelDownloader::Result ModelDownloader::DownloadOnce() {
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, &ProgressCb);
     curl_easy_setopt(curl, CURLOPT_XFERINFODATA,     &ctx);
 
+    const auto attempt_started = std::chrono::steady_clock::now();
+    LVA_LOGI(kTag, "download attempt started (offset=%ju)", offset);
     const CURLcode rc = curl_easy_perform(curl);
+    const auto attempt_elapsed = std::chrono::duration_cast<
+        std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                   attempt_started).count();
     long http_code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     curl_easy_cleanup(curl);
+    LVA_LOGI(kTag, "download attempt finished rc=%d http=%ld elapsed_ms=%lld",
+             static_cast<int>(rc), http_code,
+             static_cast<long long>(attempt_elapsed));
     std::fflush(ctx.fp);
     ::fsync(::fileno(ctx.fp));
     std::fclose(ctx.fp);

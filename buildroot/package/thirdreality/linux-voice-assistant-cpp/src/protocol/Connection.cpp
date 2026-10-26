@@ -149,6 +149,7 @@ bool Connection::DispatchFrame(const InboundFrame& frame) {
             ::AuthenticationResponse resp;
             const bool ok = Send(resp);
             if (ok) {
+                authenticated_ = true;
                 ::GetTimeRequest gt;
                 Send(gt);
 
@@ -352,6 +353,9 @@ bool Connection::DispatchFrame(const InboundFrame& frame) {
                      peer_label_.c_str(), m.subscribe() ? 1 : 0,
                      m.flags());
             voice_subscribed_ = m.subscribe();
+            if (voice_subscribed_) {
+                state_.FlushPendingNotifications();
+            }
             return true;
         }
         case kIdVoiceAssistantResponse: {

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -63,10 +64,13 @@ class ServerState {
 
     class ::lva::tr::Supervisor* supervisor = nullptr;
 
-    using BroadcastFn = std::function<void(
+    using BroadcastFn = std::function<bool(
         std::uint32_t msg_type_id,
         const ::google::protobuf::MessageLite& msg)>;
     BroadcastFn broadcast;
+
+    using ConnectionPredicate = std::function<bool()>;
+    ConnectionPredicate has_voice_client;
 
     using ConnectionEventFn = std::function<void()>;
     ConnectionEventFn on_client_authenticated;
@@ -104,12 +108,23 @@ class ServerState {
     void PersistSendspinEnabled(bool enabled);
 
     // Shows a notification in HA (persistent_notification.create). The id
-    // replaces an earlier notification with the same id.
+    // replaces an earlier notification with the same id. If HA is offline,
+    // the latest undelivered notification is replayed after authentication.
     void NotifyHa(const std::string& id, const std::string& title,
-                  const std::string& message) const;
+                  const std::string& message);
+
+    void FlushPendingNotifications();
 
     // Words per minute for the local TTS.
     void PersistTtsRate(int rate_wpm);
+
+   private:
+    struct PendingNotification {
+        std::string title;
+        std::string message;
+    };
+
+    std::map<std::string, PendingNotification> pending_notifications_;
 };
 
 }  // namespace lva::state

@@ -327,14 +327,20 @@ void Satellite::OpenStreamToHa(const std::string& wake_word_phrase) {
         }
     }
 
-    if (!state_.broadcast) {
-        LVA_LOGW(kTag, "no broadcast hook; can't notify HA");
+    if (!state_.broadcast || !state_.has_voice_client ||
+        !state_.has_voice_client()) {
+        LVA_LOGW(kTag, "no connected HA client; cannot start voice pipeline");
+        ResetHaPipeline("no connected HA client");
         return;
     }
     ::VoiceAssistantRequest req;
     req.set_start(true);
     req.set_wake_word_phrase(wake_word_phrase);
-    state_.broadcast(lva::proto::kIdVoiceAssistantRequest, req);
+    if (!state_.broadcast(lva::proto::kIdVoiceAssistantRequest, req)) {
+        LVA_LOGW(kTag, "HA voice pipeline request was not delivered");
+        ResetHaPipeline("HA voice request not delivered");
+        return;
+    }
     ArmHaWatchdog(kHaStartTimeout);
 }
 
@@ -380,10 +386,18 @@ void Satellite::BeginListening() {
     lva::tr::Show(lva::tr::LedState::Listening);
     is_streaming_audio_ = true;
     pipeline_active_    = true;
-    if (state_.broadcast) {
-        ::VoiceAssistantRequest req;
-        req.set_start(true);
-        state_.broadcast(lva::proto::kIdVoiceAssistantRequest, req);
+    if (!state_.broadcast || !state_.has_voice_client ||
+        !state_.has_voice_client()) {
+        LVA_LOGW(kTag, "no connected HA client; cannot continue listening");
+        ResetHaPipeline("no connected HA client");
+        return;
+    }
+    ::VoiceAssistantRequest req;
+    req.set_start(true);
+    if (!state_.broadcast(lva::proto::kIdVoiceAssistantRequest, req)) {
+        LVA_LOGW(kTag, "HA continued-listening request was not delivered");
+        ResetHaPipeline("HA continued-listening request not delivered");
+        return;
     }
     ArmHaWatchdog(kHaStartTimeout);
 }
@@ -684,6 +698,12 @@ void Satellite::OnLoopTick() {
 
     PollLocalVoice();
 
+    if (is_streaming_audio_ &&
+        (!state_.has_voice_client ||
+         !state_.has_voice_client())) {
+        ResetHaPipeline("HA disconnected during voice pipeline");
+    }
+
     CheckHaWatchdog();
 
     PumpAudioToHa();
@@ -813,8 +833,10 @@ void Satellite::PollLocalVoice() {
 }
 
 void Satellite::SendConversationRequest(const std::string& text) {
-    if (!state_.broadcast) {
-        LVA_LOGW(kTag, "no HA connection; cannot process '%s'", text.c_str());
+    if (!state_.broadcast || !state_.has_voice_client ||
+        !state_.has_voice_client()) {
+        LVA_LOGW(kTag, "no connected HA client; cannot process '%s'",
+                 text.c_str());
         local_phase_ = LocalPhase::kIdle;
         continue_conversation_ = false;
         SpeakLocal(kLocalNoConnection);
@@ -846,7 +868,13 @@ void Satellite::SendConversationRequest(const std::string& text) {
     intent_deadline_ = std::chrono::steady_clock::now() + kIntentTimeout;
     LVA_LOGI(kTag, "conversation.process '%s' (call_id=%u)", text.c_str(),
              pending_call_id_);
-    state_.broadcast(lva::proto::kIdHomeassistantActionRequest, req);
+    if (!state_.broadcast(lva::proto::kIdHomeassistantActionRequest, req)) {
+        LVA_LOGW(kTag, "conversation.process request was not delivered");
+        pending_call_id_ = 0;
+        local_phase_ = LocalPhase::kIdle;
+        continue_conversation_ = false;
+        SpeakLocal(kLocalNoConnection);
+    }
 }
 
 void Satellite::OnActionResponse(std::uint32_t call_id, bool success,
