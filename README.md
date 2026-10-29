@@ -30,7 +30,7 @@ The firmware consists of two main application components:
     - [Serial](#serial)
     - [ADB](#adb)
     - [SSH](#ssh)
-  - [Setup the voice assist](#setup-the-voice-assist)
+  - [Set up the voice assistant](#set-up-the-voice-assistant)
   - [Setup through HA APP](#setup-through-ha-app)
   - [Smart Home control with voice](#smart-home-control-with-voice)
   - [Smart Home control with button](#smart-home-control-with-button)
@@ -38,6 +38,7 @@ The firmware consists of two main application components:
   - [Multi-Room Music](#multi-room-music)
     - [Work with Apple HomePod](#work-with-apple-homepod)
     - [Work with Sonos](#work-with-sonos)
+  - [License](#license)
 
 ---
 
@@ -177,28 +178,58 @@ ssh root@<device-ip>
 - Username: `root`
 - Password: `hello3r`
 
-## Setup the voice assist
+## Set up the voice assistant
 
-There are two ways to use the voice assistant: Home Assistant Cloud or local voice recognition (If your device doesn't have sufficient performance, please choose Home Assistant Cloud)
-
-After completing either of the above options, add an assistant under **Settings → Voice Assistants**.
+Speech-to-text (STT) and text-to-speech (TTS) can run in three places.
+For the first two, set up the service and then add an assistant under
+**Settings → Voice Assistants**.
 
 - Home Assistant Cloud
 
-  Open the Home Assistant app or the Home Assistant web interface, Go to **Settings → Home Assistant Cloud**. Create or log in to your account. (30 day free trial)
+  Easiest; needs a Home Assistant Cloud subscription (30-day free trial).
+  Open the Home Assistant app or the Home Assistant web interface, Go to **Settings → Home Assistant Cloud**. Create or log in to your account.
   <div align="left">
     <img src="doc/images/ha-cloud-1.png" width="10%">
     <img src="doc/images/ha-cloud-2.png" width="10%">
   </div>
 
+- Local voice on your Home Assistant server
 
-- Local voice recognition
-
-  Please refer to:
+  Wyoming add-ons on your Home Assistant host. Needs a reasonably fast
+  host. Please refer to:
 
   <https://github.com/rhasspy/wyoming-piper>
 
   <https://github.com/rhasspy/wyoming-faster-whisper>
+
+- Speech on the speaker (3R Speaker)
+
+  STT (whisper.cpp) and TTS (the Piper "amy" voice, via sanoTTS) run on
+  the speaker; no extra service is needed. Home Assistant still
+  understands the command (intents) and runs the action, so the speaker
+  must stay connected to Home Assistant. English only. Replies start
+  after a short pause: the speaker synthesizes the whole reply first,
+  which takes about as long as the reply itself.
+
+  1. In Home Assistant, go to **Settings → Devices & services → ESPHome**,
+     click **Configure** on the speaker and turn on **Allow the device to
+     perform Home Assistant actions**. Without it the speaker gets no
+     reply and no notifications are shown.
+  2. On the device page, under **Configuration**, set **Speech
+     Processing** to **3R Speaker**.
+  3. The first time, the speaker downloads a 31 MB speech model (it
+     starts downloading at boot, so it is often ready already). Until
+     then it keeps using Home Assistant for voice, and a notification
+     shows the progress. When the download finishes the speaker switches
+     by itself; voice is unavailable for about 10 seconds while it
+     restarts. If the download fails, **Speech Processing** goes back to
+     **Home Assistant**; pick **3R Speaker** again to retry.
+  4. Optional: **Speech Rate (Local TTS)** changes how fast the speaker
+     talks (165 = normal). It only applies to 3R Speaker; with Home
+     Assistant the voice is set in the assistant settings.
+
+  Set **Speech Processing** back to **Home Assistant** at any time to use
+  the Home Assistant voice pipeline again.
 
 ---
 
@@ -282,6 +313,10 @@ We can create automation scripts based on the speaker's Home button trigger even
 
 We can use [Music Assistant](https://www.home-assistant.io/integrations/music_assistant/) to play music.
 
+> **Note:** current firmware needs Music Assistant **2.10.7 or newer**
+> (or beta 2.11.0b4 or newer). Older versions cannot connect to the
+> speaker.
+
 **Settings → Add-ons** → search for and add **Music Assistant**. After adding it, you can access it via port 8095.
 
 If it doesn’t exist, please add it using [Music Assistant github repository](https://github.com/music-assistant/home-assistant-addon.git)
@@ -333,10 +368,6 @@ We use [Sendspin](https://www.sendspin-audio.com/) as the playback protocol, so 
 
 Go to the Music Assistant: **Settings → Player Providers → Add a player provider**. Search for and add AirPlay and Sync Group Player.
 
-<div align="left">
-  <img src="doc/images/music-6.png" width="30%">
-</div>
-
 Then you can create a sync group player with your thirdreality speaker and HomePod.
 
 <div align="left">
@@ -360,3 +391,15 @@ Then you can create a universal group player with your thirdreality speaker and 
   <img src="doc/images/music-12.png" width="30%">
   <img src="doc/images/music-13.png" width="30%">
 </div>
+
+## License
+
+The source code in this repository is licensed under the
+[Apache License 2.0](LICENSE). The firmware also includes third-party
+components under their own licences, including GPL-3.0-or-later
+components (eSpeak-NG and the sanoTTS runtime used for on-device speech).
+See
+[THIRD_PARTY_NOTICES.md](buildroot/package/thirdreality/linux-voice-assistant-cpp/THIRD_PARTY_NOTICES.md);
+on the device the notices are in `/usr/share/thirdreality/licenses/`.
+Buildroot's `make legal-info` lists the licences of every package in the
+image.
