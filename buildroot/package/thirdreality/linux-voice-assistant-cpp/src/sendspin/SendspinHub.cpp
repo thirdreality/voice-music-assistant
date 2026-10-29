@@ -5,7 +5,6 @@
 #include <sendspin/controller_role.h>
 #include <sendspin/metadata_role.h>
 #include <sendspin/player_role.h>
-#include <sendspin/visualizer_role.h>
 
 #include <pulse/error.h>
 #include <pulse/pulseaudio.h>
@@ -33,7 +32,11 @@
 #include <thread>
 #include <vector>
 
+#include "util/Diag.h"
 #include "util/Log.h"
+#ifdef LVA_DIAG_LOG
+#include "util/MemProbe.h"
+#endif
 
 extern char** environ;
 
@@ -614,6 +617,9 @@ class PulseSink {
    public:
     // PA target length; also the latency reported when PA has none yet.
     static constexpr pa_usec_t kTargetLatencyUs = 100000;
+    // Five consecutive 20 ms write timeouts mean the sink made no progress for about 100 ms.
+    // Drop that stale PCM and let Sendspin resynchronize instead of retrying it indefinitely.
+    static constexpr unsigned kMaxConsecutiveZeroWrites = 5;
 
     PulseSink() {
         mainloop_ = pa_threaded_mainloop_new();
@@ -662,9 +668,13 @@ class PulseSink {
         pa_threaded_mainloop_lock(mainloop_);
         stream_active_ = true;
         next_stream_attempt_us_ = 0;
+        consecutive_zero_writes_ = 0;
+        last_zero_write_log_us_ = 0;
         sample_rate_ = sample_rate;
         channels_ = channels;
         frame_size_ = static_cast<std::size_t>(channels_) * sizeof(std::int16_t);
+        LVA_DIAG_LOGI(kTag, "PA open requested: %uHz %uch frame=%zu",
+                      sample_rate, channels, frame_size_);
         CloseStreamLocked();
         EnsureStreamLocked();
         pa_threaded_mainloop_unlock(mainloop_);
@@ -674,6 +684,9 @@ class PulseSink {
         if (mainloop_ == nullptr) return;
         pa_threaded_mainloop_lock(mainloop_);
         stream_active_ = false;
+        consecutive_zero_writes_ = 0;
+        last_zero_write_log_us_ = 0;
+        LVA_DIAG_LOGI(kTag, "PA close requested");
         CloseStreamLocked();
         pa_threaded_mainloop_unlock(mainloop_);
     }
@@ -682,23 +695,55 @@ class PulseSink {
     // report with them.
     std::size_t Write(const std::uint8_t* data, std::size_t length,
                       std::uint32_t timeout_ms, std::size_t* frame_size,
-                      pa_usec_t* latency_us) {
-        if (length == 0 || mainloop_ == nullptr) return 0;
+                      pa_usec_t* latency_us, bool* drop_data) {
+        if (drop_data != nullptr) *drop_data = false;
+        if (frame_size != nullptr) *frame_size = frame_size_;
+        if (length == 0) return 0;
+        if (mainloop_ == nullptr) {
+            if (drop_data != nullptr) *drop_data = true;
+            return 0;
+        }
         const auto deadline = std::chrono::steady_clock::now() +
                               std::chrono::milliseconds(timeout_ms);
         do {
-            if (shutting_down_.load(std::memory_order_acquire)) return 0;
+            if (shutting_down_.load(std::memory_order_acquire)) {
+                if (drop_data != nullptr) *drop_data = true;
+                return 0;
+            }
 
             std::size_t written = 0;
+#ifdef LVA_DIAG_LOG
+            std::size_t diag_writable = 0;
+            int diag_context_state = -1;
+            int diag_stream_state = -1;
+#endif
             *latency_us = kTargetLatencyUs;
 
             pa_threaded_mainloop_lock(mainloop_);
+#ifdef LVA_DIAG_LOG
+            if (context_ != nullptr) {
+                diag_context_state =
+                    static_cast<int>(pa_context_get_state(context_));
+            }
+            if (stream_ != nullptr) {
+                diag_stream_state =
+                    static_cast<int>(pa_stream_get_state(stream_));
+            }
+#endif
             if (stream_active_ && EnsureStreamLocked()) {
                 const std::size_t writable = pa_stream_writable_size(stream_);
+#ifdef LVA_DIAG_LOG
+                diag_writable = writable;
+                diag_context_state =
+                    static_cast<int>(pa_context_get_state(context_));
+                diag_stream_state =
+                    static_cast<int>(pa_stream_get_state(stream_));
+#endif
                 if (writable == static_cast<std::size_t>(-1)) {
-                    LVA_LOGW(kTag, "pa_stream_writable_size failed: %s",
+                    LVA_LOGW(kTag, "pa_stream_writable_size failed: %s; dropping stale audio",
                              pa_strerror(pa_context_errno(context_)));
                     CloseStreamLocked();
+                    if (drop_data != nullptr) *drop_data = true;
                 } else {
                     written = std::min(length, writable);
                     written -= written % frame_size_;
@@ -709,11 +754,13 @@ class PulseSink {
                         if (pa_stream_write(stream_, write_buffer_.data(),
                                             written, nullptr, 0,
                                             PA_SEEK_RELATIVE) < 0) {
-                            LVA_LOGW(kTag, "pa_stream_write failed: %s",
+                            LVA_LOGW(kTag, "pa_stream_write failed: %s; dropping stale audio",
                                      pa_strerror(pa_context_errno(context_)));
                             CloseStreamLocked();
                             written = 0;
+                            if (drop_data != nullptr) *drop_data = true;
                         } else {
+                            consecutive_zero_writes_ = 0;
                             int negative = 0;
                             if (pa_stream_get_latency(stream_, latency_us,
                                                       &negative) < 0 ||
@@ -726,10 +773,39 @@ class PulseSink {
             }
             pa_threaded_mainloop_unlock(mainloop_);
 
+            if (drop_data != nullptr && *drop_data) return length;
             if (written > 0) return written;
             if (timeout_ms == 0 ||
                 std::chrono::steady_clock::now() >= deadline) {
-                return 0;
+                pa_threaded_mainloop_lock(mainloop_);
+                if (stream_active_) {
+                    ++consecutive_zero_writes_;
+#ifdef LVA_DIAG_LOG
+                    const std::int64_t now_us = NowUs();
+                    if (last_zero_write_log_us_ == 0 ||
+                        now_us - last_zero_write_log_us_ >= 1000000) {
+                        last_zero_write_log_us_ = now_us;
+                        LVA_LOGW(
+                            kTag,
+                            "PA no progress: request=%zu writable=%zu context_state=%d "
+                            "stream_state=%d zero_streak=%u write_buffer_capacity=%zu",
+                            length, diag_writable, diag_context_state,
+                            diag_stream_state, consecutive_zero_writes_,
+                            write_buffer_.capacity());
+                    }
+#endif
+                    if (consecutive_zero_writes_ >= kMaxConsecutiveZeroWrites) {
+                        LVA_LOGW(kTag,
+                                 "PulseAudio made no write progress for about 100 ms; "
+                                 "dropping stale audio and reopening the stream");
+                        CloseStreamLocked();
+                        consecutive_zero_writes_ = 0;
+                        last_zero_write_log_us_ = 0;
+                        if (drop_data != nullptr) *drop_data = true;
+                    }
+                }
+                pa_threaded_mainloop_unlock(mainloop_);
+                return (drop_data != nullptr && *drop_data) ? length : 0;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         } while (std::chrono::steady_clock::now() < deadline);
@@ -868,6 +944,8 @@ class PulseSink {
     std::uint32_t sample_rate_ = 48000;
     std::uint8_t channels_ = 2;
     std::size_t frame_size_ = 4;
+    unsigned consecutive_zero_writes_ = 0;
+    std::int64_t last_zero_write_log_us_ = 0;  // LVA_DIAG_LOG throttle
     std::int64_t next_connect_attempt_us_ = 0;
     std::int64_t next_stream_attempt_us_ = 0;
 };
@@ -901,7 +979,6 @@ struct SendspinHub::Impl : public PlayerRoleListener,
                            public ControllerRoleListener,
                            public MetadataRoleListener,
                            public ColorRoleListener,
-                           public VisualizerRoleListener,
                            public SendspinClientListener {
     Impl(Config cfg, Callbacks cbs)
         : config(std::move(cfg)), callbacks(std::move(cbs)) {}
@@ -931,12 +1008,57 @@ struct SendspinHub::Impl : public PlayerRoleListener,
     int last_controller_volume = -1;
     std::string last_track;
     std::int64_t last_command_failure_us = 0;
+#ifdef LVA_DIAG_LOG
+    // Audio counters for the LVA_DIAG_LOG stats log.
+    std::int64_t last_audio_stats_log_us = 0;
+    std::int64_t last_audio_drop_log_us = 0;
+    std::atomic<std::uint64_t> audio_written_bytes{0};
+    std::atomic<std::uint64_t> audio_dropped_bytes{0};
+    std::atomic<std::uint64_t> audio_inactive_dropped_bytes{0};
+    std::atomic<std::uint64_t> audio_notify_frames{0};
+#endif
 
     void SetActive(bool value) {
         if (active.exchange(value, std::memory_order_acq_rel) == value) return;
         LVA_LOGI(kTag, "stream %s", value ? "active" : "inactive");
         if (callbacks.on_active_changed) callbacks.on_active_changed(value);
     }
+
+#ifdef LVA_DIAG_LOG
+    void LogAudioStats() {
+        const std::int64_t now = NowUs();
+        if (last_audio_stats_log_us != 0 &&
+            now - last_audio_stats_log_us < 60'000'000) {
+            return;
+        }
+        last_audio_stats_log_us = now;
+        LVA_LOGI(kTag,
+                 "audio stats: written=%llu dropped=%llu inactive_dropped=%llu "
+                 "notify_frames=%llu rss_anon_kb=%ld",
+                 static_cast<unsigned long long>(
+                     audio_written_bytes.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(
+                     audio_dropped_bytes.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(
+                     audio_inactive_dropped_bytes.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(
+                     audio_notify_frames.load(std::memory_order_relaxed)),
+                 lva::memprobe::ReadRssAnonKb());
+    }
+
+    void LogAudioDrop(std::size_t length) {
+        const std::int64_t now = NowUs();
+        if (last_audio_drop_log_us != 0 &&
+            now - last_audio_drop_log_us < 1'000'000) {
+            return;
+        }
+        last_audio_drop_log_us = now;
+        LVA_LOGW(kTag, "dropping audio after PulseAudio write failure: bytes=%zu total=%llu",
+                 length,
+                 static_cast<unsigned long long>(
+                     audio_dropped_bytes.load(std::memory_order_relaxed)));
+    }
+#endif
 
     void SendCommand(SendspinControllerCommand command, const char* name) {
         if (controller == nullptr) return;
@@ -958,17 +1080,33 @@ struct SendspinHub::Impl : public PlayerRoleListener,
     std::size_t on_audio_write(std::uint8_t* data, std::size_t length,
                                std::uint32_t timeout_ms) override {
         if (!active.load(std::memory_order_acquire) || player == nullptr) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms));
-            return 0;
+            // This source no longer owns the speaker. Do not keep retrying the same decoded
+            // buffer while another media source is active; returning length tells SyncTask that
+            // the stale PCM was intentionally discarded so it can consume newer chunks.
+            LVA_DIAG(audio_inactive_dropped_bytes.fetch_add(length, std::memory_order_relaxed));
+            return length;
         }
         std::size_t frame_size = 1;
         pa_usec_t latency_us = PulseSink::kTargetLatencyUs;
+        bool drop_data = false;
         const std::size_t written =
-            sink.Write(data, length, timeout_ms, &frame_size, &latency_us);
+            sink.Write(data, length, timeout_ms, &frame_size, &latency_us, &drop_data);
+        if (drop_data) {
+            // The bytes were intentionally discarded and never reached PulseAudio. Do not report
+            // them as played: notify_audio_played() advances the real output timeline and fake
+            // progress here causes buffered-frame underflow and repeated sync corrections.
+#ifdef LVA_DIAG_LOG
+            audio_dropped_bytes.fetch_add(length, std::memory_order_relaxed);
+            LogAudioDrop(length);
+#endif
+            return length;
+        }
         if (written > 0) {
+            const auto frames = static_cast<std::uint32_t>(written / frame_size);
+            LVA_DIAG(audio_written_bytes.fetch_add(written, std::memory_order_relaxed));
+            LVA_DIAG(audio_notify_frames.fetch_add(frames, std::memory_order_relaxed));
             player->notify_audio_played(
-                static_cast<std::uint32_t>(written / frame_size),
-                NowUs() + static_cast<std::int64_t>(latency_us));
+                frames, NowUs() + static_cast<std::int64_t>(latency_us));
         }
         return written;
     }
@@ -1055,20 +1193,6 @@ struct SendspinHub::Impl : public PlayerRoleListener,
 
     void on_color_clear() override { led.ResetColor(); }
 
-    // --- VisualizerRoleListener ---------------------------------------------
-
-    void on_visualizer_stream_start(const ServerVisualizerStreamObject&) override {
-        led.ResetVisualizer();
-    }
-    void on_visualizer_stream_end() override { led.ResetVisualizer(); }
-    void on_visualizer_stream_clear() override { led.ResetVisualizer(); }
-    // Drain thread.
-    void on_beat(std::int64_t, bool) override { led.QueuePulse(); }
-    // Drain thread.
-    void on_loudness(std::int64_t, std::uint16_t loudness) override {
-        led.QueueLoudness(loudness);
-    }
-
     // --- SendspinClientListener ---------------------------------------------
 
     void on_group_update(const GroupUpdateObject& group) override {
@@ -1145,15 +1269,6 @@ bool SendspinHub::Start() {
         d.controller = &controller;
         d.client->add_color().set_listener(&d);
 
-        VisualizerRoleConfig viz_config;
-        viz_config.support.buffer_capacity = 8192;
-        viz_config.stream.types = {
-            VisualizerDataType::BEAT,
-            VisualizerDataType::LOUDNESS,
-        };
-        viz_config.stream.rate_max = 30;
-        d.client->add_visualizer(std::move(viz_config)).set_listener(&d);
-
         d.player->update_volume(static_cast<std::uint8_t>(
             std::clamp(d.config.initial_volume, 0, 100)));
     }
@@ -1189,6 +1304,9 @@ void SendspinHub::Loop() {
     if (!d.client) return;
     d.client->loop();
     d.led.Tick();
+#ifdef LVA_DIAG_LOG
+    d.LogAudioStats();
+#endif
 
     if (d.reactivate_pending && NowUs() - d.left_at_us >= kLeaveGraceUs) {
         d.reactivate_pending = false;

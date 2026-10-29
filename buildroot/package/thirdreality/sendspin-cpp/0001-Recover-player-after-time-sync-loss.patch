@@ -1,0 +1,223 @@
+From 52cb52e1d29952c2db0e14139d27aa73b93943da Mon Sep 17 00:00:00 2001
+From: tianwei.ge <tianwei.ge@thirdreality.ai>
+Date: Wed, 28 Oct 2026 15:32:16 +0800
+Subject: [PATCH] Recover player after time sync loss
+
+Reset the time filter after repeated unanswered time messages and flush stale
+player audio while waiting for a new clock measurement. This prevents old audio
+from pinning the inbound ring during a network outage.
+---
+ src/sync_task.cpp  | 47 +++++++++++++++++++++++++++++++++++++++++++---
+ src/sync_task.h    |  4 ++++
+ src/time_burst.cpp | 47 ++++++++++++++++++++++++++++++++++++++++------
+ src/time_burst.h   |  4 ++++
+ 4 files changed, 93 insertions(+), 9 deletions(-)
+
+diff --git a/src/sync_task.cpp b/src/sync_task.cpp
+index 0bf3b06..4cd9aa1 100644
+--- a/src/sync_task.cpp
++++ b/src/sync_task.cpp
+@@ -241,9 +241,10 @@ SyncTaskState SyncTask::handle_initial_sync(SyncContext& sync_context) {
+ 
+ SyncTaskState SyncTask::handle_load_chunk(SyncContext& sync_context) {
+     if (!this->player_impl_->client->is_time_synced()) {
+-        // Wait for the time filter to receive its first measurement before processing audio chunks.
+-        // Without a valid time offset, server timestamps can't be correctly converted to client
+-        // timestamps.
++        // A time burst can reset the filter after repeated unanswered time messages. Do not keep
++        // decoded or encoded audio queued against the old clock while waiting for recovery: that
++        // would pin the player's inbound ring and grow memory during a network outage.
++        this->discard_unsynchronized_audio(sync_context);
+         std::this_thread::sleep_for(std::chrono::milliseconds(WAIT_FOR_TIME_SYNC_MS));
+         return SyncTaskState::LOAD_CHUNK;
+     }
+@@ -477,6 +478,35 @@ bool SyncTask::transfer_audio(SyncContext& sync_context) {
+     return true;
+ }
+ 
++void SyncTask::discard_unsynchronized_audio(SyncContext& sync_context) {
++    if (sync_context.encoded_item != nullptr) {
++        this->inbound_.return_item(sync_context.encoded_item);
++        sync_context.encoded_item = nullptr;
++    }
++    if (sync_context.decode_buffer != nullptr) {
++        sync_context.decode_buffer->decrease_buffer_length(sync_context.decode_buffer->available());
++    }
++    sync_context.release_chunk = false;
++    sync_context.silence_remaining = 0;
++    sync_context.buffered_frames = 0;
++    sync_context.new_audio_client_playtime = 0;
++    sync_context.aligning = true;
++    sync_context.hard_syncing = true;
++
++    while (true) {
++        void* item = this->take_item(0);
++        if (item == nullptr) {
++            return;
++        }
++        if (this->is_pending_header(item)) {
++            sync_context.next_header = item;
++            sync_context.abandoned = true;
++            return;
++        }
++        this->inbound_.return_item(item);
++    }
++}
++
+ bool SyncTask::load_next_chunk(SyncContext& sync_context) {
+     if (sync_context.encoded_item == nullptr) {
+         void* item = this->take_item(ENCODED_CHUNK_RECEIVE_TIMEOUT_MS);
+@@ -1040,6 +1070,17 @@ void SyncTask::thread_entry(void* params) {
+                 continue;
+             }
+ 
++            // Time sync can be lost while the task is in TRANSFER_AUDIO, before the next
++            // handle_load_chunk() check. Flush immediately so a stalled sink cannot keep the same
++            // decoded buffer and its old inbound items alive until the clock recovers.
++            if (!this_task->player_impl_->client->is_time_synced()) {
++                this_task->discard_unsynchronized_audio(sync_context);
++                if (sync_context.next_header != nullptr || sync_context.abandoned) {
++                    break;
++                }
++                sync_state = SyncTaskState::LOAD_CHUNK;
++            }
++
+             this_task->process_playback_progress(sync_context);
+ 
+             switch (sync_state) {
+diff --git a/src/sync_task.h b/src/sync_task.h
+index 6ced0e2..75d77fc 100644
+--- a/src/sync_task.h
++++ b/src/sync_task.h
+@@ -252,6 +252,10 @@ protected:
+     /// Returns true when all data has been sent, false if more transfers are needed.
+     bool transfer_audio(SyncContext& sync_context);
+ 
++    /// @brief Drops encoded audio while the connection has no valid time synchronization.
++    /// Keeps a later codec header as the next stream boundary.
++    void discard_unsynchronized_audio(SyncContext& sync_context);
++
+     /// @brief Loads the next encoded chunk from the item list
+     /// Returns true if a chunk is available, false if none ready yet or the item taken was a
+     /// later stream's codec header, kept in `sync_context.next_header`.
+diff --git a/src/time_burst.cpp b/src/time_burst.cpp
+index ab6e71d..05e23ac 100644
+--- a/src/time_burst.cpp
++++ b/src/time_burst.cpp
+@@ -62,6 +62,7 @@ TimeBurstResult SendspinTimeBurst::loop(SendspinConnection* conn, int64_t now_ms
+         if (now_ms - this->current_message_sent_time_ > this->response_timeout_ms_) {
+             SS_LOGW(TAG, "Time message %u/%u timed out", this->burst_index_ + 1, this->burst_size_);
+             conn->cancel_time_frame();
++            this->note_time_sync_failure(conn);
+             this->pending_embedded_ = 0;
+             return {.sent = false, .burst_completed = this->retire_message(conn, now_ms)};
+         }
+@@ -79,6 +80,7 @@ TimeBurstResult SendspinTimeBurst::loop(SendspinConnection* conn, int64_t now_ms
+     }
+ 
+     SS_LOGD(TAG, "Time message %u/%u not sent", this->burst_index_ + 1, this->burst_size_);
++    this->note_time_sync_failure(conn);
+     return {.sent = false, .burst_completed = this->retire_message(conn, now_ms)};
+ }
+ 
+@@ -95,11 +97,20 @@ bool SendspinTimeBurst::on_time_response(SendspinConnection* conn, const TimeRes
+     // values arise from clock skew or timestamp quantization in the time message and would
+     // yield zero/negative measurement variance in the Kalman filter (risking divide-by-zero
+     // in the update step), so we skip updating the best_* tracking for those samples.
+-    if (response.max_error > 0 && response.max_error < this->best_max_error_) {
+-        this->best_max_error_ = response.max_error;
+-        this->best_offset_ = response.offset;
+-        this->best_timestamp_ = response.timestamp;
+-    } else if (response.max_error <= 0) {
++    if (response.max_error > 0) {
++        // Any valid response proves that the transport is answering again, even when its RTT is
++        // not the best sample in this burst.
++        if (this->time_sync_lost_) {
++            SS_LOGI(TAG, "Time synchronization recovered");
++        }
++        this->consecutive_failures_ = 0;
++        this->time_sync_lost_ = false;
++        if (response.max_error < this->best_max_error_) {
++            this->best_max_error_ = response.max_error;
++            this->best_offset_ = response.offset;
++            this->best_timestamp_ = response.timestamp;
++        }
++    } else {
+         SS_LOGW(TAG, "Dropping time response with non-positive max_error: %" PRId64 " us",
+                 response.max_error);
+     }
+@@ -155,6 +166,8 @@ void SendspinTimeBurst::reset() {
+     this->current_message_sent_time_ = 0;
+     this->pending_burst_completed_ = false;
+     this->pending_embedded_ = 0;
++    this->consecutive_failures_ = 0;
++    this->time_sync_lost_ = false;
+     this->best_max_error_ = std::numeric_limits<int64_t>::max();
+     this->best_offset_ = 0;
+     this->best_timestamp_ = 0;
+@@ -164,13 +177,35 @@ void SendspinTimeBurst::reset() {
+ // Internal helpers
+ // ============================================================================
+ 
++void SendspinTimeBurst::note_time_sync_failure(SendspinConnection* conn) {
++    if (this->consecutive_failures_ < UINT8_MAX) {
++        ++this->consecutive_failures_;
++    }
++    if (this->consecutive_failures_ < TIME_SYNC_FAILURE_THRESHOLD ||
++        this->time_sync_lost_) {
++        return;
++    }
++
++    auto* time_filter = conn->get_time_filter();
++    if (time_filter != nullptr) {
++        time_filter->reset();
++    }
++    this->time_sync_lost_ = true;
++    // Do not let retire_message() write an older sample from this burst back into the reset
++    // filter. The next valid response must establish a fresh clock baseline.
++    this->best_max_error_ = std::numeric_limits<int64_t>::max();
++    SS_LOGW(TAG, "Time synchronization lost after %u consecutive failures; flushing audio",
++            this->consecutive_failures_);
++}
++
+ bool SendspinTimeBurst::retire_message(SendspinConnection* conn, int64_t now_ms) {
+     this->burst_index_++;
+     if (this->burst_index_ < this->burst_size_) {
+         return false;
+     }
+     auto* time_filter = conn->get_time_filter();
+-    if (time_filter != nullptr && this->best_max_error_ < std::numeric_limits<int64_t>::max()) {
++    if (!this->time_sync_lost_ && time_filter != nullptr &&
++        this->best_max_error_ < std::numeric_limits<int64_t>::max()) {
+         time_filter->update(this->best_offset_, this->best_max_error_, this->best_timestamp_);
+         SS_LOGV(TAG, "Burst complete (with retired messages), best max_error: %" PRId64 " us",
+                 this->best_max_error_);
+diff --git a/src/time_burst.h b/src/time_burst.h
+index 9444692..39a48b1 100644
+--- a/src/time_burst.h
++++ b/src/time_burst.h
+@@ -137,8 +137,10 @@ protected:
+     /// @param now_ms The loop() call's clock, stamped as the completion time.
+     /// @return true if this completed the burst.
+     bool retire_message(SendspinConnection* conn, int64_t now_ms);
++    void note_time_sync_failure(SendspinConnection* conn);
+ 
+     static constexpr int64_t DEFAULT_BURST_INTERVAL_MS = 10000;
++    static constexpr uint8_t TIME_SYNC_FAILURE_THRESHOLD = 3;
+     static constexpr int64_t DEFAULT_RESPONSE_TIMEOUT_MS = 10000;
+ 
+     // 64-bit fields
+@@ -156,8 +158,10 @@ protected:
+     // 8-bit fields
+     uint8_t burst_size_{8};
+     uint8_t burst_index_{8};  // starts "complete" so first loop triggers a burst
++    uint8_t consecutive_failures_{0};
+     // Flag set by on_time_response() when burst completes, consumed by loop()
+     bool pending_burst_completed_{false};
++    bool time_sync_lost_{false};
+ };
+ 
+ }  // namespace sendspin
+-- 
+2.40.1
+

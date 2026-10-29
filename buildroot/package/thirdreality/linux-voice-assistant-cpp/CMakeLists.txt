@@ -234,6 +234,14 @@ target_include_directories(linux-voice-assistant-cpp
         ${CMAKE_SOURCE_DIR}/src
 )
 
+# Diagnostic logging (memprobe sampler, Sendspin audio stats, AEC rebuild
+# memory). Off by default; see src/util/Diag.h.
+option(LVA_DIAG_LOG "Compile in diagnostic logging" OFF)
+if(LVA_DIAG_LOG)
+    target_sources(linux-voice-assistant-cpp PRIVATE src/util/MemProbe.cpp)
+    target_compile_definitions(linux-voice-assistant-cpp PRIVATE LVA_DIAG_LOG=1)
+endif()
+
 # api.pb.h uses deprecated enum values at file scope, so the warning fires in
 # every TU that includes it.
 target_compile_options(linux-voice-assistant-cpp PRIVATE

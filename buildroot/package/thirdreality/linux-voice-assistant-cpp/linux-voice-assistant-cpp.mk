@@ -22,6 +22,10 @@ LINUX_VOICE_ASSISTANT_CPP_DEPENDENCIES = host-protobuf protobuf json-for-modern-
 
 LINUX_VOICE_ASSISTANT_CPP_CONF_OPTS =
 
+ifeq ($(BR2_PACKAGE_LINUX_VOICE_ASSISTANT_CPP_DIAG_LOG),y)
+LINUX_VOICE_ASSISTANT_CPP_CONF_OPTS += -DLVA_DIAG_LOG=ON
+endif
+
 define LINUX_VOICE_ASSISTANT_CPP_INSTALL_WAKEWORDS
 	$(INSTALL) -d $(TARGET_DIR)/usr/share/thirdreality/wakewords/microwakeword
 	cp -f $(LINUX_VOICE_ASSISTANT_CPP_PKGDIR)/wakewords/microwakeword/*.tflite \

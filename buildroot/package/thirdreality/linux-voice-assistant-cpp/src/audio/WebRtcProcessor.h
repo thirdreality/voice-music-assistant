@@ -2,6 +2,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -79,6 +80,10 @@ class WebRtcProcessor {
     std::atomic<std::int64_t> linear_guard_until_ns_{0};
 
     void* apm_ = nullptr;
+    // Owns one reference on apm_ (taken in RebuildLocked()).
+    // rebuild_count_ and last_reset_ feed the LVA_DIAG_LOG reset log only.
+    unsigned rebuild_count_ = 0;
+    std::chrono::steady_clock::time_point last_reset_{};
     std::unique_ptr<webrtc::StreamConfig> stream_cfg_;
 };
 

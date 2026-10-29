@@ -9,6 +9,9 @@
 #include "rtc_base/ref_count.h"
 
 #include "util/Log.h"
+#ifdef LVA_DIAG_LOG
+#include "util/MemProbe.h"
+#endif
 
 namespace lva::audio {
 
@@ -148,7 +151,12 @@ void WebRtcProcessor::RebuildLocked() {
         LVA_LOGE(kTag, "AudioProcessingBuilder::Create() returned null");
         return;
     }
+    // A new RefCountedObject starts at refcount 0 (see rtc_base/ref_count.h):
+    // the creator must AddRef() it. Without this, Release() below drops the
+    // count to -1 and never deletes, leaking a whole AEC3 instance per rebuild.
+    apm->AddRef();
     apm_ = apm;
+    ++rebuild_count_;
 
     const bool echo_on =
         far_end_active_.load(std::memory_order_relaxed) ||
@@ -319,8 +327,27 @@ bool WebRtcProcessor::GetLinearAecOutput(std::int16_t* buf,
 void WebRtcProcessor::ResetEcho() {
     std::lock_guard<std::mutex> lk(apm_mutex_);
     if (!aec_enabled_) return;
+#ifdef LVA_DIAG_LOG
+    const auto now = std::chrono::steady_clock::now();
+    const long since_last_ms =
+        last_reset_.time_since_epoch().count() == 0
+            ? -1
+            : static_cast<long>(
+                  std::chrono::duration_cast<std::chrono::milliseconds>(
+                      now - last_reset_).count());
+    last_reset_ = now;
+    const long rss_before = lva::memprobe::ReadRssAnonKb();
+    LVA_LOGW(kTag,
+             "resetting echo canceller (post-xrun re-converge) "
+             "rebuilds=%u since_last=%ld ms RssAnon=%ld kB",
+             rebuild_count_, since_last_ms, rss_before);
+    RebuildLocked();
+    LVA_LOGI(kTag, "echo canceller rebuilt: RssAnon %ld -> %ld kB",
+             rss_before, lva::memprobe::ReadRssAnonKb());
+#else
     LVA_LOGW(kTag, "resetting echo canceller (post-xrun re-converge)");
     RebuildLocked();
+#endif
 }
 
 bool WebRtcProcessor::Process(std::int16_t* buf, std::size_t n) {

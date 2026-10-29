@@ -27,3 +27,11 @@ config BR2_PACKAGE_LINUX_VOICE_ASSISTANT_CPP
 
 	  Requires gcc >= 10 (C++20). Do not enable together with
 	  BR2_PACKAGE_LINUX_VOICE_ASSISTANT.
+
+config BR2_PACKAGE_LINUX_VOICE_ASSISTANT_CPP_DIAG_LOG
+	bool "diagnostic logging"
+	depends on BR2_PACKAGE_LINUX_VOICE_ASSISTANT_CPP
+	help
+	  Compile in extra diagnostic logs: a memory sampler thread,
+	  Sendspin audio stats, PulseAudio stall details and AEC
+	  rebuild memory. For debugging only; leave off for release.

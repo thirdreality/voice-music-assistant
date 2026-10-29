@@ -64,6 +64,9 @@
 #include "tr/SysInfo.h"
 #include "tr/SystemVolume.h"
 #include "util/Log.h"
+#ifdef LVA_DIAG_LOG
+#include "util/MemProbe.h"
+#endif
 
 namespace {
 
@@ -388,6 +391,10 @@ int main(int argc, char** argv) {
     if (cli.debug) {
         lva::log::SetLogFile("/usr/share/thirdreality/log/lva.log", 5u << 20);
     }
+
+#ifdef LVA_DIAG_LOG
+    lva::memprobe::Start();
+#endif
 
     LVA_LOGI(kTag,
              "linux-voice-assistant-cpp %s starting "
