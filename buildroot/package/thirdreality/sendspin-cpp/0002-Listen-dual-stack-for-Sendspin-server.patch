@@ -1,0 +1,89 @@
+From a8916750e714a8f8ed1b516bb51b24c4a7475cfe Mon Sep 17 00:00:00 2001
+From: tianwei.ge <tianwei.ge@thirdreality.ai>
+Date: Wed, 28 Oct 2026 15:32:21 +0800
+Subject: [PATCH] Listen dual-stack for the Sendspin server
+
+Bind the Sendspin WebSocket server to "::" (IPv6 with IPV6_V6ONLY=0) instead of
+"0.0.0.0", matching the ESPHome API server, and set IPV6_V6ONLY=0 in the vendored
+IXWebSocket listener so IPv4-mapped connections are also accepted. avahi advertises
+the device IPv6 address, and Music Assistant may pick it during discovery while the
+server only listened on IPv4, leaving the speaker undiscoverable until the next boot.
+
+Kernels without IPv6 are detected by probing an AF_INET6 socket up front and fall
+back to IPv4 only. The connection callback is therefore registered on a single
+server instance instead of being lost on a listen() retry.
+---
+ src/host/ws_server.cpp                        | 21 +++++++++++++++++--
+ .../ixwebsocket/IXSocketServer.cpp            | 16 ++++++++++++++
+ 2 files changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/src/host/ws_server.cpp b/src/host/ws_server.cpp
+index 7acef5f..94e904e 100644
+--- a/src/host/ws_server.cpp
++++ b/src/host/ws_server.cpp
+@@ -24,6 +24,9 @@
+ #include <ixwebsocket/IXWebSocketMessage.h>
+ #include <ixwebsocket/IXWebSocketMessageType.h>
+ 
++#include <sys/socket.h>
++#include <unistd.h>
++
+ #include <atomic>
+ #include <cstddef>
+ #include <utility>
+@@ -57,9 +60,23 @@ bool SendspinWsServer::start(SendspinClient* client, bool /*task_stack_in_psram*
+     // Create IXWebSocket server on the configured port. max_connections_ is enforced here (IX
+     // closes surplus sockets at accept), so the configured budget is real on host, matching the
+     // ESP build's httpd max_open_sockets.
++    //
++    // Listen dual-stack (AF_INET6 socket bound to "::" with IPV6_V6ONLY=0, set inside the
++    // vendored IXWebSocket) so Music Assistant can connect over either address family. avahi
++    // advertises the device's IPv6 addresses, and MA may pick one of them during discovery.
++    // Kernels without IPv6 cannot create an AF_INET6 socket; probe once and use IPv4 only there
++    // (avahi has no IPv6 address to advertise on such a kernel either). The probe replaces a
++    // listen()-failure retry so the connection callback below is registered on exactly one server.
++    const int probe_fd = ::socket(AF_INET6, SOCK_STREAM, 0);
++    const bool use_ipv6 = probe_fd >= 0;
++    if (use_ipv6) {
++        ::close(probe_fd);
++    } else {
++        SS_LOGW(TAG, "IPv6 sockets unavailable, listening on IPv4 only");
++    }
+     this->server_ = std::make_unique<ix::WebSocketServer>(
+-        this->server_port_, "0.0.0.0", ix::SocketServer::kDefaultTcpBacklog, this->max_connections_,
+-        WS_HANDSHAKE_TIMEOUT_SECS);
++        this->server_port_, use_ipv6 ? "::" : "0.0.0.0", ix::SocketServer::kDefaultTcpBacklog,
++        this->max_connections_, WS_HANDSHAKE_TIMEOUT_SECS, use_ipv6 ? AF_INET6 : AF_INET);
+ 
+     this->server_->setOnConnectionCallback(
+         [this](const std::weak_ptr<ix::WebSocket>& weak_ws,
+diff --git a/third_party/ixwebsocket/ixwebsocket/IXSocketServer.cpp b/third_party/ixwebsocket/ixwebsocket/IXSocketServer.cpp
+index bf9d20a..c32f9af 100644
+--- a/third_party/ixwebsocket/ixwebsocket/IXSocketServer.cpp
++++ b/third_party/ixwebsocket/ixwebsocket/IXSocketServer.cpp
+@@ -150,6 +150,22 @@ namespace ix
+                 return std::make_pair(false, ss.str());
+             }
+ 
++            // Accept IPv4-mapped connections too (dual-stack), so a listener
++            // bound to "::" also serves IPv4 clients.
++            int v6only = 0;
++            if (setsockopt(_serverFd, IPPROTO_IPV6, IPV6_V6ONLY, (char*) &v6only,
++                           sizeof(v6only)) < 0)
++            {
++                std::stringstream ss;
++                ss << "SocketServer::listen() error calling setsockopt(IPV6_V6ONLY) "
++                   << "at address " << _host << ":" << _port << " : "
++                   << strerror(Socket::getErrno());
++
++                Socket::closeSocket(_serverFd);
++                _serverFd = -1;
++                return std::make_pair(false, ss.str());
++            }
++
+             // Bind the socket to the server address.
+             if (bind(_serverFd, (struct sockaddr*) &server, sizeof(server)) < 0)
+             {
+-- 
+2.40.1
+
