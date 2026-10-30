@@ -70,6 +70,7 @@ class Satellite {
    private:
     void StartPipeline(const std::string& wake_word_phrase);
     void OpenStreamToHa(const std::string& wake_word_phrase);
+    std::string WakeWordPhraseFor(const std::string& model_id) const;
     void StopAudioStreaming();
     // Open the mic and ask HA to start listening (continued conversation).
     void BeginListening();
@@ -136,6 +137,7 @@ class Satellite {
     std::atomic<bool> tap_down_pending_{false};
     std::string tts_url_;
     bool   tts_played_         = false;
+    std::string active_wake_phrase_;
 
     std::atomic<std::int64_t> continue_listen_at_ns_{0};
 

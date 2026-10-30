@@ -221,6 +221,28 @@ bool Satellite::OwnsAnnouncePlayback() const {
     return pipeline_active_.load(std::memory_order_acquire) || timer_ringing_;
 }
 
+std::string Satellite::WakeWordPhraseFor(const std::string& model_id) const {
+    if (const auto it = external_wake_words_.find(model_id);
+        it != external_wake_words_.end() && !it->second.wake_word.empty()) {
+        return it->second.wake_word;
+    }
+    for (const auto& m : engine_.SnapshotModels()) {
+        if (m != nullptr && m->config().id == model_id &&
+            !m->config().wake_word.empty()) {
+            return m->config().wake_word;
+        }
+    }
+    for (const auto& m : engine_.SnapshotOpenModels()) {
+        if (m != nullptr && m->config().id == model_id &&
+            !m->config().wake_word.empty()) {
+            return m->config().wake_word;
+        }
+    }
+    LVA_LOGW(kTag, "no phrase for wake model id '%s'; reporting id as phrase",
+             model_id.c_str());
+    return model_id;
+}
+
 void Satellite::StartPipeline(const std::string& wake_word_phrase) {
     const auto now = std::chrono::steady_clock::now();
     const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -258,6 +280,7 @@ void Satellite::StartPipeline(const std::string& wake_word_phrase) {
     }
     LVA_LOGI(kTag, "starting voice pipeline (wake='%s')",
              wake_word_phrase.c_str());
+    active_wake_phrase_ = wake_word_phrase;
 
     refractory_until_ns_.store(now_ns + 2'000'000'000LL,
                                std::memory_order_relaxed);
@@ -394,6 +417,9 @@ void Satellite::BeginListening() {
     }
     ::VoiceAssistantRequest req;
     req.set_start(true);
+    if (!active_wake_phrase_.empty()) {
+        req.set_wake_word_phrase(active_wake_phrase_);
+    }
     if (!state_.broadcast(lva::proto::kIdVoiceAssistantRequest, req)) {
         LVA_LOGW(kTag, "HA continued-listening request was not delivered");
         ResetHaPipeline("HA continued-listening request not delivered");
@@ -450,6 +476,7 @@ void Satellite::FinishSpeech(bool success) {
             std::memory_order_release);
     } else {
         pipeline_active_ = false;
+        active_wake_phrase_.clear();
         lva::tr::Show(lva::tr::LedState::Idle);
         Unduck();
         ::malloc_trim(0);
@@ -474,6 +501,7 @@ void Satellite::PlayAnnounce(const std::string& media_id,
     pipeline_active_ = true;
     DisarmHaWatchdog();
     Duck();
+    active_wake_phrase_.clear();
     continue_conversation_ = start_conversation;
 
     speech_active_ = true;
@@ -653,6 +681,7 @@ void Satellite::OnVoiceEvent(
                 } else {
                     DisarmHaWatchdog();
                     pipeline_active_ = false;
+                    active_wake_phrase_.clear();
                     lva::tr::Show(lva::tr::LedState::Idle);
                     Unduck();
                 }
@@ -669,7 +698,7 @@ void Satellite::OnLoopTick() {
     if (pending_wake_.load(std::memory_order_acquire)) {
         const PendingWake snap = pending_wake_data_;
         pending_wake_.store(false, std::memory_order_relaxed);
-        StartPipeline(snap.model_id);
+        StartPipeline(WakeWordPhraseFor(snap.model_id));
     }
 
     if (pending_stop_.exchange(false, std::memory_order_acq_rel)) {
@@ -736,6 +765,7 @@ void Satellite::ResetHaPipeline(const char* reason) {
     pipeline_active_       = false;
     continue_conversation_ = false;
     wake_sound_pending_    = false;
+    active_wake_phrase_.clear();
     continue_listen_at_ns_.store(0, std::memory_order_relaxed);
     Unduck();
     lva::tr::Show(lva::tr::LedState::Idle);
@@ -750,6 +780,7 @@ void Satellite::OnDisconnected() {
     pipeline_active_       = false;
     continue_conversation_ = false;
     speech_active_         = false;
+    active_wake_phrase_.clear();
     wake_sound_pending_    = false;
     continue_listen_at_ns_.store(0, std::memory_order_relaxed);
     Unduck();
@@ -770,6 +801,7 @@ void Satellite::OnMuted() {
         pipeline_active_       = false;
         continue_conversation_ = false;
         speech_active_         = false;
+        active_wake_phrase_.clear();
         wake_sound_pending_    = false;
         Unduck();
         lva::tr::Show(lva::tr::LedState::Idle);
