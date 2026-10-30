@@ -233,6 +233,7 @@ std::string OtaClient::CalculateFileMd5(const std::string& path) {
 namespace {
 
 struct DownloadCtx {
+    NetworkRequest* request = nullptr;
     std::FILE*                              fp = nullptr;
     Md5                                     md5;
     OtaClient::ProgressCallback             progress;
@@ -241,13 +242,12 @@ struct DownloadCtx {
     curl_off_t                              written = 0;
     int                                     fd = -1;
     off_t                                   dropped = 0;
-    const std::atomic<bool>*                cancel = nullptr;
 };
 
 std::size_t WriteCb(char* ptr, std::size_t size, std::size_t nmemb,
                     void* userdata) {
     auto* ctx = static_cast<DownloadCtx*>(userdata);
-    if (ctx->cancel != nullptr && ctx->cancel->load()) {
+    if (ctx->request->Cancelled()) {
         return 0;  // tell curl to abort
     }
     const std::size_t n = size * nmemb;
@@ -268,7 +268,7 @@ std::size_t WriteCb(char* ptr, std::size_t size, std::size_t nmemb,
 int ProgressCb(void* clientp, curl_off_t dltotal, curl_off_t dlnow,
                curl_off_t /*ultotal*/, curl_off_t /*ulnow*/) {
     auto* ctx = static_cast<DownloadCtx*>(clientp);
-    if (ctx->cancel != nullptr && ctx->cancel->load()) {
+    if (ctx->request->Cancelled()) {
         return 1;  // abort
     }
     if (dltotal > 0) {
@@ -288,7 +288,7 @@ int ProgressCb(void* clientp, curl_off_t dltotal, curl_off_t dlnow,
 
 }  // namespace
 
-void OtaClient::DownloadFirmware(const OtaRelease& release,
+void OtaClient::DownloadFirmware(const OtaRelease& release, const NetworkPolicy& policy,
                                  ProgressCallback progress,
                                  const std::atomic<bool>* cancel) {
     if (release.url.empty()) {
@@ -333,7 +333,10 @@ void OtaClient::DownloadFirmware(const OtaRelease& release,
         }
     }
 
+    NetworkRequest access(policy, release.source, cancel);
+    if (access.Cancelled()) throw std::runtime_error("OTA: background internet disabled");
     DownloadCtx ctx;
+    ctx.request = &access;
     ctx.fp = std::fopen(temp_path.c_str(), "wb");
     if (ctx.fp == nullptr) {
         throw std::runtime_error("OTA: cannot create " + temp_path +
@@ -341,7 +344,6 @@ void OtaClient::DownloadFirmware(const OtaRelease& release,
     }
     ctx.fd       = ::fileno(ctx.fp);
     ctx.progress = std::move(progress);
-    ctx.cancel   = cancel;
 
     CURL* curl = curl_easy_init();
     if (curl == nullptr) {
@@ -350,6 +352,7 @@ void OtaClient::DownloadFirmware(const OtaRelease& release,
         throw std::runtime_error("OTA: curl_easy_init failed");
     }
 
+    access.Configure(curl);
     curl_easy_setopt(curl, CURLOPT_URL,            release.url.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,  &WriteCb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA,      &ctx);

@@ -573,6 +573,7 @@ void SupervisorHttpServer::HandlePost(int conn_fd, const std::string& path,
     }
     if (command == "ota") {
         OtaRelease release;
+        release.source = RequestSource::Explicit;
         release.url          = param_dict.count("url")     ? param_dict["url"]     : "";
         release.version      = param_dict.count("version") ? param_dict["version"] : "";
         release.expected_md5 = param_dict.count("md5")     ? param_dict["md5"]     : "";

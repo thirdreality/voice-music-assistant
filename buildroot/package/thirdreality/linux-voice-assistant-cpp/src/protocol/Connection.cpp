@@ -13,6 +13,7 @@
 #include "protocol/MessageRegistry.h"
 #include "satellite/Satellite.h"
 #include "tr/TimeZoneSync.h"
+#include "tr/TimeSync.h"
 #include "state/ServerState.h"
 #include "util/Log.h"
 
@@ -30,6 +31,10 @@ constexpr std::uint32_t kApiVersionMinor = 10;
 constexpr std::size_t kMaxReadBufferBytes = 1u * 1024u * 1024u;
 
 constexpr std::size_t kReadChunkBytes = 4096;
+constexpr std::chrono::minutes kTimeRetryIntervals[] = {
+    std::chrono::minutes(1), std::chrono::minutes(5), std::chrono::minutes(15)};
+constexpr auto kTimeRefreshInterval = std::chrono::hours(1);
+constexpr auto kMaxTimeResponseAge = std::chrono::seconds(5);
 
 }  // namespace
 
@@ -122,6 +127,15 @@ bool Connection::ProcessBuffer() {
     return true;
 }
 
+void Connection::PollTimeSync(std::chrono::steady_clock::time_point now) {
+    if (closed_ || !authenticated_ || now < next_time_request_) return;
+    next_time_request_ = now + kTimeRetryIntervals[time_retry_step_];
+    if (time_retry_step_ + 1 < std::size(kTimeRetryIntervals)) ++time_retry_step_;
+    time_request_started_.reset();
+    ::GetTimeRequest request;
+    if (Send(request)) time_request_started_ = now;
+}
+
 bool Connection::DispatchFrame(const InboundFrame& frame) {
     LVA_LOGD(kTag, "[%s] <- type=%u (%.*s) len=%zu",
              peer_label_.c_str(), frame.msg_type_id,
@@ -150,8 +164,7 @@ bool Connection::DispatchFrame(const InboundFrame& frame) {
             const bool ok = Send(resp);
             if (ok) {
                 authenticated_ = true;
-                ::GetTimeRequest gt;
-                Send(gt);
+                PollTimeSync();
 
                 const auto sink = MakeSink();
                 for (const auto& entity : state_.entities) {
@@ -165,6 +178,16 @@ bool Connection::DispatchFrame(const InboundFrame& frame) {
         }
 
         case kIdGetTimeResponse: {
+            // Only consume a fresh response to this connection's request.
+            // Unsolicited, duplicate or delayed timestamps cannot set the clock.
+            if (!authenticated_ || !time_request_started_) return true;
+            const auto now = std::chrono::steady_clock::now();
+            const auto age = now - *time_request_started_;
+            time_request_started_.reset();
+            if (age < std::chrono::steady_clock::duration::zero() || age > kMaxTimeResponseAge) {
+                LVA_LOGW(kTag, "[%s] ignoring stale HA time response", peer_label_.c_str());
+                return true;
+            }
             ::GetTimeResponse gtr;
             if (!gtr.ParseFromArray(
                     frame.payload.data(),
@@ -174,12 +197,18 @@ bool Connection::DispatchFrame(const InboundFrame& frame) {
                 return false;
             }
             const std::string tz = gtr.timezone();
-            LVA_LOGI(kTag, "[%s] HA timezone=%s epoch=%u",
+            LVA_LOGD(kTag, "[%s] HA timezone=%s epoch=%u",
                      peer_label_.c_str(),
                      tz.empty() ? "(empty)" : tz.c_str(),
                      gtr.epoch_seconds());
             if (!tz.empty()) {
                 lva::tr::ApplyTimezone(tz);
+            }
+            const auto result = lva::tr::ApplyHaTime(gtr.epoch_seconds());
+            if (result != lva::tr::TimeSyncResult::Invalid &&
+                result != lva::tr::TimeSyncResult::Failed) {
+                time_retry_step_ = 0;
+                next_time_request_ = now + kTimeRefreshInterval;
             }
             return true;
         }

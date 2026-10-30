@@ -8,12 +8,14 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <google/protobuf/message_lite.h>
 
 #include "entities/Entity.h"
 #include "state/Preferences.h"
+#include "tr/NetworkPolicy.h"
 
 namespace lva::audio    { class AudioCapture; class WebRtcProcessor; class IAudioPlayer; class WakeWordEngine; }
 namespace lva::satellite { class Satellite; }
@@ -25,6 +27,9 @@ namespace lva::state {
 
 class ServerState {
    public:
+    explicit ServerState(std::filesystem::path network_policy_path = "/data/conf/network.json")
+        : network_policy(std::move(network_policy_path)) {}
+    lva::tr::NetworkPolicy network_policy;
     std::string name;            // e.g. "3RSPK-A8E291152F53"
     std::string friendly_name;   // human-readable fallback to name
     std::string mac_address;     // colon-separated, lowercase

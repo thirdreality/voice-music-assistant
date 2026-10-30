@@ -4,7 +4,8 @@
 #include <atomic>
 #include <cstdint>
 #include <string>
-#include <thread>
+#include <future>
+#include "tr/NetworkPolicy.h"
 
 #include "entities/Entity.h"
 
@@ -15,6 +16,9 @@ namespace lva::entities {
 class UpdateEntity final : public Entity {
    public:
     UpdateEntity(std::uint32_t key, lva::state::ServerState& state);
+
+    ~UpdateEntity() override;
+    bool AutomaticBusy() const { return check_.valid() && check_source_ != lva::tr::RequestSource::Explicit; }
 
     void OnListEntities(const ResponseSink& sink) override;
     void OnSubscribeStates(const ResponseSink& sink) override;
@@ -31,10 +35,10 @@ class UpdateEntity final : public Entity {
 
    private:
     void EmitState(const ResponseSink& sink) const;
-    void ScheduleCheck();
+    void ScheduleCheck(lva::tr::RequestSource source = lva::tr::RequestSource::Automatic);
     void ScheduleInstall();
-    void CheckOnce();
-    void InstallOnce();
+    void ApplyCheckResult(const std::string& body);
+    void Poll();
 
     lva::state::ServerState& state_;
 
@@ -49,8 +53,10 @@ class UpdateEntity final : public Entity {
     bool        has_progress_ = false;
     float       progress_     = 0.0f;
 
-    std::atomic<bool> worker_busy_{false};
-    std::thread       worker_;
+    std::atomic<bool> cancel_{false};
+    std::future<std::string> check_;
+    lva::tr::RequestSource check_source_ = lva::tr::RequestSource::Automatic;
+    bool installing_ = false;
 
     int  daily_check_offset_min_ = -1;  // [0,60), set on first tick
     int  last_check_yday_        = -1;  // tm_yday of last daily check

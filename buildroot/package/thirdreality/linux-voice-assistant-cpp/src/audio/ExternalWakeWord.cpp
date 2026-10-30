@@ -52,7 +52,8 @@ std::size_t WriteToFileCb(char* ptr, std::size_t size, std::size_t nmemb,
 }
 
 bool DownloadToFile(const std::string& url,
-                    const std::filesystem::path& dest) {
+                    const std::filesystem::path& dest, lva::tr::NetworkRequest& access) {
+    if (access.Cancelled()) return false;
     std::FILE* fp = std::fopen(dest.c_str(), "wb");
     if (fp == nullptr) {
         LVA_LOGE(kTag, "cannot create %s", dest.c_str());
@@ -67,6 +68,7 @@ bool DownloadToFile(const std::string& url,
         return false;
     }
 
+    access.Configure(curl);
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &WriteToFileCb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
@@ -98,11 +100,24 @@ bool DownloadToFile(const std::string& url,
     return true;
 }
 
+// Size/hash are optional in HA metadata. Check every supplied field for
+// both cached and freshly downloaded files; never accept an empty file.
+bool ModelMatches(const std::filesystem::path& path, const ExternalWakeWordInfo& info) {
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    if (error || size == 0 || (info.model_size != 0 && size != info.model_size)) return false;
+    if (info.model_hash.empty()) return true;
+    const auto actual = lva::util::Sha256FileHex(path);
+    return !actual.empty() && actual == info.model_hash;
+}
+
 }  // namespace
 
 std::filesystem::path DownloadExternalWakeWord(
     const ExternalWakeWordInfo& info,
-    const std::filesystem::path& dest_dir) {
+    const std::filesystem::path& dest_dir,
+    const lva::tr::NetworkPolicy& policy, const std::atomic<bool>* cancel) {
+    lva::tr::NetworkRequest access(policy, lva::tr::RequestSource::LocalModel, cancel);
     namespace fs = std::filesystem;
 
     std::error_code ec;
@@ -118,24 +133,15 @@ std::filesystem::path DownloadExternalWakeWord(
 
     const bool config_missing = !fs::exists(config_path);
 
-    bool need_model = true;
-    if (fs::exists(model_path)) {
-        const auto cached_size = fs::file_size(model_path, ec);
-        if (!ec && cached_size == info.model_size) {
-            const std::string cached_hash = lva::util::Sha256FileHex(model_path);
-            if (!cached_hash.empty() && cached_hash == info.model_hash) {
-                need_model = false;
-                LVA_LOGD(kTag,
-                         "model size and hash match for %s; skipping download",
-                         info.id.c_str());
-            }
-        }
-    }
+    const bool need_model = !ModelMatches(model_path, info);
 
-    if (config_missing || need_model) {
+    const fs::path config_part = config_path.string() + ".part";
+    const fs::path model_part = model_path.string() + ".part";
+    const bool fetch_config = config_missing || need_model;
+    if (fetch_config) {
         LVA_LOGI(kTag, "downloading config %s -> %s", info.url.c_str(),
                  config_path.c_str());
-        if (!DownloadToFile(info.url, config_path)) {
+        if (!DownloadToFile(info.url, config_part, access)) {
             return {};
         }
     }
@@ -145,11 +151,23 @@ std::filesystem::path DownloadExternalWakeWord(
             ReplaceUrlFilename(info.url, model_path.filename().string());
         LVA_LOGI(kTag, "downloading model %s -> %s", model_url.c_str(),
                  model_path.c_str());
-        if (!DownloadToFile(model_url, model_path)) {
+        if (!DownloadToFile(model_url, model_part, access)) {
+            fs::remove(config_part, ec);
             return {};
         }
+        if (!ModelMatches(model_part, info) || access.Cancelled()) {
+            fs::remove(model_part, ec); fs::remove(config_part, ec);
+            return {};
+        }
+        fs::rename(model_part, model_path, ec);
+        if (ec) { fs::remove(config_part, ec); return {}; }
     }
 
+    if (access.Cancelled()) { fs::remove(config_part, ec); return {}; }
+    if (fetch_config) {
+        fs::rename(config_part, config_path, ec);
+        if (ec) return {};
+    }
     return config_path;
 }
 

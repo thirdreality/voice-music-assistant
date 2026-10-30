@@ -66,6 +66,14 @@ void ApiServer::Stop() noexcept {
     }
 }
 
+void ApiServer::PollTimeSync() {
+    const auto now = std::chrono::steady_clock::now();
+    for (auto& [fd, connection] : connections_) {
+        (void)fd;
+        connection->PollTimeSync(now);
+    }
+}
+
 void ApiServer::AddAuxFd(int fd, std::function<void()> on_readable) {
     if (epoll_fd_ < 0) {
         LVA_LOGE(kTag, "AddAuxFd called before Start()");

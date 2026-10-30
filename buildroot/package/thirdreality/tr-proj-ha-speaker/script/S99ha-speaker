@@ -3,7 +3,7 @@
 # S99ha-speaker: unified init script and service monitor for HA speaker.
 #
 # Manages:
-#   - netmonitor       (WiFi/internet connectivity state machine)
+#   - netmonitor       (local Wi-Fi/IP state monitor)
 #   - voice-assistant  (/usr/bin/linux-voice-assistant-cpp, includes the
 #                       Sendspin music player)
 #   - pulseaudio       (reboot device if it dies)
@@ -27,6 +27,9 @@ CHECK_INTERVAL=10
 # Removed by:  S99ha-speaker <service> start
 DISABLE_NETMONITOR=/tmp/ha_disable_netmonitor
 DISABLE_VOICE=/tmp/ha_disable_voice
+NTP_DONE=/tmp/ha_initial_ntp_done
+SPEAKER_READY=/tmp/ha_speaker_ready
+. /usr/share/thirdreality/script/network-policy.sh
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -60,23 +63,34 @@ stop_netmonitor() {
 # voice-assistant
 # ---------------------------------------------------------------------------
 
-start_voice_assistant() {
+start_voice_assistant() (
+    flock -x 7 || exit 1
+    mkdir -p "$PIDDIR"
+    if [ "$1" = auto ]; then
+        [ ! -f "$DISABLE_VOICE" ] || return 0
+    else
+        rm -f "$DISABLE_VOICE"
+    fi
+    # An early explicit start enables the service; the monitor starts it
+    # once Wi-Fi is ready and hardware setup / the initial NTP attempt have completed.
+    [ -f "$SPEAKER_READY" ] && [ -f "$NTP_DONE" ] && wifi_local_ready || return 0
     is_running "$VOICE_PIDFILE" && return 0
     rm -f "$VOICE_PIDFILE" "$DISABLE_VOICE"
 
     # Restart avahi so it picks up the new hostname and sendspin.service.
-    /etc/init.d/S50avahi-daemon stop 2>/dev/null
-    /etc/init.d/S50avahi-daemon start 2>/dev/null
+    /etc/init.d/S50avahi-daemon stop 7>&- 2>/dev/null
+    /etc/init.d/S50avahi-daemon start 7>&- 2>/dev/null
 
     local spk_name
     spk_name=$(jq -r '.device.name // "thirdreality-speaker"' "$DEVICE_CONF")
     /usr/bin/linux-voice-assistant-cpp \
         --name "$spk_name" \
-        --port 6053 &
+        --port 6053 7>&- &
     echo $! > "$VOICE_PIDFILE"
-}
+) 7>/tmp/ha_voice.lock
 
-stop_voice_assistant() {
+stop_voice_assistant() (
+    flock -x 7 || exit 1
     touch "$DISABLE_VOICE"
     if is_running "$VOICE_PIDFILE"; then
         kill "$(cat "$VOICE_PIDFILE")" 2>/dev/null
@@ -84,7 +98,7 @@ stop_voice_assistant() {
         kill -9 "$(cat "$VOICE_PIDFILE")" 2>/dev/null
     fi
     rm -f "$VOICE_PIDFILE"
-}
+) 7>/tmp/ha_voice.lock
 
 # ---------------------------------------------------------------------------
 # Monitor loop
@@ -92,6 +106,11 @@ stop_voice_assistant() {
 
 monitor_loop() {
     while true; do
+        if [ ! -f /data/first_wifi_connected ] && [ -f "$NTP_DONE" ] && wifi_local_ready; then
+            touch /data/first_wifi_connected
+            paplay /usr/share/thirdreality/audio/ready_to_connect_ha.wav &
+        fi
+
         # 1. netmonitor
         if [ ! -f "$DISABLE_NETMONITOR" ] && ! is_running "$NETMONITOR_PIDFILE"; then
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] netmonitor not running, restarting..."
@@ -99,9 +118,10 @@ monitor_loop() {
         fi
 
         # 2. voice-assistant
-        if [ ! -f "$DISABLE_VOICE" ] && ! is_running "$VOICE_PIDFILE"; then
+        if [ -f "$NTP_DONE" ] && [ ! -f "$DISABLE_VOICE" ] &&
+           ! is_running "$VOICE_PIDFILE" && wifi_local_ready; then
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] voice-assistant not running, restarting..."
-            start_voice_assistant
+            start_voice_assistant auto
         fi
 
         # 3. pulseaudio
@@ -128,17 +148,17 @@ start() {
         exit 0
     fi
 
+    rm -f "$SPEAKER_READY"
     /usr/share/thirdreality/script/setup_env.sh
 
-    NETWORK_STATUS=$(jq -r '.network.status // "disconnected"' "$DEVICE_CONF" 2>/dev/null)
-    if [ "$NETWORK_STATUS" = "disconnected" ]; then
+    if ! wifi_local_ready; then
         /etc/init.d/S44bluetooth up
         paplay /usr/share/thirdreality/audio/setup_mode.wav &
     fi
 
-    # voice-assistant requires network (NTP sync). Disable it at boot;
-    # ntpdate.sh enables it after the first sync.
-    touch "$DISABLE_VOICE"
+    # S49 publishes completion even if sync fails. Never overwrite a
+    # manual stop or a completion that arrived before S99.
+    touch "$SPEAKER_READY"
 
     start_netmonitor
 
@@ -148,6 +168,7 @@ start() {
 }
 
 stop() {
+    rm -f "$SPEAKER_READY"
     if is_running "$MONITOR_PIDFILE"; then
         kill "$(cat "$MONITOR_PIDFILE")" 2>/dev/null
         echo "ha-speaker stopped (PID: $(cat "$MONITOR_PIDFILE"))"
@@ -156,7 +177,6 @@ stop() {
     fi
     rm -f "$MONITOR_PIDFILE"
 
-    /etc/init.d/S44bluetooth stop
     stop_voice_assistant
     stop_netmonitor
     # Clear disable flags so next start brings everything up

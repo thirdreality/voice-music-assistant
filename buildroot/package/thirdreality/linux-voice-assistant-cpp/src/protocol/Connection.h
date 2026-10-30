@@ -3,9 +3,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <functional>
 #include <google/protobuf/message_lite.h>
 #include <span>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -43,6 +45,9 @@ class Connection {
 
     bool OnWritable();
 
+    void PollTimeSync(std::chrono::steady_clock::time_point now =
+                          std::chrono::steady_clock::now());
+
     template <typename T>
     bool Send(const T& message);
 
@@ -64,6 +69,9 @@ class Connection {
     bool closed_ = false;
     bool authenticated_ = false;
     bool voice_subscribed_ = false;
+    std::chrono::steady_clock::time_point next_time_request_{};
+    std::size_t time_retry_step_ = 0;
+    std::optional<std::chrono::steady_clock::time_point> time_request_started_;
     lva::state::ServerState& state_;
     std::string peer_label_;
 

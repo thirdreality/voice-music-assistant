@@ -5,10 +5,12 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include "tr/NetworkPolicy.h"
 
 namespace lva::tr {
 
 struct OtaRelease {
+    RequestSource source = RequestSource::Automatic;
     std::string version;        // semver-ish, used in HA UI
     std::string url;            // download URL
     std::string expected_md5;   // hex, lower-cased on compare
@@ -30,7 +32,7 @@ class OtaClient {
     OtaClient(const OtaClient&)            = delete;
     OtaClient& operator=(const OtaClient&) = delete;
 
-    void DownloadFirmware(const OtaRelease& release,
+    void DownloadFirmware(const OtaRelease& release, const NetworkPolicy& policy,
                           ProgressCallback progress,
                           const std::atomic<bool>* cancel = nullptr);
 

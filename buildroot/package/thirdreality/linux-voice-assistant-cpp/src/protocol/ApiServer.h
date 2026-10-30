@@ -38,6 +38,8 @@ class ApiServer {
 
     void AddAuxFd(int fd, std::function<void()> on_readable);
 
+    void PollTimeSync();
+
    private:
     bool AcceptOne();
     void EraseConnection(int fd);

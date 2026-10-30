@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
+#include <memory>
+#include "tr/NetworkPolicy.h"
 #include <string>
 #include <thread>
 
@@ -32,7 +34,7 @@ class ModelDownloader {
         std::string error;
     };
 
-    explicit ModelDownloader(ModelSpec spec);
+    ModelDownloader(ModelSpec spec, const NetworkPolicy& policy);
     ~ModelDownloader();
 
     ModelDownloader(const ModelDownloader&)            = delete;
@@ -43,7 +45,9 @@ class ModelDownloader {
 
     // Starts the worker unless it is running or the model is installed.
     // The status is kDownloading when this returns.
-    void Start();
+    bool Start(RequestSource source = RequestSource::Automatic);
+    void RequestCancelAutomatic();
+    bool AutomaticBusy() const { return source_ == RequestSource::Automatic && running_.load(std::memory_order_acquire); }
 
     // Stops the worker and waits for it. The partial file is kept.
     void Cancel();
@@ -60,6 +64,9 @@ class ModelDownloader {
     void SetPercent(std::uintmax_t bytes);
     bool SleepUnlessCancelled(int seconds);
 
+    const NetworkPolicy& policy_;
+    RequestSource source_ = RequestSource::Automatic;
+    std::unique_ptr<NetworkRequest> request_;
     const ModelSpec             spec_;
     const std::filesystem::path part_path_;
 

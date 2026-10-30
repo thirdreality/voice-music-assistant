@@ -91,14 +91,22 @@ void UpdateEntity::OnCommand(const ::google::protobuf::MessageLite& request,
     LVA_LOGI(kTag, "OnCommand: command=%d", command);
 
     if (command == kEnumUpdateCmdCheck || command == kEnumUpdateCmdNone) {
-        ScheduleCheck();
+        ScheduleCheck(command == kEnumUpdateCmdCheck ? lva::tr::RequestSource::Explicit
+                                                    : lva::tr::RequestSource::Automatic);
     } else if (command == kEnumUpdateCmdInstall) {
         ScheduleInstall();
     }
     EmitState(sink);
 }
 
+UpdateEntity::~UpdateEntity() {
+    cancel_.store(true, std::memory_order_release);
+    if (check_.valid()) check_.wait();
+}
+
 void UpdateEntity::OnPeriodicTick() {
+    Poll();
+    if (!state_.network_policy.Allowed()) return;
     // Per-device offset spreads the daily check.
     if (daily_check_offset_min_ < 0) {
         const std::size_t h = std::hash<std::string>{}(state_.name);

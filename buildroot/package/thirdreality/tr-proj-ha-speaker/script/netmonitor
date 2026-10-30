@@ -1,238 +1,37 @@
 #!/bin/sh
+# Local link monitoring only. Internet reachability is deliberately not probed.
+. /usr/share/thirdreality/script/network-policy.sh
+DEVICE_CONF=/data/conf/device.json
+rm -f /tmp/net_disconnected
 
-DEVICE_CONF="/data/conf/device.json"
-DEVICE_CONF_TMP="/tmp/device_info.netmonitor.tmp.json"
-DEVICE_CONF_LOCK="/tmp/device_info.lock"
+update_net_state() (
+    flock -x 9 || exit 1
+    tmp=$(mktemp /data/conf/device.net.XXXXXX) || exit 1
+    trap 'rm -f "$tmp"' EXIT HUP INT TERM
+    jq --arg state "$1" '.network.status = $state' "$DEVICE_CONF" > "$tmp" &&
+        mv "$tmp" "$DEVICE_CONF"
+) 9>/tmp/device_info.lock
 
-INTERVAL_CONNECTED=60
-INTERVAL_DISCONNECTED=30
-INTERVAL_SSID=3
-
-WIFI_FAIL_THRESHOLD=2
-INTERNET_FAIL_THRESHOLD=3
-
-CONNECTIVITY_CHECK_URL1="http://connectivitycheck.gstatic.com/generate_204"
-CONNECTIVITY_CHECK_URL2="http://captive.apple.com/hotspot-detect.html"
-
-get_valid_ipv4_address()
-{
-    ip -o -4 addr show dev wlan0 scope global 2>/dev/null | awk '{print $4}' | cut -d'/' -f1 | head -1
-}
-
-has_default_route()
-{
-    ip route show default 2>/dev/null | grep -q "dev wlan0"
-}
-
-get_saved_net_state()
-{
-    local saved_state
-
-    saved_state="$(jq -r '.network.status // "disconnected"' "$DEVICE_CONF" 2>/dev/null)"
-
-    case "$saved_state" in
-        connected|connected_no_internet|disconnected)
-            echo "$saved_state"
-            ;;
-        *)
-            echo "disconnected"
-            ;;
-    esac
-}
-
-set_state_artifacts()
-{
-    local state="$1"
-
-    if [ "$state" = "connected" ]; then
-        rm -f /tmp/net_disconnected
+current_state=
+failures=0
+while :; do
+    if wifi_local_ready; then
+        failures=0
+        next_state=connected
     else
-        touch /tmp/net_disconnected
-    fi
-}
-
-linkReadyCheck()
-{
-    [ -n "$(get_valid_ipv4_address)" ] && has_default_route
-}
-
-ensure_dns_config()
-{
-    local dns_server="8.8.8.8"
-    
-    if [ ! -f /etc/resolv.conf ]; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Warning: /etc/resolv.conf not found, creating..."
-        echo "nameserver $dns_server" > /etc/resolv.conf
-        return 0
-    fi
-    
-    if ! grep -q "^nameserver" /etc/resolv.conf; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] No nameserver present, adding fallback $dns_server to /etc/resolv.conf"
-        echo "nameserver $dns_server" >> /etc/resolv.conf
-    else
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] DNS config OK (nameserver already present)"
-    fi
-}
-
-update_net_state()
-{
-    local new_state="$1"
-    
-    if [ ! -f "$DEVICE_CONF" ]; then
-        echo "Warning: Device config file not found: $DEVICE_CONF"
-        return 1
-    fi
-    
-    (
-        flock -x 9
-        if jq ".network.status = \"$new_state\"" "$DEVICE_CONF" > "$DEVICE_CONF_TMP"; then
-            mv "$DEVICE_CONF_TMP" "$DEVICE_CONF"
-            sync
-        else
-            echo "Error: Failed to update device config"
-            rm -f "$DEVICE_CONF_TMP"
-            return 1
+        failures=$((failures + 1))
+        next_state=disconnected
+        # Debounce a transient lost link/IP once we were connected.
+        if [ "$current_state" = connected ] && [ "$failures" -lt 2 ]; then
+            next_state=connected
         fi
-    ) 9>"$DEVICE_CONF_LOCK"
-}
-
-netUpAction()
-{
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Network connected"
-    rm -f /tmp/net_disconnected
-    update_net_state "connected"
-}
-
-netDownAction()
-{
-    local new_state
-    
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Network disconnected"
-    touch /tmp/net_disconnected
-    
-    if ssidCheck; then
-        new_state="connected_no_internet"
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] WiFi connected but no internet"
-    else
-        new_state="disconnected"
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] WiFi disconnected"
     fi
-    
-    update_net_state "$new_state"
-
-    ensure_dns_config
-    return 0
-}
-
-ssidCheck()
-{
-    if iw dev wlan0 link 2>/dev/null | grep -q "Not connected"; then
-        return 1
-    else
-        return 0
-    fi
-}
-
-connectivityCheck()
-{
-    if ! linkReadyCheck; then
-        return 1
-    fi
-
-    # Use GET instead of HEAD. Some networks/proxies do not handle HEAD well,
-    # which causes false negatives even though general internet access works.
-    if curl -fsSL --connect-timeout 2 --max-time 3 -o /dev/null "$CONNECTIVITY_CHECK_URL1" 2>/dev/null; then
-        return 0
-    fi
-    
-    if curl -fsSL --connect-timeout 2 --max-time 3 -o /dev/null "$CONNECTIVITY_CHECK_URL2" 2>/dev/null; then
-        return 0
-    fi
-    
-    return 1
-}
-
-netCheckState()
-{
-    local current_state
-    local check_interval="$INTERVAL_SSID"
-    local wifi_connected=false
-    local internet_connected=false
-    local wifi_fail_count=0
-    local internet_fail_count=0
-    
-    current_state="$(get_saved_net_state)"
-
-    if ssidCheck && linkReadyCheck && [ "$current_state" = "disconnected" ]; then
-        current_state="connected"
-        update_net_state "$current_state"
-    fi
-
-    set_state_artifacts "$current_state"
-
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Network monitor started"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Initial state: $current_state"
-
-    while true
-    do
-        if ssidCheck; then
-            wifi_connected=true
-            wifi_fail_count=0
-        else
-            wifi_fail_count=$((wifi_fail_count + 1))
-            if [ $wifi_fail_count -ge $WIFI_FAIL_THRESHOLD ]; then
-                wifi_connected=false
-            fi
+    if [ "$next_state" != "$current_state" ]; then
+        if update_net_state "$next_state"; then
+            current_state=$next_state
+            echo "Local network: $current_state"
+            [ "$current_state" != connected ] || ensure_dns_config
         fi
-
-        if [ "$wifi_connected" = false ]; then
-            if [ "$current_state" != "disconnected" ]; then
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] WiFi failed $wifi_fail_count times, marking as disconnected"
-                netDownAction
-                current_state="disconnected"
-            fi
-            internet_fail_count=0
-            check_interval="$INTERVAL_SSID"
-            sleep "$check_interval"
-            continue
-        fi
-        
-        if connectivityCheck; then
-            internet_connected=true
-            internet_fail_count=0
-        else
-            internet_fail_count=$((internet_fail_count + 1))
-            
-            if [ $internet_fail_count -ge $INTERNET_FAIL_THRESHOLD ]; then
-                internet_connected=false
-            fi
-        fi
-        
-        if [ "$internet_connected" = true ]; then
-            if [ "$current_state" != "connected" ]; then
-                netUpAction
-                current_state="connected"
-            fi
-            check_interval="$INTERVAL_CONNECTED"
-        else
-            if [ "$current_state" = "connected" ]; then
-                if [ $internet_fail_count -ge $INTERNET_FAIL_THRESHOLD ]; then
-                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Internet failed $internet_fail_count times, marking as no internet"
-                    netDownAction
-                    current_state="connected_no_internet"
-                else
-                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Internet check failed ($internet_fail_count/$INTERNET_FAIL_THRESHOLD)"
-                fi
-            elif [ "$current_state" = "disconnected" ] && [ $internet_fail_count -ge $INTERNET_FAIL_THRESHOLD ]; then
-                update_net_state "connected_no_internet"
-                current_state="connected_no_internet"
-            fi
-            check_interval="$INTERVAL_DISCONNECTED"
-        fi
-        
-        sleep "$check_interval"
-    done
-   
-}
-
-netCheckState
+    fi
+    sleep 3
+done

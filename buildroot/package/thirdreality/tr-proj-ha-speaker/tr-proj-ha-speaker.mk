@@ -9,7 +9,7 @@ TR_PROJ_HA_SPEAKER_SITE = $(TOPDIR)/package/thirdreality/tr-proj-ha-speaker
 TR_PROJ_HA_SPEAKER_SITE_METHOD = local
 
 TR_PROJ_HA_SPEAKER_INSTALL_TARGET = YES
-TR_PROJ_HA_SPEAKER_DEPENDENCIES = tr-volume
+TR_PROJ_HA_SPEAKER_DEPENDENCIES = tr-volume jq
 
 REALITY_DIR = $(TARGET_DIR)/usr/share/thirdreality
 
@@ -31,6 +31,8 @@ define TR_PROJ_HA_SPEAKER_INSTALL_TARGET_CMDS
 	$(INSTALL) -D -m 0755 $(@D)/script/setup_env.sh ${REALITY_DIR}/script/setup_env.sh
 	$(INSTALL) -D -m 0755 $(@D)/script/wifi_connect ${REALITY_DIR}/script/wifi_connect
 	$(INSTALL) -D -m 0755 $(@D)/script/netmonitor ${REALITY_DIR}/script/netmonitor
+	$(INSTALL) -D -m 0755 $(@D)/script/network-policy.sh ${REALITY_DIR}/script/network-policy.sh
+	$(INSTALL) -D -m 0755 $(@D)/script/ntp-apply ${REALITY_DIR}/script/ntp-apply
 	$(INSTALL) -D -m 0755 $(@D)/script/S99ha-speaker $(TARGET_DIR)/etc/init.d/S99ha-speaker
 
 	@echo "firmwareVersion is $(IMAGE_VERSION)"

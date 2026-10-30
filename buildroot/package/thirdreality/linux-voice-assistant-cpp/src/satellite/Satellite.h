@@ -5,6 +5,9 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <future>
+#include <memory>
+#include <optional>
 #include <google/protobuf/message_lite.h>
 #include <map>
 #include <string>
@@ -12,7 +15,7 @@
 
 #include "audio/ExternalWakeWord.h"
 
-namespace lva::audio    { class WakeWordEngine; class PcmRingBuffer; class IAudioPlayer; class ITextToSpeech; }
+namespace lva::audio    { class WakeWordEngine; class PcmRingBuffer; class IAudioPlayer; class ITextToSpeech; class MicroWakeWord; class OpenWakeWord; }
 namespace lva::state    { class ServerState; }
 
 namespace lva::satellite {
@@ -52,6 +55,7 @@ class Satellite {
                        const ::google::protobuf::MessageLite& msg);
 
     void OnLoopTick();
+    bool WakeConfigurationBusy() const { return wake_configuration_.valid(); }
 
     void OnDisconnected();
 
@@ -167,7 +171,18 @@ class Satellite {
     bool             local_speech_      = false;
     unsigned         tts_file_seq_      = 0;
 
-    std::filesystem::path ResolveWakeWordConfig(const std::string& id);
+    struct WakeConfigurationResult {
+        std::vector<std::shared_ptr<lva::audio::MicroWakeWord>> micro;
+        std::vector<std::shared_ptr<lva::audio::OpenWakeWord>> open;
+        int failures = 0;
+    };
+    std::future<WakeConfigurationResult> wake_configuration_;
+    std::atomic<bool> wake_configuration_cancel_{false};
+    std::uint64_t wake_configuration_generation_ = 0;
+    std::optional<std::vector<std::string>> next_wake_configuration_;
+    std::unique_ptr<::google::protobuf::MessageLite> deferred_configuration_request_;
+    void PollWakeConfiguration();
+    void ApplyWakeConfiguration(WakeConfigurationResult result);
 };
 
 }  // namespace lva::satellite

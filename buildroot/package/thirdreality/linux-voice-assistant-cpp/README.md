@@ -41,6 +41,28 @@ aarch64, Buildroot).
 | Sendspin | `sendspin` |
 | Home Button (event) | `thirdreality_home_button` |
 | Firmware Update | `thirdreality_firmware_update` |
+| Allow Background Internet Access | `allow_background_internet` |
+
+### Background internet access
+
+**Allow Background Internet Access** defaults to **on** and is saved in
+`/data/conf/network.json` across reboots and OTA. Turning it off stops
+automatic firmware checks, public NTP fallback and automatic speech-model
+downloads. Local HA, DHCP NTP and cached models remain usable; Wi-Fi status
+requires only association and a local IP. Connectivity probes and offline
+LED effects have been removed. Voice starts after Wi-Fi has a local IP and
+the initial NTP attempt finishes. If NTP is unavailable, HA can set the clock
+and refresh it hourly; an NTP-synchronized clock takes priority.
+
+Explicit firmware checks/installs, speech-model downloads and requested
+media playback may still access the internet. If an automatic speech-model
+download is blocked or cancelled, speech processing falls back to HA;
+select **3R Speaker** again to retry. Re-enabling the switch does not resume it.
+
+This controls application requests over IPv4/IPv6, not firewall rules.
+DHCP servers and services configured in HA remain under administrator control.
+Firmware checks send the device model, version and MAC address to the OTA
+service; default speech models come from GitHub release assets.
 
 ## Build
 

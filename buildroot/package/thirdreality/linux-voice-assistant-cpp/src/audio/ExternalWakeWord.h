@@ -4,6 +4,8 @@
 #pragma once
 
 #include <cstdint>
+#include <atomic>
+#include "tr/NetworkPolicy.h"
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -20,10 +22,12 @@ struct ExternalWakeWordInfo {
     std::string url;              // URL of the JSON config file
 };
 
-// Skips the download if the cached .tflite matches size and hash.
+// Reuses a nonempty cached .tflite if it matches all supplied size/hash
+// metadata. Zero size and empty hash mean that field was not provided.
 // Returns the JSON config path, or empty on failure.
 std::filesystem::path DownloadExternalWakeWord(
     const ExternalWakeWordInfo& info,
-    const std::filesystem::path& dest_dir);
+    const std::filesystem::path& dest_dir,
+    const lva::tr::NetworkPolicy& policy, const std::atomic<bool>* cancel);
 
 }  // namespace lva::audio

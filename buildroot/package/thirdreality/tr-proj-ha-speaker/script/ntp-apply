@@ -1,0 +1,43 @@
+#!/bin/sh
+# One owner of ntpd configuration and lifecycle. Initial ntpdate uses the
+# same lock for each burst so DHCP/HA cannot start ntpd on UDP 123 meanwhile.
+BASE="${POLICY_ROOT}/usr/share/thirdreality/script"
+. "$BASE/network-policy.sh"
+(
+    flock -x 9 || exit 1
+    # Read the latest policy under the lifecycle lock, including delayed callbacks.
+    allow=$(network_policy_allow)
+    defaults="${POLICY_ROOT}/etc/default/ntpd"
+    NTPSERVERS_DHCP='' NTPSERVERS_IP='' NTPSERVERS_DNS=''
+    [ ! -r "$defaults" ] || . "$defaults"
+    conf="${POLICY_ROOT}/etc/ntp.conf"
+    tmp=$(mktemp "$conf.XXXXXX") || exit 1
+    trap 'rm -f "$tmp"' EXIT HUP INT TERM
+    {
+        echo 'driftfile /var/lib/ntp/ntp.drift'
+        echo 'restrict default nomodify nopeer noquery limited kod'
+        echo 'restrict 127.0.0.1'
+        echo 'restrict ::1'
+        for server in $NTPSERVERS_DHCP; do echo "server $server iburst"; done
+        if [ "$allow" = 1 ]; then
+            for server in $NTPSERVERS_DNS; do echo "server $server iburst"; done
+        fi
+    } > "$tmp"
+    changed=0
+    if ! cmp -s "$tmp" "$conf"; then
+        chmod 644 "$tmp" && mv "$tmp" "$conf" || exit 1
+        changed=1
+    fi
+    # Before/while initial sync, only update config; never steal port 123.
+    [ -f "${POLICY_ROOT}/tmp/ha_initial_ntp_done" ] || exit 0
+    if ! grep -q '^server ' "$conf"; then
+        stop_ntpd
+        exit $?
+    fi
+    if pidof ntpd >/dev/null 2>&1; then
+        [ "$changed" = 1 ] || exit 0
+        stop_ntpd || exit 1
+    fi
+    # Do not let the daemon inherit the lifecycle lock.
+    start-stop-daemon -S -q -x /usr/sbin/ntpd -- -g 6>&- 7>&- 9>&-
+) 9>"${POLICY_ROOT}/tmp/ha_ntp.lock"

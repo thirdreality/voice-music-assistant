@@ -31,11 +31,11 @@ std::uintmax_t FileSizeOrZero(const std::filesystem::path& path) {
 }
 
 struct DownloadCtx {
+    NetworkRequest*                   request = nullptr;
     CURL*                              curl   = nullptr;
     std::FILE*                         fp     = nullptr;
     std::uintmax_t                     offset = 0;  // bytes in the part file
     bool                               checked_status = false;
-    const std::atomic<bool>*           cancel = nullptr;
     std::function<void(std::uintmax_t)> on_bytes;
 };
 
@@ -62,15 +62,15 @@ std::size_t WriteCb(char* ptr, std::size_t size, std::size_t nmemb,
 int ProgressCb(void* userdata, curl_off_t /*dltotal*/, curl_off_t dlnow,
                curl_off_t /*ultotal*/, curl_off_t /*ulnow*/) {
     auto* ctx = static_cast<DownloadCtx*>(userdata);
-    if (ctx->cancel->load(std::memory_order_relaxed)) return 1;
+    if (ctx->request->Cancelled()) return 1;
     ctx->on_bytes(ctx->offset + static_cast<std::uintmax_t>(dlnow));
     return 0;
 }
 
 }  // namespace
 
-ModelDownloader::ModelDownloader(ModelSpec spec)
-    : spec_(std::move(spec)),
+ModelDownloader::ModelDownloader(ModelSpec spec, const NetworkPolicy& policy)
+    : policy_(policy), spec_(std::move(spec)),
       part_path_(spec_.path.string() + ".part") {
     status_.phase   = Installed() ? Phase::kReady : Phase::kMissing;
     status_.percent = status_.phase == Phase::kReady ? 100 : 0;
@@ -82,10 +82,14 @@ bool ModelDownloader::Installed() const {
     return FileSizeOrZero(spec_.path) == spec_.size && spec_.size > 0;
 }
 
-void ModelDownloader::Start() {
-    if (running_.load(std::memory_order_acquire) || Installed()) return;
+bool ModelDownloader::Start(RequestSource source) {
+    if (Installed()) return true;
+    if (running_.load(std::memory_order_acquire)) return false;
+    if (source != RequestSource::Explicit && !policy_.Allowed()) return false;
     if (worker_.joinable()) worker_.join();
     cancel_.store(false, std::memory_order_relaxed);
+    source_ = source;
+    request_ = std::make_unique<NetworkRequest>(policy_, source, &cancel_);
     // Set before the worker runs, so a caller never sees a stale kFailed.
     SetStatus(Phase::kDownloading,
               static_cast<int>(FileSizeOrZero(part_path_) * 100 / spec_.size));
@@ -94,6 +98,14 @@ void ModelDownloader::Start() {
         Run();
         running_.store(false, std::memory_order_release);
     });
+    return true;
+}
+
+void ModelDownloader::RequestCancelAutomatic() {
+    if (source_ == RequestSource::Automatic) {
+        cancel_.store(true, std::memory_order_release);
+        cv_.notify_all();
+    }
 }
 
 void ModelDownloader::Cancel() {
@@ -124,7 +136,7 @@ void ModelDownloader::SetPercent(std::uintmax_t bytes) {
 bool ModelDownloader::SleepUnlessCancelled(int seconds) {
     std::unique_lock<std::mutex> lock(mu_);
     return !cv_.wait_for(lock, std::chrono::seconds(seconds), [this] {
-        return cancel_.load(std::memory_order_relaxed);
+        return request_->Cancelled();
     });
 }
 
@@ -133,6 +145,7 @@ void ModelDownloader::Run() {
              spec_.path.c_str());
     std::string last_error = "download failed";
     for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
+        if (request_->Cancelled()) { SetStatus(Phase::kMissing, 0); return; }
         SetStatus(Phase::kDownloading,
                   static_cast<int>(FileSizeOrZero(part_path_) * 100 /
                                    spec_.size));
@@ -195,8 +208,8 @@ ModelDownloader::Result ModelDownloader::DownloadOnce() {
     }
 
     DownloadCtx ctx;
+    ctx.request  = request_.get();
     ctx.offset   = offset;
-    ctx.cancel   = &cancel_;
     ctx.on_bytes = [this](std::uintmax_t bytes) { SetPercent(bytes); };
     ctx.fp     = std::fopen(part_path_.c_str(), offset > 0 ? "ab" : "wb");
     if (ctx.fp == nullptr) {
@@ -215,6 +228,7 @@ ModelDownloader::Result ModelDownloader::DownloadOnce() {
     }
 
     CURL* curl = ctx.curl;
+    request_->Configure(curl);
     curl_easy_setopt(curl, CURLOPT_URL,              spec_.url.c_str());
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION,   1L);
     curl_easy_setopt(curl, CURLOPT_FAILONERROR,      1L);
@@ -247,8 +261,7 @@ ModelDownloader::Result ModelDownloader::DownloadOnce() {
     ::fsync(::fileno(ctx.fp));
     std::fclose(ctx.fp);
 
-    if (rc == CURLE_ABORTED_BY_CALLBACK &&
-        cancel_.load(std::memory_order_relaxed)) {
+    if (request_->Cancelled()) {
         return Result::kCancelled;
     }
     if (http_code == 416) {
@@ -281,6 +294,7 @@ ModelDownloader::Result ModelDownloader::DownloadOnce() {
 }
 
 ModelDownloader::Result ModelDownloader::VerifyAndInstall() {
+    if (request_->Cancelled()) return Result::kCancelled;
     SetStatus(Phase::kVerifying, 99);
     const std::string actual = lva::util::Sha256FileHex(part_path_);
     std::error_code ec;
@@ -291,6 +305,7 @@ ModelDownloader::Result ModelDownloader::VerifyAndInstall() {
         SetStatus(Phase::kDownloading, 0, "checksum mismatch");
         return Result::kRetry;
     }
+    if (request_->Cancelled()) return Result::kCancelled;
     std::filesystem::rename(part_path_, spec_.path, ec);
     if (ec) {
         SetStatus(Phase::kFailed, 0, "install failed: " + ec.message());

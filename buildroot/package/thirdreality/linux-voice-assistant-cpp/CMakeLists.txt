@@ -209,6 +209,7 @@ add_executable(linux-voice-assistant-cpp
     src/tr/LedRing.cpp
     src/tr/MicMuteGpio.cpp
     src/tr/ModelDownloader.cpp
+    src/tr/NetworkPolicy.cpp
     src/tr/OtaClient.cpp
     src/tr/SoundConfWatcher.cpp
     src/tr/Supervisor.cpp
@@ -216,11 +217,13 @@ add_executable(linux-voice-assistant-cpp
     src/tr/SysInfo.cpp
     src/tr/SystemVolume.cpp
     src/tr/TimeZoneSync.cpp
+    src/tr/TimeSync.cpp
     src/entities/MuteSwitchEntity.cpp
     src/entities/ThinkingSoundEntity.cpp
     src/entities/NumberEntity.cpp
     src/entities/SelectEntity.cpp
     src/entities/SendspinSwitchEntity.cpp
+    src/entities/NetworkSwitchEntity.cpp
     src/entities/MediaPlayerEntity.cpp
     src/entities/EventEntity.cpp
     src/entities/UpdateEntity.cpp

@@ -5,6 +5,7 @@
 #include <thread>
 #include <stdexcept>
 #include <utility>
+#include <memory>
 
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
@@ -57,11 +58,13 @@ std::size_t WriteToString(char* ptr, std::size_t size, std::size_t nmemb,
     return n;
 }
 
-std::string CheckVersionHttp(const std::string& body) {
+std::string CheckVersionHttp(const std::string& body, lva::tr::NetworkRequest& access) {
+    if (access.Cancelled()) return {};
     CURL* curl = curl_easy_init();
     if (curl == nullptr) {
         throw std::runtime_error("curl_easy_init failed");
     }
+    access.Configure(curl);
     std::string response;
     struct curl_slist* hdrs = nullptr;
     hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
@@ -97,83 +100,72 @@ std::string CheckVersionHttp(const std::string& body) {
 
 }  // namespace
 
-void UpdateEntity::ScheduleCheck() {
-    bool expected = false;
-    if (!worker_busy_.compare_exchange_strong(expected, true)) {
-        LVA_LOGW(kTag, "OTA check already running");
-        return;
+void UpdateEntity::ScheduleCheck(lva::tr::RequestSource source) {
+    if (check_.valid() || installing_) return;
+    if (source != lva::tr::RequestSource::Explicit && !state_.network_policy.Allowed()) return;
+    const auto dev = lva::tr::ReadDeviceInfo();
+    if (dev.model_id.empty() || dev.serial_number().empty()) return;
+    current_version_ = state_.version;
+    const std::string body = nlohmann::json{
+        {"modelId", dev.model_id}, {"version", current_version_},
+        {"sno", dev.serial_number()}}.dump();
+    check_source_ = source;
+    cancel_.store(false, std::memory_order_release);
+    auto access = std::make_shared<lva::tr::NetworkRequest>(state_.network_policy, source, &cancel_);
+    LVA_LOGI(kTag, "%s OTA check: %s (model/version/serial)",
+             source == lva::tr::RequestSource::Explicit ? "explicit" : "automatic", kCheckVersionUrl);
+    try {
+        check_ = std::async(std::launch::async, [access, body] {
+            return CheckVersionHttp(body, *access);
+        });
+    } catch (const std::exception& e) {
+        LVA_LOGW(kTag, "could not start OTA check: %s", e.what());
     }
-    if (worker_.joinable()) worker_.join();
-    worker_ = std::thread([this] {
-        try {
-            CheckOnce();
-        } catch (const std::exception& e) {
-            LVA_LOGW(kTag, "check_version failed: %s", e.what());
-        }
-        worker_busy_.store(false, std::memory_order_release);
-    });
 }
 
 void UpdateEntity::ScheduleInstall() {
-    if (state_.supervisor == nullptr) {
-        LVA_LOGW(kTag, "no supervisor — can't install");
-        return;
-    }
+    if (!state_.supervisor || check_.valid() || installing_) return;
     if (download_url_.empty() || expected_md5_.empty()) {
-        LVA_LOGW(kTag, "no cached release info — running CHECK first");
-        ScheduleCheck();
+        ScheduleCheck(lva::tr::RequestSource::Explicit);
         return;
     }
-
-    bool expected = false;
-    if (!worker_busy_.compare_exchange_strong(expected, true)) {
-        LVA_LOGW(kTag, "OTA worker already busy");
-        return;
-    }
-    if (worker_.joinable()) worker_.join();
-    worker_ = std::thread([this] {
-        try {
-            InstallOnce();
-        } catch (const std::exception& e) {
-            LVA_LOGW(kTag, "install failed: %s", e.what());
-            in_progress_     = false;
-            release_summary_ = std::string("Install failed: ") + e.what();
-            BroadcastState();
-        }
-        worker_busy_.store(false, std::memory_order_release);
-    });
+    lva::tr::OtaRelease release;
+    release.url = download_url_;
+    release.version = latest_version_;
+    release.expected_md5 = expected_md5_;
+    release.source = lva::tr::RequestSource::Explicit;
+    installing_ = !state_.supervisor->StartOtaUpdateAsync(release).empty();
+    in_progress_ = installing_;
+    BroadcastState();
 }
 
-void UpdateEntity::CheckOnce() {
+void UpdateEntity::Poll() {
+    if (check_.valid() && check_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        try {
+            const auto body = check_.get();
+            if (!body.empty()) ApplyCheckResult(body);
+        } catch (const std::exception& e) {
+            LVA_LOGW(kTag, "check_version failed: %s", e.what());
+        }
+    }
+    if (installing_) {
+        const bool running = state_.supervisor->IsOtaRunning();
+        const auto status = state_.supervisor->GetOtaState();
+        const bool changed = progress_ != status.progress || release_summary_ != status.message || !running;
+        has_progress_ = true;
+        progress_ = status.progress;
+        release_summary_ = status.message;
+        in_progress_ = running;
+        if (!running) {
+            installing_ = false;
+            if (status.status != "failed") current_version_ = latest_version_;
+        }
+        if (changed) BroadcastState();
+    }
+}
+
+void UpdateEntity::ApplyCheckResult(const std::string& body) {
     using nlohmann::json;
-    const lva::tr::DeviceInfo dev = lva::tr::ReadDeviceInfo();
-    if (dev.model_id.empty() || dev.serial_number().empty()) {
-        LVA_LOGW(kTag, "device.json missing modelID/macAddress");
-        return;
-    }
-    current_version_ = state_.version;
-
-    json req = {
-        {"modelId", dev.model_id},
-        {"version", current_version_},
-        {"sno",     dev.serial_number()},
-    };
-    const std::string req_body = req.dump();
-    LVA_LOGI(kTag, "checking OTA version model=%s ver=%s sno=%s",
-             dev.model_id.c_str(), current_version_.c_str(),
-             dev.serial_number().c_str());
-    LVA_LOGD(kTag, "POST %s body=%s",
-             kCheckVersionUrl, req_body.c_str());
-
-    std::string body;
-    try {
-        body = CheckVersionHttp(req_body);
-    } catch (const std::exception& e) {
-        LVA_LOGW(kTag, "OTA check HTTP failed: %s", e.what());
-        return;
-    }
-    LVA_LOGD(kTag, "response: %s", body.c_str());
-
     json resp = json::parse(body, nullptr, false);
     if (resp.is_discarded() || !resp.is_object()) {
         LVA_LOGW(kTag, "OTA response not valid JSON");
@@ -213,49 +205,6 @@ void UpdateEntity::CheckOnce() {
     LVA_LOGI(kTag, "current=%s latest=%s has_update=%d",
              current_version_.c_str(), latest_version_.c_str(),
              has_update ? 1 : 0);
-    BroadcastState();
-}
-
-void UpdateEntity::InstallOnce() {
-    in_progress_     = true;
-    has_progress_    = true;
-    progress_        = 0.0f;
-    release_summary_ = "Downloading firmware...";
-    BroadcastState();
-
-    lva::tr::OtaRelease release;
-    release.url          = download_url_;
-    release.version      = latest_version_;
-    release.expected_md5 = expected_md5_;
-
-    const std::string ota_id =
-        state_.supervisor->StartOtaUpdateAsync(release);
-    if (ota_id.empty()) {
-        in_progress_     = false;
-        release_summary_ = "OTA already in progress";
-        BroadcastState();
-        return;
-    }
-
-    int last_pct = -1;
-    while (state_.supervisor->IsOtaRunning()) {
-        const auto s = state_.supervisor->GetOtaState();
-        if (s.progress != last_pct) {
-            progress_        = static_cast<float>(s.progress);
-            release_summary_ = s.message;
-            BroadcastState();
-            last_pct = s.progress;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    }
-
-    const auto final_state = state_.supervisor->GetOtaState();
-    progress_        = 100.0f;
-    in_progress_     = false;
-    release_summary_ = final_state.message;
-    if (final_state.status != "failed") {
-        current_version_ = latest_version_;
-    }
     BroadcastState();
 }
 

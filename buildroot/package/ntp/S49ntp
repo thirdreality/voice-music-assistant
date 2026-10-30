@@ -9,10 +9,42 @@ NAME=ntpd
 
 case "$1" in
   start)
-	/etc/init.d/ntpdate.sh &
+	(
+            if [ -r /usr/share/thirdreality/script/network-policy.sh ]; then
+                exec 6>/tmp/ha_initial_ntp_launcher.lock
+                flock -n 6 || exit 0
+                . /usr/share/thirdreality/script/network-policy.sh
+                while :; do
+                    /etc/init.d/ntpdate.sh
+                    ntp_result=$?
+                    [ ! -f /tmp/ha_initial_ntp_done ] || exit 0
+                    # A child killed before installing its EXIT trap may need
+                    # recovery, but Wi-Fi readiness is never optional.
+                    if [ "$ntp_result" -ne 0 ] && wifi_local_ready &&
+                       [ -x /usr/share/thirdreality/script/ntp-apply ]; then
+                        (
+                            flock -n 7 || exit 0
+                            [ ! -f /tmp/ha_initial_ntp_done ] || exit 0
+                            wifi_local_ready || exit 0
+                            touch /tmp/ha_initial_ntp_done
+                            /usr/share/thirdreality/script/ntp-apply
+                        ) 7>/tmp/ha_initial_ntp_phase.lock
+                    fi
+                    [ ! -f /tmp/ha_initial_ntp_done ] || exit 0
+                    sleep 1
+                done
+            else
+                /etc/init.d/ntpdate.sh
+            fi
+        ) &
 	;;
   stop) echo -n "Stopping $DESC: $NAME"
-	start-stop-daemon -K -q -n $NAME
+        if [ -r /usr/share/thirdreality/script/network-policy.sh ]; then
+            . /usr/share/thirdreality/script/network-policy.sh
+            stop_ntpd
+        else
+            start-stop-daemon -K -q -n "$NAME"
+        fi
 	echo "."
 	;;
   reload|force-reload) echo -n "Reloading $DESC configuration..."

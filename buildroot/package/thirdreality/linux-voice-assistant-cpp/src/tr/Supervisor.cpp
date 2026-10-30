@@ -48,7 +48,7 @@ std::string MakeOtaId() {
 
 }  // namespace
 
-Supervisor::Supervisor() {
+Supervisor::Supervisor(const NetworkPolicy& policy) : policy_(policy) {
     state_.status  = "idle";
     state_.message = "No OTA in progress";
     CleanupStaleArtifacts();
@@ -65,7 +65,7 @@ OtaState Supervisor::GetOtaState() const {
 }
 
 bool Supervisor::IsOtaRunning() const {
-    return ota_running_.load(std::memory_order_relaxed);
+    return ota_running_.load(std::memory_order_acquire);
 }
 
 void Supervisor::UpdateState(const OtaState& s) {
@@ -140,7 +140,7 @@ void Supervisor::OtaWorker(std::string ota_id, OtaRelease release) {
     LVA_LOGI(kTag, "OTA url=%s", release.url.c_str());
     try {
         ota_client_.DownloadFirmware(
-            release,
+            release, policy_,
             [this](float pct, bool has_progress) {
                 std::lock_guard<std::mutex> lk(state_mtx_);
                 state_.status   = "download";

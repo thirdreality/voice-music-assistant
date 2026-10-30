@@ -94,15 +94,11 @@ int ledShow(int num, int times, int speed,
 		new_animations = vector<string>({ "/usr/local/Alexa/animation/single/mics-off_end.animation" });
 */
 	} else if (style >= 16 && style <= 21) { // show_listening()
-		if ((access("/tmp/net_disconnected", 0)) != -1) {
-			new_animations[0] = "/usr/local/Alexa/animation/single/error.animation";
-		} else {
-			new_animations[0] = "/usr/local/Alexa/animation/single/active-waking.animation";
-		}
+		new_animations[0] = "/usr/local/Alexa/animation/single/active-waking.animation";
 	} else if (style == 32) { // printDoNotDisturbScreen()
 		new_animations[0] = "/usr/local/Alexa/animation/single/do_not_disturb.animation";
 	} else if (style == 33) { // printWifiDisconnectedError()
-		new_animations[0] = "/usr/local/Alexa/animation/single/error.animation";
+		goto out; // Network state no longer changes the LED ring.
 	} else if (style == 34) { // printNotificationIncoming()
 		new_animations[0] = "/usr/local/Alexa/animation/single/ntf_incoming.animation";
 	} else if (style == 35) { // printAlertLed()

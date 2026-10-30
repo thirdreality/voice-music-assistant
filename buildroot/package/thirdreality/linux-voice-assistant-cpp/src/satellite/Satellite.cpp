@@ -88,7 +88,10 @@ Satellite::Satellite(lva::state::ServerState& state,
     : state_(state), mic_ring_(mic_ring), engine_(engine),
       announce_player_(announce_player) {}
 
-Satellite::~Satellite() = default;
+Satellite::~Satellite() {
+    wake_configuration_cancel_.store(true, std::memory_order_release);
+    if (wake_configuration_.valid()) wake_configuration_.wait();
+}
 
 void Satellite::OnWakeDetected(const std::string& model_id, float prob) {
     const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -695,6 +698,7 @@ void Satellite::OnVoiceEvent(
 }
 
 void Satellite::OnLoopTick() {
+    PollWakeConfiguration();
     if (pending_wake_.load(std::memory_order_acquire)) {
         const PendingWake snap = pending_wake_data_;
         pending_wake_.store(false, std::memory_order_relaxed);
@@ -772,6 +776,9 @@ void Satellite::ResetHaPipeline(const char* reason) {
 }
 
 void Satellite::OnDisconnected() {
+    wake_configuration_cancel_ = true;
+    next_wake_configuration_.reset();
+    deferred_configuration_request_.reset();
     LVA_LOGI(kTag, "HA disconnected — resetting pipeline state");
     StopAudioStreaming();
     DisarmHaWatchdog();
@@ -1008,19 +1015,123 @@ void Satellite::CancelLocalTurn() {
     conversation_id_.clear();
 }
 
-std::filesystem::path Satellite::ResolveWakeWordConfig(
-    const std::string& id) {
-    const auto local_path = state_.wakeword_dir / (id + ".json");
-    if (std::filesystem::exists(local_path)) {
-        return local_path;
+void Satellite::PollWakeConfiguration() {
+    if (wake_configuration_.valid()) {
+        if (state_.network_policy.Generation() != wake_configuration_generation_)
+            wake_configuration_cancel_.store(true, std::memory_order_release);
+        if (wake_configuration_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+        try {
+            auto result = wake_configuration_.get();
+            if (!wake_configuration_cancel_) ApplyWakeConfiguration(std::move(result));
+        } catch (const std::exception& e) {
+            state_.NotifyHa("wake_model", "Wake word model", e.what());
+        }
+    }
+    if (next_wake_configuration_) {
+        auto ids = std::move(*next_wake_configuration_);
+        next_wake_configuration_.reset();
+        const auto external = external_wake_words_;
+        const auto dir = state_.wakeword_dir;
+        wake_configuration_cancel_ = false;
+        wake_configuration_generation_ = state_.network_policy.Generation();
+        try {
+            wake_configuration_ = std::async(std::launch::async,
+                [this, ids = std::move(ids), external, dir] {
+                    WakeConfigurationResult result;
+                    for (const auto& id : ids) {
+                        if (wake_configuration_cancel_) break;
+                        // IDs are filenames, never paths received from HA.
+                        if (id.empty() || id == "." || id == ".." ||
+                            id.find('/') != std::string::npos || id.find('\\') != std::string::npos) {
+                            ++result.failures; continue;
+                        }
+                        auto path = dir / (id + ".json");
+                        if (!std::filesystem::exists(path)) {
+                            const auto it = external.find(id);
+                            path = it == external.end() ? std::filesystem::path{} :
+                                lva::audio::DownloadExternalWakeWord(it->second, dir,
+                                    state_.network_policy, &wake_configuration_cancel_);
+                        }
+                        if (path.empty()) { ++result.failures; continue; }
+                        if (lva::audio::ReadWakeWordType(dir, id) == "open") {
+                            auto model = lva::audio::OpenWakeWord::FromConfig(path);
+                            if (model && model->Ok()) result.open.push_back(std::move(model));
+                            else ++result.failures;
+                        } else {
+                            auto model = lva::audio::MicroWakeWord::FromConfig(path);
+                            if (model && model->Ok()) result.micro.push_back(std::move(model));
+                            else ++result.failures;
+                        }
+                    }
+                    return result;
+                });
+        } catch (const std::exception& e) {
+            state_.NotifyHa("wake_model", "Wake word model", e.what());
+        }
+    } else if (deferred_configuration_request_) {
+        auto req = std::move(deferred_configuration_request_);
+        HandleMessage(lva::proto::kIdVoiceAssistantConfigurationRequest, *req);
+    }
+}
+
+void Satellite::ApplyWakeConfiguration(WakeConfigurationResult result) {
+    auto& new_micro = result.micro;
+    auto& new_open = result.open;
+    const int load_failures = result.failures;
+    if (!new_micro.empty() || !new_open.empty()) {
+        std::size_t slot = 0;
+        auto apply_default = [&](float cutoff) {
+            if (slot == 0 &&
+                !state_.preferences.wake_word_1_sensitivity.has_value()) {
+                state_.preferences.wake_word_1_sensitivity = cutoff;
+            } else if (slot == 1 &&
+                !state_.preferences.wake_word_2_sensitivity.has_value()) {
+                state_.preferences.wake_word_2_sensitivity = cutoff;
+            }
+            ++slot;
+        };
+        for (const auto& m : new_micro) {
+            if (slot >= 2) break;
+            apply_default(m->config().probability_cutoff);
+        }
+        for (const auto& m : new_open) {
+            if (slot >= 2) break;
+            apply_default(m->config().probability_cutoff);
+        }
+
+        // Persist loaded ids in slot order (micro, then open), before
+        // the std::move below empties the vectors.
+        std::vector<std::optional<std::string>> selected;
+        selected.reserve(new_micro.size() + new_open.size());
+        for (const auto& m : new_micro) {
+            selected.emplace_back(m->config().id);
+        }
+        for (const auto& m : new_open) {
+            selected.emplace_back(m->config().id);
+        }
+        state_.preferences.active_wake_words = std::move(selected);
+
+        engine_.SetActiveModels(std::move(new_micro));
+        engine_.SetActiveOpenModels(std::move(new_open));
+        state_.SavePreferences();
+        if (state_.broadcast) {
+            const auto sink = [&](std::uint32_t id,
+                                  const ::google::protobuf::MessageLite& m) {
+                state_.broadcast(id, m);
+            };
+            for (const auto& entity : state_.entities) {
+                entity->OnSubscribeStates(sink);
+            }
+        }
+    } else {
+        LVA_LOGW(kTag, "SetConfiguration: no valid models "
+                       "(%d failures); keeping current set",
+                 load_failures);
     }
 
-    const auto it = external_wake_words_.find(id);
-    if (it == external_wake_words_.end()) {
-        return {};
-    }
-    return lva::audio::DownloadExternalWakeWord(it->second,
-                                                state_.wakeword_dir);
+    if (load_failures) state_.NotifyHa("wake_model", "Wake word model",
+        "Some wake word models could not be loaded. When background internet is disabled, "
+        "uncached models must be available from a local server without a public redirect.");
 }
 
 bool Satellite::HandleMessage(std::uint32_t msg_type_id,
@@ -1029,6 +1140,13 @@ bool Satellite::HandleMessage(std::uint32_t msg_type_id,
 
     switch (msg_type_id) {
         case kIdVoiceAssistantConfigurationRequest: {
+            // Answer after the pending async model change, so HA's read
+            // following SET does not immediately overwrite its new choice.
+            if (wake_configuration_.valid() || next_wake_configuration_) {
+                deferred_configuration_request_.reset(msg.New());
+                deferred_configuration_request_->CheckTypeAndMergeFrom(msg);
+                return true;
+            }
             const auto& cfg_req =
                 static_cast<const ::VoiceAssistantConfigurationRequest&>(msg);
 
@@ -1102,105 +1220,11 @@ bool Satellite::HandleMessage(std::uint32_t msg_type_id,
         }
 
         case kIdVoiceAssistantSetConfiguration: {
-            const auto& set_req =
-                static_cast<const ::VoiceAssistantSetConfiguration&>(msg);
-            std::string ids;
-            for (int i = 0; i < set_req.active_wake_words_size(); ++i) {
-                if (i > 0) ids += ",";
-                ids += set_req.active_wake_words(i);
-            }
-            LVA_LOGI(kTag, "SetConfiguration: active=[%s]", ids.c_str());
-
-            std::vector<std::shared_ptr<lva::audio::MicroWakeWord>> new_micro;
-            std::vector<std::shared_ptr<lva::audio::OpenWakeWord>>  new_open;
-            int load_failures = 0;
-            for (int i = 0; i < set_req.active_wake_words_size(); ++i) {
-                const auto& ww_id = set_req.active_wake_words(i);
-                const auto json_path = ResolveWakeWordConfig(ww_id);
-                if (json_path.empty()) {
-                    ++load_failures;
-                    LVA_LOGW(kTag, "SetConfiguration: cannot resolve '%s'",
-                             ww_id.c_str());
-                    continue;
-                }
-                const std::string type =
-                    lva::audio::ReadWakeWordType(json_path.parent_path(),
-                                                 ww_id);
-
-                bool loaded = false;
-                if (type == "open") {
-                    auto model = lva::audio::OpenWakeWord::FromConfig(json_path);
-                    if (model && model->Ok()) {
-                        new_open.push_back(std::move(model));
-                        loaded = true;
-                    }
-                } else {
-                    // "" or "micro" or anything else → try micro.
-                    auto model = lva::audio::MicroWakeWord::FromConfig(json_path);
-                    if (model && model->Ok()) {
-                        new_micro.push_back(std::move(model));
-                        loaded = true;
-                    }
-                }
-                if (!loaded) {
-                    ++load_failures;
-                    LVA_LOGW(kTag, "SetConfiguration: failed to load '%s'"
-                                   " (type=%s)",
-                             ww_id.c_str(),
-                             type.empty() ? "?" : type.c_str());
-                }
-            }
-
-            if (!new_micro.empty() || !new_open.empty()) {
-                std::size_t slot = 0;
-                auto apply_default = [&](float cutoff) {
-                    if (slot == 0 &&
-                        !state_.preferences.wake_word_1_sensitivity.has_value()) {
-                        state_.preferences.wake_word_1_sensitivity = cutoff;
-                    } else if (slot == 1 &&
-                        !state_.preferences.wake_word_2_sensitivity.has_value()) {
-                        state_.preferences.wake_word_2_sensitivity = cutoff;
-                    }
-                    ++slot;
-                };
-                for (const auto& m : new_micro) {
-                    if (slot >= 2) break;
-                    apply_default(m->config().probability_cutoff);
-                }
-                for (const auto& m : new_open) {
-                    if (slot >= 2) break;
-                    apply_default(m->config().probability_cutoff);
-                }
-
-                // Persist loaded ids in slot order (micro, then open), before
-                // the std::move below empties the vectors.
-                std::vector<std::optional<std::string>> selected;
-                selected.reserve(new_micro.size() + new_open.size());
-                for (const auto& m : new_micro) {
-                    selected.emplace_back(m->config().id);
-                }
-                for (const auto& m : new_open) {
-                    selected.emplace_back(m->config().id);
-                }
-                state_.preferences.active_wake_words = std::move(selected);
-
-                engine_.SetActiveModels(std::move(new_micro));
-                engine_.SetActiveOpenModels(std::move(new_open));
-                state_.SavePreferences();
-                if (state_.broadcast) {
-                    const auto sink = [&](std::uint32_t id,
-                                          const ::google::protobuf::MessageLite& m) {
-                        state_.broadcast(id, m);
-                    };
-                    for (const auto& entity : state_.entities) {
-                        entity->OnSubscribeStates(sink);
-                    }
-                }
-            } else {
-                LVA_LOGW(kTag, "SetConfiguration: no valid models "
-                               "(%d failures); keeping current set",
-                         load_failures);
-            }
+            const auto& req = static_cast<const ::VoiceAssistantSetConfiguration&>(msg);
+            next_wake_configuration_ = std::vector<std::string>(
+                req.active_wake_words().begin(), req.active_wake_words().end());
+            if (wake_configuration_.valid()) wake_configuration_cancel_ = true;
+            PollWakeConfiguration();
             return true;
         }
 

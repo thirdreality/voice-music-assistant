@@ -5,6 +5,13 @@
 [ -z "$1" ] && echo "Error: should be called from udhcpc" && exit 1
 
 RESOLV_CONF="/etc/resolv.conf"
+# Serialize lease DNS updates and speaker DNS repair. fd 8 is inherited
+# by hooks, so release it before invoking the hook chain.
+if [ -r /usr/share/thirdreality/script/network-policy.sh ]; then
+    exec 8>/tmp/ha_dns.lock
+    flock -x 8
+    SPEAKER_DNS_LOCKED=1
+fi
 [ -e $RESOLV_CONF ] || touch $RESOLV_CONF
 [ -n "$broadcast" ] && BROADCAST="broadcast $broadcast"
 [ -n "$subnet" ] && NETMASK="netmask $subnet"
@@ -96,6 +103,20 @@ case "$1" in
 		;;
 esac
 
+if [ "${SPEAKER_DNS_LOCKED:-0}" = 1 ] && [ "$interface" = wlan0 ]; then
+    case "$1" in
+        bound|renew)
+            : > /tmp/ha_dhcp_dns.tmp
+            for i in $dns; do printf 'nameserver %s\n' "$i" >> /tmp/ha_dhcp_dns.tmp; done
+            mv /tmp/ha_dhcp_dns.tmp /tmp/ha_dhcp_dns
+            ;;
+        deconfig) rm -f /tmp/ha_dhcp_dns ;;
+    esac
+fi
+if [ "${SPEAKER_DNS_LOCKED:-0}" = 1 ]; then
+    flock -u 8
+    exec 8>&-
+fi
 HOOK_DIR="$0.d"
 for hook in "${HOOK_DIR}/"*; do
     [ -f "${hook}" -a -x "${hook}" ] || continue

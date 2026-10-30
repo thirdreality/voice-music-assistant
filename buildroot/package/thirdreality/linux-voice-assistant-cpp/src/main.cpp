@@ -44,6 +44,7 @@
 #include "entities/MediaPlayerEntity.h"
 #include "entities/MuteSwitchEntity.h"
 #include "entities/NumberEntity.h"
+#include "entities/NetworkSwitchEntity.h"
 #include "entities/SelectEntity.h"
 #include "entities/SendspinSwitchEntity.h"
 #include "entities/ThinkingSoundEntity.h"
@@ -495,11 +496,13 @@ int main(int argc, char** argv) {
                 .path   = kSttModelPath,
                 .size   = kSttModelSize,
                 .sha256 = kSttModelSha256,
-            });
+            }, state.network_policy);
     }
-    // Fetch the model on every start until it is installed, so local speech
-    // is ready when the user picks it.
-    if (stt_model_downloader) stt_model_downloader->Start();
+    // Restoring a preference is an automatic request. HA-only users never
+    // prefetch a speech model; a new explicit selection can download once.
+    if (wanted_backend == "local" && stt_model_downloader) {
+        stt_model_downloader->Start();
+    }
     const auto stt_model_ready = [&]() {
         return stt_model_downloader ? stt_model_downloader->Installed()
                                     : std::filesystem::exists(cli.stt_model);
@@ -872,7 +875,7 @@ int main(int argc, char** argv) {
                     // Keep the HA backend until the model is in place. A
                     // failed download is retried; if it fails again the
                     // main loop sets the select back to Home Assistant.
-                    if (stt_model_downloader) stt_model_downloader->Start();
+                    if (stt_model_downloader) stt_model_downloader->Start(lva::tr::RequestSource::Explicit);
                     state.NotifyHa(kVoiceNotifyId, kVoiceNotifyTitle,
                              DownloadNotice());
                     return;
@@ -947,6 +950,10 @@ int main(int argc, char** argv) {
         update_entity_ptr = upd.get();
         state.entities.push_back(std::move(upd));
     }
+
+    auto network_switch = std::make_unique<lva::entities::NetworkSwitchEntity>(next_key++, state);
+    auto* network_switch_ptr = network_switch.get();
+    state.entities.push_back(std::move(network_switch));
 
     LVA_LOGI(kTag, "registered %zu entities", state.entities.size());
 
@@ -1237,7 +1244,7 @@ int main(int argc, char** argv) {
     auto sound_watcher = std::make_unique<lva::tr::SoundConfWatcher>(
         state, cli.preferences_file);
 
-    auto supervisor = std::make_unique<lva::tr::Supervisor>();
+    auto supervisor = std::make_unique<lva::tr::Supervisor>(state.network_policy);
     state.supervisor = supervisor.get();
     auto supervisor_http =
         std::make_unique<lva::tr::SupervisorHttpServer>(*supervisor);
@@ -1433,17 +1440,24 @@ int main(int argc, char** argv) {
             server.AddAuxFd(satellite_tick_fd,
                             [&satellite, &mic_mute_gpio, &sound_watcher,
                              update_entity_ptr, satellite_tick_fd,
-                             &stt_model_downloader, &restart_for_backend,
+                             &stt_model_downloader, &restart_for_backend, network_switch_ptr,
                              &use_local_voice, &state, &cli, &server,
                              backend_select_ptr]() {
                 std::uint64_t expirations = 0;
                 while (::read(satellite_tick_fd,
                               &expirations, sizeof(expirations)) > 0) {
                 }
+                if (!state.network_policy.Allowed() && stt_model_downloader)
+                    stt_model_downloader->RequestCancelAutomatic();
                 satellite->OnLoopTick();
+                server.PollTimeSync();
                 mic_mute_gpio->Poll();
                 sound_watcher->Poll();
                 if (update_entity_ptr) update_entity_ptr->OnPeriodicTick();
+                network_switch_ptr->OnPeriodicTick(
+                    (stt_model_downloader && stt_model_downloader->AutomaticBusy()) ||
+                    (update_entity_ptr && update_entity_ptr->AutomaticBusy()) ||
+                    satellite->WakeConfigurationBusy());
 
                 const bool want_local =
                     state.preferences.voice_backend.value_or(
@@ -1457,6 +1471,13 @@ int main(int argc, char** argv) {
                                        state.name + ": the speech model is "
                                        "ready. Switching to local speech.");
                         restart_for_backend = true;
+                    } else if (st.phase == Phase::kMissing && !state.network_policy.Allowed()) {
+                        state.PersistVoiceBackend("ha");
+                        if (state.broadcast) backend_select_ptr->OnSubscribeStates(state.broadcast);
+                        state.NotifyHa(kVoiceNotifyId, kVoiceNotifyTitle,
+                            state.name + ": automatic speech model download is disabled or was cancelled. "
+                            "Speech Processing is set back to Home Assistant; select 3R Speaker "
+                            "to explicitly download the missing model.");
                     } else if (st.phase == Phase::kFailed) {
                         // Local speech cannot work; show HA as the backend
                         // again instead of a choice that is not in effect.

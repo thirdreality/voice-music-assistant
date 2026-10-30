@@ -22,7 +22,7 @@ struct OtaState {
 
 class Supervisor {
    public:
-    Supervisor();
+    explicit Supervisor(const NetworkPolicy& policy);
     ~Supervisor();
 
     Supervisor(const Supervisor&)            = delete;
@@ -47,6 +47,7 @@ class Supervisor {
                     const std::string& error);
     void CleanupStaleArtifacts();
 
+    const NetworkPolicy&      policy_;
     OtaClient                 ota_client_;
     mutable std::mutex        state_mtx_;
     OtaState                  state_;
