@@ -1003,6 +1003,18 @@ int main(int argc, char** argv) {
                             announce_player->DrainEvents();
                         });
     }
+    if (music_player->DrainFd() >= 0) {
+        server.AddAuxFd(music_player->DrainFd(),
+                        [&music_player] {
+                            music_player->PollDrain();
+                        });
+    }
+    if (announce_player->DrainFd() >= 0) {
+        server.AddAuxFd(announce_player->DrainFd(),
+                        [&announce_player] {
+                            announce_player->PollDrain();
+                        });
+    }
 
     if (!audio_capture->Start()) {
         LVA_LOGW(kTag, "audio capture failed to start; mic-using "
@@ -1442,6 +1454,7 @@ int main(int argc, char** argv) {
                              update_entity_ptr, satellite_tick_fd,
                              &stt_model_downloader, &restart_for_backend, network_switch_ptr,
                              &use_local_voice, &state, &cli, &server,
+                             &music_player, &announce_player,
                              backend_select_ptr]() {
                 std::uint64_t expirations = 0;
                 while (::read(satellite_tick_fd,
@@ -1449,6 +1462,8 @@ int main(int argc, char** argv) {
                 }
                 if (!state.network_policy.Allowed() && stt_model_downloader)
                     stt_model_downloader->RequestCancelAutomatic();
+                music_player->PollDrain();
+                announce_player->PollDrain();
                 satellite->OnLoopTick();
                 server.PollTimeSync();
                 mic_mute_gpio->Poll();
