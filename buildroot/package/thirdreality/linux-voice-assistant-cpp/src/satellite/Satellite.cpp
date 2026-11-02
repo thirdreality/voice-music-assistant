@@ -50,6 +50,8 @@ constexpr int kEvtSttVadEnd      = 12;
 constexpr int kEvtIntentProgress = 100;
 constexpr int kEvtTtsEnd         = 8;
 
+constexpr const char* kDuplicateWakeUpCode = "duplicate_wake_up_detected";
+
 constexpr const char* kThinkingSoundPath =
     "/usr/share/thirdreality/sounds/processing.wav";
 
@@ -612,16 +614,25 @@ void Satellite::OnVoiceEvent(
                 if      (k == "code")    code    = v;
                 else if (k == "message") message = v;
             }
-            LVA_LOGW(kTag, "voice ERROR event: code=%s message=%s",
-                     code.empty()    ? "(none)" : code.c_str(),
-                     message.empty() ? "(none)" : message.c_str());
-            lva::tr::Show(lva::tr::LedState::Error);
+            const bool run_taken_by_other = (code == kDuplicateWakeUpCode);
+            if (run_taken_by_other) {
+                LVA_LOGI(kTag,
+                         "run taken by another satellite; ending turn quietly");
+            } else {
+                LVA_LOGW(kTag, "voice ERROR event: code=%s message=%s",
+                         code.empty()    ? "(none)" : code.c_str(),
+                         message.empty() ? "(none)" : message.c_str());
+                lva::tr::Show(lva::tr::LedState::Error);
+            }
             StopAudioStreaming();
             DisarmHaWatchdog();
             pipeline_active_       = false;
             continue_conversation_ = false;
             wake_sound_pending_    = false;
             Unduck();
+            if (run_taken_by_other) {
+                lva::tr::Show(lva::tr::LedState::Idle);
+            }
             break;
         }
 
