@@ -277,11 +277,12 @@ void Satellite::StartPipeline(const std::string& wake_word_phrase) {
         }
     }
     if (timer_ringing_) {
-        LVA_LOGI(kTag, "wake during timer ring — stopping ring");
+        // Silencing the timer and opening the turn are one user action: the
+        // wake word that stops the ring is the same one that starts listening.
+        // Stopping the ring and returning would make the user say the wake
+        // word twice.
+        LVA_LOGI(kTag, "wake during timer ring — stopping ring and listening");
         StopTimerRing();
-        refractory_until_ns_.store(now_ns + 2'000'000'000LL,
-                                   std::memory_order_relaxed);
-        return;
     }
     LVA_LOGI(kTag, "starting voice pipeline (wake='%s')",
              wake_word_phrase.c_str());
