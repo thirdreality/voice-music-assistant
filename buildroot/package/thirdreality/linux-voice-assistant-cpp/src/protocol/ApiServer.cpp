@@ -40,6 +40,29 @@ bool SetNonBlocking(int fd) {
     return true;
 }
 
+bool SetTcpKeepAlive(int fd) {
+    const struct {
+        int level;
+        int option;
+        int value;
+        const char* name;
+    } options[] = {
+        {SOL_SOCKET, SO_KEEPALIVE, 1, "SO_KEEPALIVE"},
+        {IPPROTO_TCP, TCP_KEEPIDLE, 30, "TCP_KEEPIDLE"},
+        {IPPROTO_TCP, TCP_KEEPINTVL, 10, "TCP_KEEPINTVL"},
+        {IPPROTO_TCP, TCP_KEEPCNT, 3, "TCP_KEEPCNT"},
+    };
+    for (const auto& option : options) {
+        if (::setsockopt(fd, option.level, option.option, &option.value,
+                         sizeof(option.value)) < 0) {
+            LVA_LOGE(kTag, "setsockopt(%s, fd=%d) failed: %s", option.name,
+                     fd, std::strerror(errno));
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 ApiServer::ApiServer(lva::state::ServerState& state, Options options)
@@ -208,7 +231,7 @@ bool ApiServer::Start() {
         bool sent = false;
         for (auto& [fd, conn] : connections_) {
             (void)fd;
-            if (conn && conn->authenticated() &&
+            if (conn && !conn->closed() && conn->authenticated() &&
                 (!voice || conn->voice_subscribed())) {
                 sent = conn->SendSerializedMessage(msg_type_id, msg) || sent;
             }
@@ -218,7 +241,7 @@ bool ApiServer::Start() {
     state_.has_voice_client = [this] {
         for (const auto& [fd, conn] : connections_) {
             (void)fd;
-            if (conn && conn->authenticated() &&
+            if (conn && !conn->closed() && conn->authenticated() &&
                 conn->voice_subscribed()) {
                 return true;
             }
@@ -245,6 +268,10 @@ bool ApiServer::AcceptOne() {
     if (::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) < 0) {
         LVA_LOGW(kTag, "setsockopt(TCP_NODELAY) failed: %s", std::strerror(errno));
     }
+    if (!SetTcpKeepAlive(fd)) {
+        ::close(fd);
+        return true;
+    }
 
     char ip_str[INET6_ADDRSTRLEN] = {0};
     unsigned port = 0;
@@ -266,7 +293,7 @@ bool ApiServer::AcceptOne() {
     char peer_label[80];
     std::snprintf(peer_label, sizeof(peer_label), "%s:%u", ip_str, port);
 
-    auto conn = std::make_unique<Connection>(fd, state_,
+    auto conn = std::make_unique<Connection>(fd, epoll_fd_, state_,
                                              std::string(peer_label));
 
     epoll_event ev{};
@@ -338,23 +365,33 @@ int ApiServer::Run() {
             Connection& conn = *it->second;
 
             const std::uint32_t mask = events[i].events;
-            bool keep_alive = true;
-            if (mask & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
+            bool keep_alive = !conn.closed();
+            if (keep_alive && (mask & (EPOLLIN | EPOLLHUP | EPOLLRDHUP))) {
+                // OnReadable consumes one chunk. HUP/RDHUP remain level
+                // triggered, so revisit until recv() reaches EOF, including
+                // final messages spanning more than one read chunk.
+                keep_alive = conn.OnReadable();
+            }
+            if (mask & EPOLLERR) {
                 keep_alive = false;
-            } else {
-                if (mask & EPOLLIN) {
-                    keep_alive = conn.OnReadable();
-                }
-                if (keep_alive && (mask & EPOLLOUT)) {
-                    keep_alive = conn.OnWritable();
-                }
-                if (keep_alive && conn.closed()) {
-                    keep_alive = false;
-                }
+            }
+            if (keep_alive && (mask & EPOLLOUT)) {
+                keep_alive = conn.OnWritable();
+            }
+            if (conn.closed()) {
+                keep_alive = false;
             }
             if (!keep_alive) {
                 EraseConnection(fd);
             }
+        }
+        // Broadcast/aux callbacks may fail a send without propagating its
+        // return value. Reap those connections before blocking in epoll_wait.
+        for (auto it = connections_.begin(); it != connections_.end();) {
+            const int fd = it->first;
+            const bool closed = it->second->closed();
+            ++it;
+            if (closed) EraseConnection(fd);
         }
     }
 

@@ -22,7 +22,7 @@ namespace lva::proto {
 
 class Connection {
    public:
-    Connection(int fd,
+    Connection(int fd, int epoll_fd,
                lva::state::ServerState& state,
                std::string peer_label);
     ~Connection();
@@ -64,8 +64,12 @@ class Connection {
     bool ProcessBuffer();
     bool DispatchFrame(const InboundFrame& frame);
     bool SendRaw(std::span<const std::uint8_t> bytes);
+    bool QueueWrite(std::span<const std::uint8_t> bytes);
+    bool SetWriteInterest(bool enabled);
+    bool FailWrite();
 
     int fd_;
+    int epoll_fd_;  // Borrowed from ApiServer; all sends run on its loop thread.
     bool closed_ = false;
     bool authenticated_ = false;
     bool voice_subscribed_ = false;

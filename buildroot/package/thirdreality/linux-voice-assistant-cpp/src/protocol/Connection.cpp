@@ -1,6 +1,7 @@
 #include "protocol/Connection.h"
 
 #include <errno.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -29,6 +30,7 @@ constexpr std::uint32_t kApiVersionMajor = 1;
 constexpr std::uint32_t kApiVersionMinor = 10;
 
 constexpr std::size_t kMaxReadBufferBytes = 1u * 1024u * 1024u;
+constexpr std::size_t kMaxWriteBufferBytes = 512u * 1024u;
 
 constexpr std::size_t kReadChunkBytes = 4096;
 constexpr std::chrono::minutes kTimeRetryIntervals[] = {
@@ -38,10 +40,10 @@ constexpr auto kMaxTimeResponseAge = std::chrono::seconds(5);
 
 }  // namespace
 
-Connection::Connection(int fd,
+Connection::Connection(int fd, int epoll_fd,
                        lva::state::ServerState& state,
                        std::string peer_label)
-    : fd_(fd), state_(state), peer_label_(std::move(peer_label)) {
+    : fd_(fd), epoll_fd_(epoll_fd), state_(state), peer_label_(std::move(peer_label)) {
     LVA_LOGI(kTag, "[%s] connected (fd=%d)", peer_label_.c_str(), fd_);
 }
 
@@ -493,9 +495,8 @@ bool Connection::DispatchFrame(const InboundFrame& frame) {
 }
 
 bool Connection::OnWritable() {
-    if (closed_ || write_buf_.empty()) {
-        return true;
-    }
+    if (closed_) return false;
+    if (write_buf_.empty()) return true;
     while (!write_buf_.empty()) {
         const ssize_t n = ::send(fd_, write_buf_.data(), write_buf_.size(),
                                  MSG_NOSIGNAL);
@@ -518,17 +519,49 @@ bool Connection::OnWritable() {
         }
         LVA_LOGE(kTag, "[%s] send failed: %s", peer_label_.c_str(),
                  std::strerror(errno));
-        return false;
+        return FailWrite();
+    }
+    return SetWriteInterest(false);
+}
+
+bool Connection::FailWrite() {
+    // Keep ownership of the fd until ApiServer erases this connection. Closing
+    // here could let accept() reuse it while it is still a key in connections_.
+    closed_ = true;
+    ::shutdown(fd_, SHUT_RDWR);
+    write_buf_.clear();
+    return false;
+}
+
+bool Connection::SetWriteInterest(bool enabled) {
+    epoll_event ev{};
+    ev.events = EPOLLIN | EPOLLRDHUP | (enabled ? EPOLLOUT : 0u);
+    ev.data.fd = fd_;
+    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd_, &ev) < 0) {
+        LVA_LOGE(kTag, "[%s] epoll_ctl(write interest) failed: %s",
+                 peer_label_.c_str(), std::strerror(errno));
+        return FailWrite();
     }
     return true;
+}
+
+bool Connection::QueueWrite(std::span<const std::uint8_t> bytes) {
+    if (bytes.size() > kMaxWriteBufferBytes - write_buf_.size()) {
+        LVA_LOGE(kTag, "[%s] write buffer overflow (%zu + %zu bytes, limit %zu), closing",
+                 peer_label_.c_str(), write_buf_.size(), bytes.size(),
+                 kMaxWriteBufferBytes);
+        return FailWrite();
+    }
+    const bool was_empty = write_buf_.empty();
+    write_buf_.insert(write_buf_.end(), bytes.begin(), bytes.end());
+    return !was_empty || write_buf_.empty() || SetWriteInterest(true);
 }
 
 bool Connection::SendRaw(std::span<const std::uint8_t> bytes) {
     if (closed_) return false;
 
     if (!write_buf_.empty()) {
-        write_buf_.insert(write_buf_.end(), bytes.begin(), bytes.end());
-        return true;
+        return QueueWrite(bytes);
     }
 
     std::size_t sent_total = 0;
@@ -543,13 +576,11 @@ bool Connection::SendRaw(std::span<const std::uint8_t> bytes) {
             continue;
         }
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            write_buf_.assign(bytes.begin() + static_cast<std::ptrdiff_t>(sent_total),
-                              bytes.end());
-            return true;
+            return QueueWrite(bytes.subspan(sent_total));
         }
         LVA_LOGE(kTag, "[%s] send failed: %s", peer_label_.c_str(),
                  std::strerror(errno));
-        return false;
+        return FailWrite();
     }
     return true;
 }
