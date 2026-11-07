@@ -4,6 +4,8 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -11,7 +13,9 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cerrno>
 #include <cstring>
+#include <exception>
 #include <map>
 #include <memory>
 #include <sstream>
@@ -32,6 +36,67 @@ constexpr const char* kTag        = "http";
 constexpr const char* kSecretKey  = "ThirdReality";
 constexpr std::size_t kMaxHeader  = 16 * 1024;
 constexpr std::size_t kMaxBody    = 64 * 1024;
+constexpr auto kRequestTimeout = std::chrono::seconds(5);
+constexpr auto kSendTimeout = std::chrono::seconds(5);
+constexpr auto kOverloadLogInterval = std::chrono::seconds(10);
+
+// One deadline covers both headers and body, so trickled bytes cannot keep
+// renewing a per-recv timeout indefinitely. Socket shutdown wakes poll().
+ssize_t ReceiveBefore(int fd, char* buffer, std::size_t size,
+                      std::chrono::steady_clock::time_point deadline) {
+    for (;;) {
+        const auto remaining = deadline - std::chrono::steady_clock::now();
+        if (remaining <= std::chrono::steady_clock::duration::zero()) return -1;
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            remaining).count();
+        pollfd event{fd, POLLIN, 0};
+        const int ready = ::poll(&event, 1, static_cast<int>(ms + 1));
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready <= 0) return -1;
+        const ssize_t n = ::recv(fd, buffer, size, MSG_DONTWAIT);
+        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+            continue;
+        }
+        return n;
+    }
+}
+
+void SendAll(int fd, const std::string& data) {
+    const auto deadline = std::chrono::steady_clock::now() + kSendTimeout;
+    std::size_t sent = 0;
+    while (sent < data.size()) {
+        const auto remaining = deadline - std::chrono::steady_clock::now();
+        if (remaining <= std::chrono::steady_clock::duration::zero()) {
+            LVA_LOGW(kTag, "HTTP response timed out (fd=%d, sent=%zu/%zu)",
+                     fd, sent, data.size());
+            return;
+        }
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            remaining).count();
+        pollfd event{fd, POLLOUT, 0};
+        const int ready = ::poll(&event, 1, static_cast<int>(ms + 1));
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready <= 0) {
+            LVA_LOGW(kTag, "HTTP response incomplete (fd=%d, sent=%zu/%zu): %s",
+                     fd, sent, data.size(),
+                     ready == 0 ? "send timeout" : std::strerror(errno));
+            return;
+        }
+        const ssize_t n = ::send(fd, data.data() + sent, data.size() - sent,
+                                 MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (n > 0) {
+            sent += static_cast<std::size_t>(n);
+            continue;
+        }
+        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+            continue;
+        }
+        LVA_LOGW(kTag, "HTTP response incomplete (fd=%d, sent=%zu/%zu): %s",
+                 fd, sent, data.size(),
+                 n == 0 ? "send returned zero" : std::strerror(errno));
+        return;
+    }
+}
 
 const char* ReasonPhrase(int code) {
     switch (code) {
@@ -303,23 +368,58 @@ bool SupervisorHttpServer::Start() {
     }
     listen_fd_ = fd;
     running_.store(true, std::memory_order_relaxed);
-    accept_thread_ = std::thread([this] { AcceptLoop(); });
+    try {
+        accept_thread_ = std::thread([this] { AcceptLoop(); });
+    } catch (const std::exception& error) {
+        LVA_LOGE(kTag, "HTTP accept thread creation failed: %s", error.what());
+        running_.store(false, std::memory_order_relaxed);
+        ::close(listen_fd_);
+        listen_fd_ = -1;
+        return false;
+    }
     LVA_LOGI(kTag, "supervisor HTTP listening on 0.0.0.0:%u", port_);
     return true;
 }
 
 void SupervisorHttpServer::Stop() {
     if (!running_.exchange(false, std::memory_order_acq_rel)) return;
+    stopped_.notify_all();
     if (listen_fd_ >= 0) {
         ::shutdown(listen_fd_, SHUT_RDWR);
+    }
+    // AcceptLoop keeps using listen_fd_; do not close/reuse it before joining.
+    if (accept_thread_.joinable()) accept_thread_.join();
+    {
+        std::lock_guard lock(workers_mutex_);
+        for (auto& worker : workers_) {
+            if (worker.fd >= 0) ::shutdown(worker.fd, SHUT_RDWR);
+        }
+    }
+    for (auto& worker : workers_) {
+        if (worker.thread.joinable()) worker.thread.join();
+    }
+    if (listen_fd_ >= 0) {
         ::close(listen_fd_);
         listen_fd_ = -1;
     }
-    if (accept_thread_.joinable()) accept_thread_.join();
     LVA_LOGI(kTag, "supervisor HTTP stopped");
 }
 
+bool SupervisorHttpServer::WaitForActionDelay(const char* action) {
+    std::unique_lock lock(workers_mutex_);
+    if (stopped_.wait_for(lock, std::chrono::seconds(3), [this] {
+        return !running_.load(std::memory_order_relaxed);
+    })) {
+        LVA_LOGW(kTag, "%s cancelled: server stopping", action);
+        return false;
+    }
+    return true;
+}
+
 void SupervisorHttpServer::AcceptLoop() {
+    ::pthread_setname_np(::pthread_self(), "lva-http-accept");
+    auto next_overload_log = std::chrono::steady_clock::time_point::min();
+    std::size_t rejected_since_log = 0;
     while (running_.load(std::memory_order_relaxed)) {
         sockaddr_in peer{};
         socklen_t   plen = sizeof(peer);
@@ -332,25 +432,78 @@ void SupervisorHttpServer::AcceptLoop() {
             LVA_LOGW(kTag, "accept() failed: %s", std::strerror(errno));
             continue;
         }
-        std::thread([this, conn] { HandleConnection(conn); }).detach();
+        std::lock_guard lock(workers_mutex_);
+        if (!running_.load(std::memory_order_relaxed)) {
+            ::close(conn);
+            break;
+        }
+        Worker* available = nullptr;
+        for (auto& worker : workers_) {
+            if (worker.fd < 0) {
+                available = &worker;
+                break;
+            }
+        }
+        if (!available) {
+            ++rejected_since_log;
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= next_overload_log) {
+                char address[INET_ADDRSTRLEN]{};
+                const char* ip = ::inet_ntop(AF_INET, &peer.sin_addr,
+                                             address, sizeof(address));
+                LVA_LOGW(kTag, "HTTP connection limit (%zu) reached; rejecting "
+                         "peer=%s:%u (%zu rejected since last log)",
+                         kMaxConnections, ip ? ip : "unknown",
+                         static_cast<unsigned>(ntohs(peer.sin_port)),
+                         rejected_since_log);
+                rejected_since_log = 0;
+                next_overload_log = now + kOverloadLogInterval;
+            }
+            // Do not block the accept loop on a response to an excess client.
+            ::close(conn);
+            continue;
+        }
+        // For a joinable slot, fd becomes -1 only in the worker's final
+        // mutex-protected scope. It never locks workers_mutex_ again, so
+        // joining under this mutex cannot deadlock. Preserve this invariant.
+        if (available->thread.joinable()) available->thread.join();
+        available->fd = conn;
+        try {
+            available->thread = std::thread([this, conn, available] {
+                ::pthread_setname_np(::pthread_self(), "lva-http");
+                try {
+                    HandleConnection(conn);
+                } catch (const std::exception& error) {
+                    LVA_LOGE(kTag, "HTTP connection failed: %s", error.what());
+                } catch (...) {
+                    LVA_LOGE(kTag, "HTTP connection failed: unknown exception");
+                }
+                // Serialize close with Stop's shutdown so an fd cannot be
+                // reused while Stop still considers it an active client.
+                std::lock_guard lock(workers_mutex_);
+                ::close(conn);
+                available->fd = -1;
+            });
+        } catch (const std::exception& error) {
+            LVA_LOGE(kTag, "HTTP connection thread creation failed: %s", error.what());
+            ::close(conn);
+            available->fd = -1;
+        }
     }
 }
 
 void SupervisorHttpServer::HandleConnection(int conn_fd) {
     std::string buf;
     buf.reserve(1024);
-    timeval tv{5, 0};
-    ::setsockopt(conn_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    ::setsockopt(conn_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    const auto deadline = std::chrono::steady_clock::now() + kRequestTimeout;
 
     while (buf.find("\r\n\r\n") == std::string::npos) {
         char tmp[2048];
-        const ssize_t n = ::recv(conn_fd, tmp, sizeof(tmp), 0);
-        if (n <= 0) { ::close(conn_fd); return; }
+        const ssize_t n = ReceiveBefore(conn_fd, tmp, sizeof(tmp), deadline);
+        if (n <= 0) return;
         buf.append(tmp, static_cast<std::size_t>(n));
         if (buf.size() > kMaxHeader) {
             SendText(conn_fd, 400, "Request header too large");
-            ::close(conn_fd);
             return;
         }
     }
@@ -369,7 +522,6 @@ void SupervisorHttpServer::HandleConnection(int conn_fd) {
     rl >> method >> path >> http_ver;
     if (method.empty() || path.empty()) {
         SendText(conn_fd, 400, "Malformed request");
-        ::close(conn_fd);
         return;
     }
 
@@ -394,14 +546,13 @@ void SupervisorHttpServer::HandleConnection(int conn_fd) {
     }
     if (cl > kMaxBody) {
         SendText(conn_fd, 400, "Request body too large");
-        ::close(conn_fd);
         return;
     }
     while (body.size() < cl) {
         char tmp[2048];
-        const ssize_t n = ::recv(conn_fd, tmp,
-                                 std::min(sizeof(tmp), cl - body.size()), 0);
-        if (n <= 0) break;
+        const ssize_t n = ReceiveBefore(conn_fd, tmp,
+            std::min(sizeof(tmp), cl - body.size()), deadline);
+        if (n <= 0) return;  // Never execute a truncated/timed-out request.
         body.append(tmp, static_cast<std::size_t>(n));
     }
     body.resize(cl);
@@ -422,7 +573,6 @@ void SupervisorHttpServer::HandleConnection(int conn_fd) {
     } else {
         SendJson(conn_fd, 405, "{\"error\":\"Method not allowed\"}");
     }
-    ::close(conn_fd);
 }
 
 void SupervisorHttpServer::HandleGet(int conn_fd, const std::string& path) {
@@ -556,19 +706,15 @@ void SupervisorHttpServer::HandlePost(int conn_fd, const std::string& path,
 
     if (command == "reboot") {
         SendJson(conn_fd, 200, "{\"success\":true}");
-        // Let the response reach the client first.
-        std::thread([] {
-            std::this_thread::sleep_for(std::chrono::seconds(3));
-            Supervisor::PerformReboot();
-        }).detach();
+        // Queue the response before FIN, then reuse this worker for the delay.
+        ::shutdown(conn_fd, SHUT_WR);
+        if (WaitForActionDelay("reboot")) Supervisor::PerformReboot();
         return;
     }
     if (command == "factory_reset") {
         SendJson(conn_fd, 200, "{\"success\":true}");
-        std::thread([] {
-            std::this_thread::sleep_for(std::chrono::seconds(3));
-            Supervisor::PerformFactoryReset();
-        }).detach();
+        ::shutdown(conn_fd, SHUT_WR);
+        if (WaitForActionDelay("factory_reset")) Supervisor::PerformFactoryReset();
         return;
     }
     if (command == "ota") {
@@ -611,8 +757,7 @@ void SupervisorHttpServer::SendJson(int conn_fd, int status,
         << "Access-Control-Allow-Headers: Content-Type\r\n"
         << "Connection: close\r\n\r\n"
         << body;
-    const std::string out = oss.str();
-    ::send(conn_fd, out.data(), out.size(), MSG_NOSIGNAL);
+    SendAll(conn_fd, oss.str());
 }
 
 void SupervisorHttpServer::SendText(int conn_fd, int status,
@@ -624,8 +769,7 @@ void SupervisorHttpServer::SendText(int conn_fd, int status,
         << "Access-Control-Allow-Origin: *\r\n"
         << "Connection: close\r\n\r\n"
         << body;
-    const std::string out = oss.str();
-    ::send(conn_fd, out.data(), out.size(), MSG_NOSIGNAL);
+    SendAll(conn_fd, oss.str());
 }
 
 }  // namespace lva::tr
