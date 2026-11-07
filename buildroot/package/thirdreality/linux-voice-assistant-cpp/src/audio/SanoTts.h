@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <atomic>
 #include <string>
 
 #include "audio/ITextToSpeech.h"
@@ -31,12 +32,19 @@ class SanoTts final : public ITextToSpeech {
     void Stop() override;
     bool Synthesize(const std::string& text,
                     std::vector<std::int16_t>& out_pcm) override;
+    // Cooperative cancellation between model stages and decoder chunks.
+    bool Synthesize(const std::string& text,
+                    std::vector<std::int16_t>& out_pcm,
+                    const std::atomic<bool>& cancelled);
     int SampleRate() const override;
 
     // Takes effect from the next Synthesize(). Same thread as Synthesize().
     void SetSpeed(float speed);
 
    private:
+    bool SynthesizeImpl(const std::string& text,
+                        std::vector<std::int16_t>& out_pcm,
+                        const std::atomic<bool>* cancelled);
     struct Impl;
     Config                config_;
     std::unique_ptr<Impl> impl_;

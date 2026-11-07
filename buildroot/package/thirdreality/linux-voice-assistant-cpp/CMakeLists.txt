@@ -203,6 +203,7 @@ add_executable(linux-voice-assistant-cpp
     src/audio/WavFile.cpp
     src/satellite/ConversationReply.cpp
     src/satellite/LocalStt.cpp
+    src/satellite/LocalTts.cpp
     src/satellite/Satellite.cpp
     src/sendspin/SendspinHub.cpp
     src/tr/ControlListener.cpp

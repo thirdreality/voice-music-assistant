@@ -21,12 +21,13 @@ namespace lva::state    { class ServerState; }
 namespace lva::satellite {
 
 class LocalStt;
+class LocalTts;
 
 // On-device STT/TTS; HA only resolves the intent via conversation.process.
 // Pointers are non-owning.
 struct LocalVoiceConfig {
     LocalStt*                  stt = nullptr;
-    lva::audio::ITextToSpeech* tts = nullptr;
+    LocalTts*                 tts = nullptr;
     std::string conversation_agent;  // empty = HA default
     std::string language = "en";
 };
@@ -63,13 +64,11 @@ class Satellite {
 
     // Call once at startup, before the first wake.
     void EnableLocalVoice(LocalVoiceConfig cfg);
+    // Shutdown path: cancel jobs/files before the borrowed engines go away.
+    void StopLocalVoice();
 
     // No voice turn, reply or timer in progress.
-    bool IsIdle() const {
-        return !pipeline_active_.load(std::memory_order_acquire) &&
-               !speech_active_.load(std::memory_order_acquire) &&
-               !timer_ringing_ && local_phase_ == LocalPhase::kIdle;
-    }
+    bool IsIdle() const;
 
    private:
     void StartPipeline(const std::string& wake_word_phrase);
@@ -96,7 +95,10 @@ class Satellite {
     void OnActionResponse(std::uint32_t call_id, bool success,
                           const std::string& error_message,
                           const std::string& response_data);
-    std::string SynthesizeToFile(const std::string& text);
+    void PollLocalTts();
+    void CancelLocalTts(bool timed_out = false);
+    void PlayAnnouncementMedia(const std::string& media_id,
+                               const std::string& preannounce_media_id);
     void SpeakLocal(const std::string& text);
     void FinishLocalTurn();
     void CancelLocalTurn();
@@ -169,7 +171,14 @@ class Satellite {
     std::string      conversation_id_;
     // Local reply playing: do not send AnnounceFinished to HA.
     bool             local_speech_      = false;
-    unsigned         tts_file_seq_      = 0;
+    struct PendingTts {
+        std::uint64_t generation;
+        std::string fallback_media_id;
+        std::string preannounce_media_id;
+        std::chrono::steady_clock::time_point deadline;
+    };
+    std::optional<PendingTts> pending_tts_;
+    std::string tts_playback_path_;
 
     struct WakeConfigurationResult {
         std::vector<std::shared_ptr<lva::audio::MicroWakeWord>> micro;

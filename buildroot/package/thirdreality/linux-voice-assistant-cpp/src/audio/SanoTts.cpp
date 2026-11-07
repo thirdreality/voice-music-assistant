@@ -164,20 +164,17 @@ std::size_t MetaBytes(const unsigned char* p, std::size_t size,
 class WorkerPool {
    public:
     explicit WorkerPool(int threads) {
-        for (int i = 1; i < threads; ++i) {
-            workers_.emplace_back([this] { WorkerMain(); });
+        try {
+            for (int i = 1; i < threads; ++i) {
+                workers_.emplace_back([this] { WorkerMain(); });
+            }
+        } catch (...) {
+            Shutdown();
+            throw;
         }
     }
 
-    ~WorkerPool() {
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            quit_ = true;
-            ++generation_;
-        }
-        go_.notify_all();
-        for (auto& t : workers_) t.join();
-    }
+    ~WorkerPool() { Shutdown(); }
 
     WorkerPool(const WorkerPool&)            = delete;
     WorkerPool& operator=(const WorkerPool&) = delete;
@@ -187,6 +184,16 @@ class WorkerPool {
     }
 
    private:
+    void Shutdown() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            quit_ = true;
+            ++generation_;
+        }
+        go_.notify_all();
+        for (auto& t : workers_) t.join();
+    }
+
     void RunJobs(int n, void (*job)(void*, int), void* ctx) {
         if (workers_.empty() || n <= 1) {
             for (int j = 0; j < n; ++j) job(ctx, j);
@@ -382,7 +389,12 @@ bool SanoTts::Start() {
     }
 
     const int threads = std::clamp(config_.threads, 1, 4);
-    impl->pool = std::make_unique<WorkerPool>(threads);
+    try {
+        impl->pool = std::make_unique<WorkerPool>(threads);
+    } catch (...) {
+        espeak_Terminate();
+        throw;
+    }
     snt_piperlite_set_parallel(&WorkerPool::Run, impl->pool.get());
 
     impl_ = std::move(impl);
@@ -406,13 +418,30 @@ void SanoTts::SetSpeed(float speed) {
 
 bool SanoTts::Synthesize(const std::string& text,
                          std::vector<std::int16_t>& out_pcm) {
+    return SynthesizeImpl(text, out_pcm, nullptr);
+}
+
+bool SanoTts::Synthesize(const std::string& text,
+                         std::vector<std::int16_t>& out_pcm,
+                         const std::atomic<bool>& cancelled) {
+    return SynthesizeImpl(text, out_pcm, &cancelled);
+}
+
+bool SanoTts::SynthesizeImpl(const std::string& text,
+                             std::vector<std::int16_t>& out_pcm,
+                             const std::atomic<bool>* cancelled) {
     out_pcm.clear();
+    const auto is_cancelled = [&] {
+        return cancelled && cancelled->load(std::memory_order_relaxed);
+    };
+    if (is_cancelled()) return false;
     if (!impl_ || text.empty()) return false;
     Impl& m = *impl_;
     const auto t0 = std::chrono::steady_clock::now();
 
     std::vector<std::int32_t> ids;
     const int n = TextToIds(text, ids);
+    if (is_cancelled()) return false;
     if (n <= 3) {
         LVA_LOGW(kTag, "no phonemes for '%s'", text.c_str());
         return false;
@@ -441,6 +470,7 @@ bool SanoTts::Synthesize(const std::string& text,
                                      length_scale, durations.data(),
                                      arena.data(), arena.size());
     }
+    if (is_cancelled()) return false;
     if (frames <= 0) {
         LVA_LOGE(kTag, "duration model failed (%ld)", frames);
         return false;
@@ -461,6 +491,7 @@ bool SanoTts::Synthesize(const std::string& text,
             return false;
         }
     }
+    if (is_cancelled()) return false;
     const auto t1 = std::chrono::steady_clock::now();
 
     // Decode in overlapping chunks; keep only each chunk's core.
@@ -473,6 +504,10 @@ bool SanoTts::Synthesize(const std::string& text,
     out_pcm.resize(static_cast<std::size_t>(frames) * kHop);
 
     for (long s = 0; s < frames; s += kChunkFrames) {
+        if (is_cancelled()) {
+            out_pcm.clear();
+            return false;
+        }
         const long a = std::max(0L, s - kOverlapFrames);
         const long b = std::min(frames, s + kChunkFrames + kOverlapFrames);
         const int  w = static_cast<int>(b - a);

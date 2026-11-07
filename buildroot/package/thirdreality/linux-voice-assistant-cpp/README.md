@@ -143,7 +143,7 @@ src/audio/                  AudioCapture, LibMpvPlayer, PcmRingBuffer,
                             OpenWakeWordFeatures, WakeWordScanner,
                             WakeWordEngine, TfliteRuntime,
                             WebRtcProcessor, IAudioPlayer
-src/satellite/              Voice pipeline state machine, LocalStt worker,
+src/satellite/              Voice pipeline state machine, LocalStt/LocalTts workers,
                             conversation.process reply parser
 src/sendspin/               SendspinHub: sendspin-cpp client, PulseAudio
                             sink, identity files, music LED
@@ -224,9 +224,20 @@ Selected in HA with the "Speech Processing" select (`Home Assistant` /
   to the next reply without a restart. It only affects the local
   backend; with `Home Assistant` the voice is set in the HA Assist
   pipeline.
+- Local TTS initialization, speed updates, synthesis and WAV output run on
+  one `lva-tts` worker. The main loop polls completed jobs and starts playback.
+  A replacement keeps only the latest pending job; stop/mute/disconnect discard
+  cancelled results. Cancellation is checked between model stages and decoder
+  chunks, so it cannot interrupt an individual model call. Shutdown waits for
+  the worker before releasing its engine and removes outstanding WAV files.
+  The worker removes `/tmp/lva-tts` at startup to reclaim files left by crashes.
+  Each submitted job has a 60 s deadline, including initialization/queue time.
+  A timeout ends the turn and disables continuation; new synthesis jobs are
+  rejected until the cancelled call returns. A model call that never returns
+  still requires a process restart and can prevent graceful worker shutdown.
 
 ```
-wake -> LocalStt (whisper.cpp) -> HA conversation.process -> SanoTts -> mpv
+wake -> LocalStt (whisper.cpp) -> HA conversation.process -> LocalTts (SanoTts) -> mpv
 ```
 
 - Input is the post-APM, post-mic-gain capture tap.

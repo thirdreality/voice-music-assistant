@@ -11,16 +11,15 @@
 
 #include "audio/ExternalWakeWord.h"
 #include "audio/IAudioPlayer.h"
-#include "audio/ITextToSpeech.h"
 #include "audio/MicroWakeWord.h"
 #include "audio/OpenWakeWord.h"
 #include "audio/PcmRingBuffer.h"
 #include "audio/WakeWordEngine.h"
 #include "audio/WakeWordScanner.h"
-#include "audio/WavFile.h"
 #include "protocol/MessageRegistry.h"
 #include "satellite/ConversationReply.h"
 #include "satellite/LocalStt.h"
+#include "satellite/LocalTts.h"
 #include "state/ServerState.h"
 #include "tr/LedRing.h"
 #include "sendspin/SendspinHub.h"
@@ -63,9 +62,9 @@ constexpr const char* kTimerFinishedSoundPath =
 
 constexpr int kTimerMaxRingSeconds = 900;
 
-constexpr const char* kTtsDir = "/tmp/lva-tts";
 // LLM conversation agents can take several seconds.
 constexpr auto kIntentTimeout = std::chrono::seconds(15);
+constexpr auto kLocalTtsTimeout = std::chrono::seconds(60);
 
 // HA sends RUN_START right after VoiceAssistantRequest(start=true). If it
 // does not, the run was never created and the mic would stream forever.
@@ -91,8 +90,16 @@ Satellite::Satellite(lva::state::ServerState& state,
       announce_player_(announce_player) {}
 
 Satellite::~Satellite() {
+    CancelLocalTts();
     wake_configuration_cancel_.store(true, std::memory_order_release);
     if (wake_configuration_.valid()) wake_configuration_.wait();
+}
+
+bool Satellite::IsIdle() const {
+    return !pipeline_active_.load(std::memory_order_acquire) &&
+           !speech_active_.load(std::memory_order_acquire) &&
+           !timer_ringing_ && local_phase_ == LocalPhase::kIdle &&
+           (!local_.tts || !local_.tts->Busy());
 }
 
 void Satellite::OnWakeDetected(const std::string& model_id, float prob) {
@@ -462,6 +469,7 @@ void Satellite::PlayTts() {
 
 void Satellite::FinishSpeech(bool success) {
     if (!speech_active_.exchange(false, std::memory_order_acq_rel)) return;
+    CancelLocalTts();
 
     const bool was_local = std::exchange(local_speech_, false);
     if (state_.broadcast && !was_local) {
@@ -495,13 +503,21 @@ void Satellite::PlayAnnounce(const std::string& media_id,
                              bool start_conversation) {
     if (announce_player_ == nullptr) return;
 
-    // Speak announcement text locally; media without text plays as-is.
-    std::string play_id = media_id;
-    if (LocalVoiceEnabled() && local_.tts != nullptr && !text.empty()) {
-        const std::string path = SynthesizeToFile(text);
-        if (!path.empty()) play_id = path;
+    const bool synthesize = LocalVoiceEnabled() && local_.tts && !text.empty();
+    if (!synthesize && media_id.empty()) return;
+
+    PrepareForMediaAnnouncement();
+    CancelLocalTurn();
+    announce_player_->Stop();
+    continue_listen_at_ns_.store(0, std::memory_order_relaxed);
+    if (is_streaming_audio_) {
+        StopAudioStreaming();
+        if (state_.broadcast) {
+            ::VoiceAssistantRequest req;
+            req.set_start(false);
+            state_.broadcast(lva::proto::kIdVoiceAssistantRequest, req);
+        }
     }
-    if (play_id.empty()) return;
 
     if (timer_ringing_) StopTimerRing();
     pipeline_active_ = true;
@@ -512,15 +528,51 @@ void Satellite::PlayAnnounce(const std::string& media_id,
 
     speech_active_ = true;
     local_speech_  = false;
-    auto play_main = [this, play_id]() {
-        announce_player_->Play(play_id, [this]() {
+    if (synthesize) {
+        const auto generation = local_.tts->Submit(text);
+        if (generation != 0) {
+            pending_tts_ = PendingTts{generation, media_id, preannounce_media_id,
+                std::chrono::steady_clock::now() + kLocalTtsTimeout};
+            lva::tr::Show(lva::tr::LedState::Thinking);
+            return;
+        }
+        LVA_LOGW(kTag, "local TTS worker unavailable; using announcement media");
+    }
+    PlayAnnouncementMedia(media_id, preannounce_media_id);
+}
+
+void Satellite::PlayAnnouncementMedia(const std::string& media_id,
+                                       const std::string& preannounce_media_id) {
+    if (media_id.empty() || announce_player_ == nullptr) {
+        continue_conversation_ = false;
+        FinishSpeech(false);
+        return;
+    }
+    auto play_main = [this, media_id]() {
+        if (!speech_active_) return;
+        lva::tr::Show(lva::tr::LedState::Speaking);
+        announce_player_->Play(media_id, [this]() {
             FinishSpeech(true);
         });
+        // Play() can fail synchronously without calling its completion hook.
+        if (announce_player_->State() == lva::audio::PlayerState::kIdle ||
+            announce_player_->State() == lva::audio::PlayerState::kError) {
+            LVA_LOGW(kTag, "announcement playback failed: %s", media_id.c_str());
+            continue_conversation_ = false;
+            FinishSpeech(false);
+        }
     };
 
     if (!preannounce_media_id.empty()) {
         announce_player_->Play(preannounce_media_id,
                                std::move(play_main));
+        if (announce_player_->State() == lva::audio::PlayerState::kIdle ||
+            announce_player_->State() == lva::audio::PlayerState::kError) {
+            LVA_LOGW(kTag, "preannouncement playback failed: %s",
+                     preannounce_media_id.c_str());
+            continue_conversation_ = false;
+            FinishSpeech(false);
+        }
     } else {
         play_main();
     }
@@ -742,6 +794,7 @@ void Satellite::OnLoopTick() {
     }
 
     PollLocalVoice();
+    PollLocalTts();
 
     if (is_streaming_audio_ &&
         (!state_.has_voice_client ||
@@ -834,6 +887,16 @@ void Satellite::EnableLocalVoice(LocalVoiceConfig cfg) {
              local_.tts != nullptr ? "yes" : "no",
              local_.conversation_agent.empty()
                  ? "(default)" : local_.conversation_agent.c_str());
+}
+
+void Satellite::StopLocalVoice() {
+    if (pending_tts_ || !tts_playback_path_.empty()) {
+        if (announce_player_) announce_player_->Stop();
+        speech_active_ = false;
+    }
+    CancelLocalTurn();
+    if (local_.tts) local_.tts->Stop();
+    local_ = {};
 }
 
 void Satellite::BeginLocalListening() {
@@ -962,41 +1025,89 @@ void Satellite::OnActionResponse(std::uint32_t call_id, bool success,
     SpeakLocal(reply.speech);
 }
 
-std::string Satellite::SynthesizeToFile(const std::string& text) {
-    if (local_.tts == nullptr) return {};
-
-    std::vector<std::int16_t> pcm;
-    const auto t0 = std::chrono::steady_clock::now();
-    if (!local_.tts->Synthesize(text, pcm)) return {};
-    const double synth_s = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - t0).count();
-
-    std::error_code ec;
-    std::filesystem::create_directories(kTtsDir, ec);
-    // Two files, so a new reply never overwrites one mpv is still reading.
-    const std::string path = std::string(kTtsDir) + "/reply-" +
-                             std::to_string(tts_file_seq_++ % 2) + ".wav";
-    if (!lva::audio::WriteWavS16Mono(path, pcm, local_.tts->SampleRate())) {
-        LVA_LOGW(kTag, "failed to write %s", path.c_str());
-        return {};
+void Satellite::CancelLocalTts(bool timed_out) {
+    pending_tts_.reset();
+    if (local_.tts) local_.tts->Cancel(timed_out);
+    if (!tts_playback_path_.empty()) {
+        std::error_code ec;
+        std::filesystem::remove(tts_playback_path_, ec);
+        tts_playback_path_.clear();
     }
-    LVA_LOGI(kTag, "local TTS: %.2f s audio in %.0f ms -> %s",
-             static_cast<double>(pcm.size()) / local_.tts->SampleRate(),
-             synth_s * 1000.0, path.c_str());
-    return path;
+}
+
+void Satellite::PollLocalTts() {
+    if (!local_.tts) return;
+    if (pending_tts_ && std::chrono::steady_clock::now() >= pending_tts_->deadline) {
+        LVA_LOGW(kTag, "local TTS timed out after 60 s (job=%llu); cancelling turn",
+                 static_cast<unsigned long long>(pending_tts_->generation));
+        CancelLocalTts(true);
+        continue_conversation_ = false;
+        continue_listen_at_ns_.store(0, std::memory_order_relaxed);
+        if (local_speech_) {
+            speech_active_ = false;
+            local_speech_ = false;
+            FinishLocalTurn();
+        } else {
+            FinishSpeech(false);
+        }
+        return;
+    }
+    auto result = local_.tts->TakeResult();
+    if (!result) return;
+    const bool current = pending_tts_ && result->generation == pending_tts_->generation;
+    if (!current ||
+        !speech_active_ || !pipeline_active_ || state_.muted.load()) {
+        std::error_code ec;
+        if (!result->path.empty()) std::filesystem::remove(result->path, ec);
+        if (current) {
+            CancelLocalTts();
+            continue_conversation_ = false;
+            FinishSpeech(false);
+        }
+        return;
+    }
+    auto pending = std::move(*pending_tts_);
+    pending_tts_.reset();
+    if (result->path.empty()) {
+        LVA_LOGW(kTag, "local TTS failed (job=%llu)",
+                 static_cast<unsigned long long>(result->generation));
+        if (local_speech_) {
+            speech_active_ = false;
+            local_speech_ = false;
+            FinishLocalTurn();
+        } else {
+            PlayAnnouncementMedia(pending.fallback_media_id,
+                                  pending.preannounce_media_id);
+        }
+        return;
+    }
+    tts_playback_path_ = std::move(result->path);
+    PlayAnnouncementMedia(tts_playback_path_, pending.preannounce_media_id);
 }
 
 void Satellite::SpeakLocal(const std::string& text) {
-    const std::string path = SynthesizeToFile(text);
-    if (path.empty() || announce_player_ == nullptr) {
+    if (!local_.tts || announce_player_ == nullptr || text.empty()) {
         FinishLocalTurn();
         return;
     }
     if (timer_ringing_) StopTimerRing();
-    lva::tr::Show(lva::tr::LedState::Speaking);
+    announce_player_->Stop();  // Stop the thinking sound before synthesis.
+    CancelLocalTts();
+    continue_listen_at_ns_.store(0, std::memory_order_relaxed);
+    const auto generation = local_.tts->Submit(text);
+    if (generation == 0) {
+        LVA_LOGW(kTag, "local TTS unavailable or recovering; ending turn");
+        continue_conversation_ = false;
+        FinishLocalTurn();
+        return;
+    }
+    pending_tts_ = PendingTts{generation, {}, {},
+        std::chrono::steady_clock::now() + kLocalTtsTimeout};
+    lva::tr::Show(lva::tr::LedState::Thinking);
+    pipeline_active_ = true;
     speech_active_ = true;
     local_speech_  = true;
-    announce_player_->Play(path, [this]() { FinishSpeech(true); });
+    DisarmHaWatchdog();
 }
 
 void Satellite::FinishLocalTurn() {
@@ -1017,6 +1128,7 @@ void Satellite::FinishLocalTurn() {
 }
 
 void Satellite::CancelLocalTurn() {
+    CancelLocalTts();
     if (!LocalVoiceEnabled()) return;
     if (local_phase_ != LocalPhase::kIdle) {
         LVA_LOGI(kTag, "local turn cancelled");

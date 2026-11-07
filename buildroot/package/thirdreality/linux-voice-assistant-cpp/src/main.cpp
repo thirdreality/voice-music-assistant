@@ -52,6 +52,7 @@
 #include "protocol/ApiServer.h"
 #include "protocol/MdnsPublisher.h"
 #include "satellite/LocalStt.h"
+#include "satellite/LocalTts.h"
 #include "satellite/Satellite.h"
 #include "sendspin/SendspinHub.h"
 #include "state/Preferences.h"
@@ -830,7 +831,7 @@ int main(int argc, char** argv) {
 
     // Created later if the local backend is in use; the rate entity below
     // applies changes to it.
-    std::unique_ptr<lva::audio::SanoTts> local_tts;
+    std::unique_ptr<lva::satellite::LocalTts> local_tts;
 
     // Set when HA picks another voice backend; main loop restarts LVA.
     bool restart_for_backend = false;
@@ -1193,7 +1194,7 @@ int main(int argc, char** argv) {
         tts_cfg.speed           = TtsSpeed(
             state.preferences.tts_rate.value_or(kDefaultTtsRate));
         tts_cfg.threads         = cli.tts_threads;
-        local_tts = std::make_unique<lva::audio::SanoTts>(tts_cfg);
+        local_tts = std::make_unique<lva::satellite::LocalTts>(tts_cfg);
         if (!local_tts->Start()) {
             LVA_LOGW(kTag, "local TTS unavailable; replies will be silent");
             local_tts.reset();
@@ -1655,6 +1656,7 @@ int main(int argc, char** argv) {
     mdns.Stop();
     wakeword_engine->Stop();
     linear_wakeword_engine->Stop();
+    satellite->StopLocalVoice();
     if (local_stt) local_stt->Stop();
     if (stt_model_downloader) stt_model_downloader->Cancel();
     audio_capture->Stop();
