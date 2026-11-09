@@ -571,21 +571,9 @@ int main(int argc, char** argv) {
 
     // Set when a first-boot default is filled in, so sound.json is saved
     // once with every setting.
-    bool prefs_dirty = preferences_corrupt;
-    if (state.preferences.mic_auto_gain == 0) {
-        state.preferences.mic_auto_gain = 10;
-        prefs_dirty = true;
-    }
-    if (state.preferences.mic_noise_suppression == 0) {
-        state.preferences.mic_noise_suppression = 2;  // Medium NS
-        prefs_dirty = true;
-    }
-    if (state.preferences.mic_volume == 100) {
-        state.preferences.mic_volume = 1600;
-        state.mic_volume_live.store(1600, std::memory_order_relaxed);
-        prefs_dirty = true;
-    }
-    if (prefs_dirty) {
+    const bool mic_defaults_applied = state.preferences.mic_defaults_applied();
+    bool prefs_dirty = preferences_corrupt || mic_defaults_applied;
+    if (mic_defaults_applied) {
         LVA_LOGI(kTag,
                  "applied first-boot mic defaults: agc=%d, ns=%d, vol=%d",
                  state.preferences.mic_auto_gain,

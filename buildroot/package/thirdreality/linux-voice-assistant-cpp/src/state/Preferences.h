@@ -31,9 +31,10 @@ class Preferences {
     std::optional<double> wake_word_2_sensitivity;
     std::optional<double> stop_word_sensitivity;
 
-    // WebRTC AGC / NS levels, 0..N. 0 = off.
-    int mic_auto_gain         = 0;
-    int mic_noise_suppression = 0;
+    // WebRTC AGC / NS levels, 0..N. Explicit 0 = off; defaults apply only
+    // when loading a missing/null setting.
+    int mic_auto_gain         = 10;
+    int mic_noise_suppression = 2;
 
     int mic_volume = 1600;
 
@@ -51,6 +52,7 @@ class Preferences {
     int mic_mute = 1;    // 0 = muted, 1 = unmuted (matches GPIO 438)
 
     Format format() const noexcept { return format_; }
+    bool mic_defaults_applied() const noexcept { return mic_defaults_applied_; }
     bool is_mic_muted() const noexcept { return mic_mute == 0; }
     void set_mic_muted(bool muted) noexcept { mic_mute = muted ? 0 : 1; }
 
@@ -73,6 +75,8 @@ class Preferences {
     bool Save(const std::filesystem::path& storage_path,
               const std::set<std::string>* keys, bool recover_corrupt) const;
     Format format_ = Format::kPreferences;
+    // Load metadata only; not persisted or included in ChangedFields().
+    bool mic_defaults_applied_ = true;
     std::string raw_data_text_;
 };
 

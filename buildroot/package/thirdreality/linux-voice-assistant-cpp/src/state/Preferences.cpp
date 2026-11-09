@@ -185,10 +185,15 @@ void PopulateFromJson(Preferences& out,
     out.thinking_sound        = CoerceInt(obj.value("thinking_sound", 0), 0) ? 1 : 0;
     out.mic_gain              = CoerceInt(obj.value("mic_gain", 30), 30);
     out.mic_mute              = CoerceInt(obj.value("mic_mute", 1), 1) == 0 ? 0 : 1;
-    out.mic_auto_gain         = CoerceInt(obj.value("mic_auto_gain", 0), 0);
-    out.mic_noise_suppression = CoerceInt(obj.value("mic_noise_suppression", 0), 0);
+    auto load_mic_setting = [&](const char* key, int fallback) {
+        const auto it = obj.find(key);
+        return it == obj.end() ? fallback : CoerceInt(*it, fallback);
+    };
+    out.mic_auto_gain = load_mic_setting("mic_auto_gain", out.mic_auto_gain);
+    out.mic_noise_suppression =
+        load_mic_setting("mic_noise_suppression", out.mic_noise_suppression);
     out.mic_volume = std::clamp(
-        CoerceInt(obj.value("mic_volume", 1600), 1600), 1, 4000);
+        load_mic_setting("mic_volume", out.mic_volume), 1, 4000);
 
     auto load_optional_double = [&](const char* key) -> std::optional<double> {
         if (auto it = obj.find(key);
@@ -335,6 +340,14 @@ Preferences Preferences::LoadFromFile(const std::filesystem::path& storage_path,
 
     Preferences p;
     PopulateFromJson(p, obj, storage_path);
+    p.mic_defaults_applied_ = false;
+    for (const auto* key : {"mic_auto_gain", "mic_noise_suppression", "mic_volume"}) {
+        const auto it = obj.find(key);
+        if (it == obj.end() || it->is_null()) {
+            p.mic_defaults_applied_ = true;
+            break;
+        }
+    }
     p.raw_data_text_ = std::move(text);
     if (loaded) *loaded = true;
     // Status-query callers include the periodic watcher; successful polling
