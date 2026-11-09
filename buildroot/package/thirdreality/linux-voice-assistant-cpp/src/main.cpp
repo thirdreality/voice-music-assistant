@@ -58,6 +58,7 @@
 #include "state/Preferences.h"
 #include "state/ServerState.h"
 #include "tr/ControlListener.h"
+#include "tr/DeviceEffects.h"
 #include "tr/MicMuteGpio.h"
 #include "tr/ModelDownloader.h"
 #include "tr/SoundConfWatcher.h"
@@ -435,8 +436,13 @@ int main(int argc, char** argv) {
         ? "/usr/share/thirdreality/wakewords/openwakeword"
         : "/usr/share/thirdreality/wakewords/microwakeword";
     state.wakeword_dir = wakeword_dir;
+    bool preferences_corrupt = false;
     state.preferences      = lva::state::Preferences::LoadFromFile(
-        cli.preferences_file);
+        cli.preferences_file, nullptr, &preferences_corrupt);
+    if (!state.StartPreferencesWriter() || !lva::tr::StartDeviceEffects()) {
+        LVA_LOGE(kTag, "failed to start background settings/hardware workers");
+        return 1;
+    }
 
     if (state.preferences.volume.has_value()) {
         state.volume.store(*state.preferences.volume,
@@ -565,7 +571,7 @@ int main(int argc, char** argv) {
 
     // Set when a first-boot default is filled in, so sound.json is saved
     // once with every setting.
-    bool prefs_dirty = false;
+    bool prefs_dirty = preferences_corrupt;
     if (state.preferences.mic_auto_gain == 0) {
         state.preferences.mic_auto_gain = 10;
         prefs_dirty = true;
@@ -1158,8 +1164,10 @@ int main(int argc, char** argv) {
     }
 
     if (prefs_dirty) {
-        if (state.SavePreferences()) {
-            LVA_LOGI(kTag, "persisted complete config to %s",
+        const bool queued = preferences_corrupt ? state.RequestPreferencesRecovery()
+                                               : state.SavePreferences(true);
+        if (queued) {
+            LVA_LOGI(kTag, "queued complete config for %s",
                      state.preferences_path.c_str());
         } else {
             LVA_LOGW(kTag, "failed to persist first-boot config to %s",
@@ -1660,6 +1668,10 @@ int main(int argc, char** argv) {
     if (local_stt) local_stt->Stop();
     if (stt_model_downloader) stt_model_downloader->Cancel();
     audio_capture->Stop();
+    if (!state.StopPreferencesWriter()) {
+        LVA_LOGW(kTag, "final preferences flush failed; latest changes may not be saved");
+    }
+    lva::tr::StopDeviceEffects();
 
     const int signo = g_shutdown_signal.load(std::memory_order_relaxed);
     if (signo != 0) {

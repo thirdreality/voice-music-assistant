@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -55,11 +56,22 @@ class Preferences {
 
     static Preferences ForPath(const std::filesystem::path& storage_path);
 
-    static Preferences LoadFromFile(const std::filesystem::path& storage_path);
+    static Preferences LoadFromFile(const std::filesystem::path& storage_path,
+                                    bool* loaded = nullptr, bool* corrupt = nullptr);
+    // Shared by the reader and writer: one periodic warning per path/30 s.
+    static bool ShouldLogWarning(const std::filesystem::path& storage_path);
 
     bool SaveToFile(const std::filesystem::path& storage_path) const;
+    // Empty keys means no changes. Merge only selected fields into the latest
+    // on-disk JSON, preserving changes made by external tools to other fields.
+    bool SaveFields(const std::filesystem::path& storage_path,
+                    const std::set<std::string>& keys, bool recover_corrupt = false) const;
+    std::set<std::string> ChangedFields(const Preferences& previous) const;
+    static std::set<std::string> AllFields();
 
    private:
+    bool Save(const std::filesystem::path& storage_path,
+              const std::set<std::string>* keys, bool recover_corrupt) const;
     Format format_ = Format::kPreferences;
     std::string raw_data_text_;
 };

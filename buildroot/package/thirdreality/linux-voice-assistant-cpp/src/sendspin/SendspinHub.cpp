@@ -10,7 +10,6 @@
 #include <pulse/pulseaudio.h>
 
 #include <fcntl.h>
-#include <spawn.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -32,13 +31,12 @@
 #include <thread>
 #include <vector>
 
+#include "tr/LedRing.h"
 #include "util/Diag.h"
 #include "util/Log.h"
 #ifdef LVA_DIAG_LOG
 #include "util/MemProbe.h"
 #endif
-
-extern char** environ;
 
 namespace lva::sendspin {
 
@@ -308,42 +306,8 @@ class FilePersistenceProvider : public SendspinPersistenceProvider {
 
 // ---------------------------------------------------------------------------
 // LED: tr-ledring animations (D-Bus) plus direct sysfs for loudness.
-// dbus-send runs through posix_spawn: LVA's SIGCHLD handler reaps children,
-// which breaks system().
+// Animation commands share LVA's bounded background effects worker.
 // ---------------------------------------------------------------------------
-
-void SpawnQuiet(char* const argv[]) {
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null",
-                                     O_RDONLY, 0);
-    posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null",
-                                     O_WRONLY, 0);
-    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null",
-                                     O_WRONLY, 0);
-    pid_t pid = 0;
-    const int rc = ::posix_spawn(&pid, argv[0], &actions, nullptr, argv,
-                                 environ);
-    posix_spawn_file_actions_destroy(&actions);
-    if (rc != 0) {
-        LVA_LOGW(kTag, "posix_spawn(%s) failed: %s", argv[0],
-                 std::strerror(rc));
-    }
-}
-
-void SendLedShow(bool to_idle, const std::string& array_arg) {
-    char prog[]    = "/usr/bin/dbus-send";
-    char system_a[] = "--system";
-    char type_a[]  = "--type=signal";
-    char path_a[]  = "/com/3r/EventBus";
-    char iface_a[] = "com._3reality.EventBus.LedShow";
-    char idle_t[]  = "boolean:true";
-    char idle_f[]  = "boolean:false";
-    std::string array_buf = array_arg;
-    char* argv[] = {prog, system_a, type_a, path_a, iface_a,
-                    to_idle ? idle_t : idle_f, array_buf.data(), nullptr};
-    SpawnQuiet(argv);
-}
 
 class LedColorController {
    public:
@@ -584,14 +548,11 @@ class LedColorController {
         WriteSysfs("/sys/class/leds/RGB_B/brightness", b);
     }
 
-    // No shell here (posix_spawn), so no quotes around the paths: the
-    // standalone client's quotes were stripped by system()'s shell.
     static void SendLedAnimation(const char* path, const char* next_path) {
-        SendLedShow(false, std::string("array:string:") + path + "," +
-                               next_path);
+        lva::tr::ShowAnimations(false, {path, next_path});
     }
 
-    static void SendLedIdle() { SendLedShow(true, "array:string:"); }
+    static void SendLedIdle() { lva::tr::ShowAnimations(true, {}); }
 
     std::mutex mu_;
     std::uint8_t base_r_ = 0, base_g_ = 0, base_b_ = 0;

@@ -1,6 +1,9 @@
 
 #pragma once
 
+#include <string>
+#include <vector>
+
 namespace lva::tr {
 
 enum class LedState {
@@ -14,8 +17,9 @@ enum class LedState {
 };
 
 void Show(LedState state);
+void ShowAnimations(bool to_idle, const std::vector<std::string>& paths);
 
-// Brief volume-changed LED feedback (non-blocking fork of dbus-send).
+// Brief volume feedback, coalesced/throttled on the background worker.
 void ShowVolumeChanged();
 
 }  // namespace lva::tr

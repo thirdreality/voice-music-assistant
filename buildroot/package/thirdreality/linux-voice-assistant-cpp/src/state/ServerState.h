@@ -15,6 +15,7 @@
 
 #include "entities/Entity.h"
 #include "state/Preferences.h"
+#include "state/PreferencesWriter.h"
 #include "tr/NetworkPolicy.h"
 
 namespace lva::audio    { class AudioCapture; class WebRtcProcessor; class IAudioPlayer; class WakeWordEngine; }
@@ -84,8 +85,26 @@ class ServerState {
 
     std::vector<std::unique_ptr<entities::Entity>> entities;
 
-    bool SavePreferences() const {
-        return preferences.SaveToFile(preferences_path);
+    bool StartPreferencesWriter() {
+        return preferences_writer_.Start(preferences_path, preferences);
+    }
+
+    // True acknowledges queuing, not durable persistence. The worker reports
+    // write failures and retries; StopPreferencesWriter flushes on exit.
+    bool SavePreferences(bool force = false) {
+        return preferences_writer_.Queue(preferences, force);
+    }
+    bool RequestPreferencesRecovery() {
+        return preferences_writer_.Recover(preferences);
+    }
+    std::uint64_t PreferencesRevision() const {
+        return preferences_writer_.Revision();
+    }
+    bool CanApplyExternalPreference(const std::string& key, std::uint64_t revision) const {
+        return preferences_writer_.CanApplyExternal(key, revision);
+    }
+    bool StopPreferencesWriter() {
+        return preferences_writer_.Stop();
     }
 
     void PersistVolume(double new_volume);
@@ -124,6 +143,7 @@ class ServerState {
     void PersistTtsRate(int rate_wpm);
 
    private:
+    PreferencesWriter preferences_writer_;
     struct PendingNotification {
         std::string title;
         std::string message;

@@ -1,16 +1,10 @@
 #include "tr/LedRing.h"
 
-#include <fcntl.h>
-#include <signal.h>
-#include <spawn.h>
-#include <unistd.h>
-
-#include <cstring>
 #include <string>
+#include <utility>
 
+#include "tr/DeviceEffects.h"
 #include "util/Log.h"
-
-extern char** environ;
 
 namespace lva::tr {
 
@@ -46,89 +40,29 @@ bool IsTerminal(LedState s) {
 
 }  // namespace
 
+void ShowAnimations(bool to_idle, const std::vector<std::string>& paths) {
+    std::string array_arg = "array:string:";
+    for (std::size_t i = 0; i < paths.size(); ++i) {
+        if (i != 0) array_arg += ',';
+        array_arg += paths[i];
+    }
+    // Sendspin rewrites dynamic animation files in place; identical paths do
+    // not imply identical contents, so only coalesce pending requests here.
+    QueueLedAnimation(to_idle, std::move(array_arg), false, false);
+}
+
 void Show(LedState state) {
     const char* anim_name = AnimationFor(state);
     if (anim_name == nullptr) {
         LVA_LOGW(kTag, "unknown LED state");
         return;
     }
-    std::string anim_path = std::string(kAnimDir) + anim_name;
-
-    const char* to_idle_str = IsTerminal(state) ? "boolean:true"
-                                                : "boolean:false";
-    std::string array_arg = std::string("array:string:") + anim_path;
-
-    char prog[]    = "/usr/bin/dbus-send";
-    char system_a[]= "--system";
-    char type_a[]  = "--type=signal";
-    char path_a[]  = "/com/3r/EventBus";
-    char iface_a[] = "com._3reality.EventBus.LedShow";
-    char to_idle_buf[24];
-    std::strncpy(to_idle_buf, to_idle_str, sizeof(to_idle_buf) - 1);
-    to_idle_buf[sizeof(to_idle_buf) - 1] = '\0';
-    std::string array_buf = array_arg;
-
-    char* argv[] = {
-        prog, system_a, type_a, path_a, iface_a,
-        to_idle_buf, array_buf.data(), nullptr,
-    };
-
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO,
-                                     "/dev/null", O_RDONLY, 0);
-    posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO,
-                                     "/dev/null", O_WRONLY, 0);
-    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO,
-                                     "/dev/null", O_WRONLY, 0);
-
-    pid_t pid = 0;
-    const int rc = ::posix_spawn(&pid, prog, &actions, nullptr,
-                                 argv, environ);
-    posix_spawn_file_actions_destroy(&actions);
-    if (rc != 0) {
-        LVA_LOGW(kTag, "posix_spawn failed: %s", std::strerror(rc));
-        return;
-    }
-    LVA_LOGD(kTag, "show '%s' (pid=%d)", anim_name, (int)pid);
+    QueueLedAnimation(IsTerminal(state), std::string("array:string:") + kAnimDir + anim_name);
 }
 
 void ShowVolumeChanged() {
-    std::string anim_path =
-        std::string(kAnimDir) + "volume-changed.animation";
-    std::string array_arg = std::string("array:string:") + anim_path;
-
-    char prog[]    = "/usr/bin/dbus-send";
-    char system_a[]= "--system";
-    char type_a[]  = "--type=signal";
-    char path_a[]  = "/com/3r/EventBus";
-    char iface_a[] = "com._3reality.EventBus.LedShow";
-    char to_idle[] = "boolean:false";
-    std::string array_buf = array_arg;
-
-    char* argv[] = {
-        prog, system_a, type_a, path_a, iface_a,
-        to_idle, array_buf.data(), nullptr,
-    };
-
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO,
-                                     "/dev/null", O_RDONLY, 0);
-    posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO,
-                                     "/dev/null", O_WRONLY, 0);
-    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO,
-                                     "/dev/null", O_WRONLY, 0);
-
-    pid_t pid = 0;
-    const int rc = ::posix_spawn(&pid, prog, &actions, nullptr,
-                                 argv, environ);
-    posix_spawn_file_actions_destroy(&actions);
-    if (rc != 0) {
-        LVA_LOGW(kTag, "posix_spawn failed: %s", std::strerror(rc));
-        return;
-    }
-    LVA_LOGD(kTag, "show 'volume-changed' (pid=%d)", (int)pid);
+    QueueLedAnimation(false, std::string("array:string:") + kAnimDir +
+                             "volume-changed.animation", true);
 }
 
 }  // namespace lva::tr

@@ -17,11 +17,13 @@ class SoundConfWatcher {
     void Poll();
 
    private:
-    void ReloadAndApply();
+    bool ReloadAndApply();  // False means a background save raced with the read.
 
     lva::state::ServerState& state_;
     std::filesystem::path    path_;
     struct timespec          last_mtime_{0, 0};
+    bool                     have_stamp_ = false;
+    unsigned                 invalid_reads_ = 0;
     std::chrono::steady_clock::time_point last_check_{};
 };
 

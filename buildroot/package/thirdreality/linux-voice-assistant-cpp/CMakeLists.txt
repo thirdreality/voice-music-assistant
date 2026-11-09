@@ -186,6 +186,7 @@ add_executable(linux-voice-assistant-cpp
     src/protocol/ApiServer.cpp
     src/protocol/MdnsPublisher.cpp
     src/state/Preferences.cpp
+    src/state/PreferencesWriter.cpp
     src/state/ServerState.cpp
     src/state/ServerState_Notify.cpp
     src/audio/LibMpvPlayer.cpp
@@ -208,6 +209,7 @@ add_executable(linux-voice-assistant-cpp
     src/sendspin/SendspinHub.cpp
     src/tr/ControlListener.cpp
     src/tr/LedRing.cpp
+    src/tr/DeviceEffects.cpp
     src/tr/MicMuteGpio.cpp
     src/tr/ModelDownloader.cpp
     src/tr/NetworkPolicy.cpp
