@@ -77,6 +77,8 @@ class Satellite {
     void StopAudioStreaming();
     // Open the mic and ask HA to start listening (continued conversation).
     void BeginListening();
+    // True if scheduled now or already waiting for the settle timer.
+    bool ScheduleContinuedListening(const char* reason);
     void PumpAudioToHa();
     void OnVoiceEvent(int event_type,
                       const std::vector<std::pair<std::string, std::string>>& data);

@@ -447,6 +447,33 @@ void Satellite::BeginListening() {
     ArmHaWatchdog(kHaStartTimeout);
 }
 
+bool Satellite::ScheduleContinuedListening(const char* reason) {
+    const bool pipeline = pipeline_active_.load(std::memory_order_relaxed);
+    const bool continuing = continue_conversation_.load(std::memory_order_relaxed);
+    const bool speech = speech_active_.load(std::memory_order_relaxed);
+    if (!pipeline || !continuing || speech) {
+        LVA_LOGD(kTag, "%s — not continuing: pipeline=%d continue=%d speech=%d",
+                 reason, pipeline ? 1 : 0, continuing ? 1 : 0, speech ? 1 : 0);
+        return false;
+    }
+
+    // The current turn has finished. The settle timer owns the transition until
+    // BeginListening() starts the next run and arms its start watchdog.
+    DisarmHaWatchdog();
+    const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    std::int64_t expected = 0;
+    if (!continue_listen_at_ns_.compare_exchange_strong(
+            expected, now_ns + state_.continue_conversation_delay_ns,
+            std::memory_order_release, std::memory_order_relaxed)) {
+        return true;  // Already scheduled; do not postpone or end the turn.
+    }
+    lva::tr::Show(lva::tr::LedState::Thinking);
+    LVA_LOGI(kTag, "%s — continuing conversation after %lld ms", reason,
+             static_cast<long long>(state_.continue_conversation_delay_ns / 1'000'000));
+    return true;
+}
+
 void Satellite::PlayTts() {
     if (tts_url_.empty()) {
         LVA_LOGW(kTag, "PlayTts called with empty url");
@@ -467,6 +494,7 @@ void Satellite::PlayTts() {
     lva::tr::Show(lva::tr::LedState::Speaking);
 
     if (timer_ringing_) StopTimerRing();
+    continue_listen_at_ns_.store(0, std::memory_order_relaxed);
     speech_active_ = true;
     if (!announce_player_->Play(tts_url_, [this](bool ok) {
         if (!ok) LVA_LOGW(kTag, "TTS playback failed asynchronously");
@@ -493,24 +521,15 @@ void Satellite::FinishSpeech(bool success) {
         done.set_success(success);
         state_.broadcast(lva::proto::kIdVoiceAssistantAnnounceFinished, done);
     }
-    if (continue_conversation_) {
-        LVA_LOGI(kTag, "speech done — continuing conversation after %lld ms",
-                 static_cast<long long>(
-                     state_.continue_conversation_delay_ns / 1'000'000));
-        lva::tr::Show(lva::tr::LedState::Thinking);
-        const auto now_ns =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
-        continue_listen_at_ns_.store(
-            now_ns + state_.continue_conversation_delay_ns,
-            std::memory_order_release);
-    } else {
-        pipeline_active_ = false;
-        active_wake_phrase_.clear();
-        lva::tr::Show(lva::tr::LedState::Idle);
-        Unduck();
-        ::malloc_trim(0);
-    }
+    if (continue_conversation_ && ScheduleContinuedListening("speech done")) return;
+    DisarmHaWatchdog();
+    pipeline_active_ = false;
+    continue_conversation_ = false;
+    continue_listen_at_ns_.store(0, std::memory_order_relaxed);
+    active_wake_phrase_.clear();
+    lva::tr::Show(lva::tr::LedState::Idle);
+    Unduck();
+    ::malloc_trim(0);
 }
 
 void Satellite::PlayAnnounce(const std::string& media_id,
@@ -673,8 +692,11 @@ void Satellite::OnTimerSoundEof(bool success) {
 void Satellite::OnVoiceEvent(
     int event_type,
     const std::vector<std::pair<std::string, std::string>>& data) {
-    // HA is alive and driving this run.
-    if (ha_deadline_ != std::chrono::steady_clock::time_point{}) {
+    // An event (including RUN_START) may arrive after the settle path disarmed
+    // the previous deadline. Restore protection for an active HA turn, rather
+    // than requiring the old watchdog to still be armed. Local voice and
+    // speech playback have their own completion paths.
+    if (pipeline_active_ && !speech_active_ && !LocalVoiceEnabled()) {
         ArmHaWatchdog(kHaEventTimeout);
     }
     switch (event_type) {
@@ -760,6 +782,10 @@ void Satellite::OnVoiceEvent(
             break;
 
         case kEvtRunEnd:
+            if (!pipeline_active_) {
+                LVA_LOGD(kTag, "ignoring RUN_END for an inactive pipeline");
+                break;
+            }
             for (const auto& [k, v] : data) {
                 if (k == "continue_conversation" && v == "1") {
                     continue_conversation_ = true;
@@ -771,7 +797,7 @@ void Satellite::OnVoiceEvent(
             StopAudioStreaming();
             if (!tts_played_) {
                 if (continue_conversation_) {
-                    lva::tr::Show(lva::tr::LedState::Listening);
+                    ScheduleContinuedListening("RUN_END without TTS");
                 } else {
                     DisarmHaWatchdog();
                     pipeline_active_ = false;
@@ -808,9 +834,13 @@ void Satellite::OnLoopTick() {
                 std::chrono::steady_clock::now().time_since_epoch()).count();
         if (now_ns >= listen_at) {
             continue_listen_at_ns_.store(0, std::memory_order_relaxed);
-            if (state_.muted.load(std::memory_order_relaxed)) {
+            if (!pipeline_active_ || !continue_conversation_ || speech_active_) {
+                LVA_LOGD(kTag, "continued conversation skipped: turn ended or speech active");
+            } else if (state_.muted.load(std::memory_order_relaxed)) {
                 LVA_LOGD(kTag, "continued conversation skipped: muted");
                 pipeline_active_ = false;
+                continue_conversation_ = false;
+                active_wake_phrase_.clear();
                 lva::tr::Show(lva::tr::LedState::Idle);
                 Unduck();
             } else {
@@ -1138,17 +1168,13 @@ void Satellite::SpeakLocal(const std::string& text) {
 }
 
 void Satellite::FinishLocalTurn() {
-    if (continue_conversation_) {
-        const auto now_ns =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
-        continue_listen_at_ns_.store(
-            now_ns + state_.continue_conversation_delay_ns,
-            std::memory_order_release);
-        return;
-    }
+    if (continue_conversation_ && ScheduleContinuedListening("local turn done")) return;
+    DisarmHaWatchdog();
+    continue_conversation_ = false;
+    continue_listen_at_ns_.store(0, std::memory_order_relaxed);
     conversation_id_.clear();
     pipeline_active_ = false;
+    active_wake_phrase_.clear();
     lva::tr::Show(lva::tr::LedState::Idle);
     Unduck();
     ::malloc_trim(0);
