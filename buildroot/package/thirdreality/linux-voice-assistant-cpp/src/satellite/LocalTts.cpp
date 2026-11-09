@@ -89,12 +89,28 @@ std::uint64_t LocalTts::Submit(std::string text) {
     cancel_current_.store(true, std::memory_order_relaxed);
     DiscardResult();
     pending_ = Request{++generation_, std::move(text)};
+    progress_at_ = std::chrono::steady_clock::now();
     changed_.notify_one();
     return generation_;
 }
 
 void LocalTts::Cancel(bool timed_out) {
     std::lock_guard lock(mutex_);
+    CancelLocked(timed_out);
+}
+
+bool LocalTts::TryCancelStalled(std::uint64_t generation,
+                               std::chrono::steady_clock::duration timeout) {
+    std::lock_guard lock(mutex_);
+    if (generation != generation_ || result_ ||
+        std::chrono::steady_clock::now() - progress_at_ < timeout) {
+        return false;
+    }
+    CancelLocked(true);
+    return true;
+}
+
+void LocalTts::CancelLocked(bool timed_out) {
     ++generation_;
     cancel_current_.store(true, std::memory_order_relaxed);
     pending_.reset();
@@ -105,6 +121,21 @@ void LocalTts::Cancel(bool timed_out) {
 bool LocalTts::Busy() const {
     std::lock_guard lock(mutex_);
     return busy_ || pending_.has_value();
+}
+
+std::optional<std::chrono::steady_clock::time_point> LocalTts::ProgressAt(
+    std::uint64_t generation) const {
+    std::lock_guard lock(mutex_);
+    if (generation != generation_) return std::nullopt;
+    return progress_at_;
+}
+
+void LocalTts::ReportProgress(std::uint64_t generation) {
+    std::lock_guard lock(mutex_);
+    if (generation == generation_ && !stopping_ &&
+        !cancel_current_.load(std::memory_order_relaxed)) {
+        progress_at_ = std::chrono::steady_clock::now();
+    }
 }
 
 void LocalTts::DiscardResult() {
@@ -166,8 +197,10 @@ void LocalTts::ThreadMain() {
         try {
             std::vector<std::int16_t> pcm;
             const auto started = std::chrono::steady_clock::now();
+            ReportProgress(request.generation);
             engine.SetSpeed(speed);
-            if (ready && engine.Synthesize(request.text, pcm, cancel_current_) &&
+            if (ready && engine.Synthesize(request.text, pcm, cancel_current_,
+                    [this, generation = request.generation] { ReportProgress(generation); }) &&
                 !cancel_current_.load(std::memory_order_relaxed)) {
                 std::error_code ec;
                 std::filesystem::create_directories(kTtsDir, ec);

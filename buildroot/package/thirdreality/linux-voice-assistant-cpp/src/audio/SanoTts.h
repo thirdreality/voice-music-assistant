@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <atomic>
 #include <string>
@@ -33,9 +34,14 @@ class SanoTts final : public ITextToSpeech {
     bool Synthesize(const std::string& text,
                     std::vector<std::int16_t>& out_pcm) override;
     // Cooperative cancellation between model stages and decoder chunks.
+    // Progress runs on the synthesis thread after completed stages/chunks.
     bool Synthesize(const std::string& text,
                     std::vector<std::int16_t>& out_pcm,
                     const std::atomic<bool>& cancelled);
+    bool Synthesize(const std::string& text,
+                    std::vector<std::int16_t>& out_pcm,
+                    const std::atomic<bool>& cancelled,
+                    const std::function<void()>& progress);
     int SampleRate() const override;
 
     // Takes effect from the next Synthesize(). Same thread as Synthesize().
@@ -44,7 +50,8 @@ class SanoTts final : public ITextToSpeech {
    private:
     bool SynthesizeImpl(const std::string& text,
                         std::vector<std::int16_t>& out_pcm,
-                        const std::atomic<bool>* cancelled);
+                        const std::atomic<bool>* cancelled,
+                        const std::function<void()>& progress);
     struct Impl;
     Config                config_;
     std::unique_ptr<Impl> impl_;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
@@ -32,7 +33,14 @@ class LocalTts {
     std::uint64_t Submit(std::string text);
     // After a timeout, reject new jobs until the in-flight call returns.
     void Cancel(bool timed_out = false);
+    // Recheck completion/progress and cancel atomically under mutex_. A result
+    // or fresh progress published after the caller's poll wins over timeout.
+    bool TryCancelStalled(std::uint64_t generation,
+                          std::chrono::steady_clock::duration timeout);
     bool Busy() const;
+    // Only real synthesis progress for this generation renews the watchdog.
+    std::optional<std::chrono::steady_clock::time_point> ProgressAt(
+        std::uint64_t generation) const;
     std::optional<Result> TakeResult();
 
    private:
@@ -41,7 +49,9 @@ class LocalTts {
         std::string text;
     };
     void ThreadMain();
+    void ReportProgress(std::uint64_t generation);
     void DiscardResult();  // mutex_ held.
+    void CancelLocked(bool timed_out);  // mutex_ held.
 
     lva::audio::SanoTts::Config config_;
     std::thread thread_;
@@ -53,6 +63,7 @@ class LocalTts {
     bool recovering_ = false;
     float speed_;
     std::uint64_t generation_ = 0;
+    std::chrono::steady_clock::time_point progress_at_{};
     std::optional<Request> pending_;
     std::optional<Result> result_;
 };

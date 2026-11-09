@@ -63,7 +63,7 @@ constexpr int kTimerMaxRingSeconds = 900;
 
 // LLM conversation agents can take several seconds.
 constexpr auto kIntentTimeout = std::chrono::seconds(15);
-constexpr auto kLocalTtsTimeout = std::chrono::seconds(60);
+constexpr auto kLocalTtsStallTimeout = std::chrono::seconds(60);
 
 // HA sends RUN_START right after VoiceAssistantRequest(start=true). If it
 // does not, the run was never created and the mic would stream forever.
@@ -569,7 +569,7 @@ void Satellite::PlayAnnounce(const std::string& media_id,
         const auto generation = local_.tts->Submit(text);
         if (generation != 0) {
             pending_tts_ = PendingTts{generation, media_id, preannounce_media_id,
-                std::chrono::steady_clock::now() + kLocalTtsTimeout};
+                std::chrono::steady_clock::now() + kLocalTtsStallTimeout};
             lva::tr::Show(lva::tr::LedState::Thinking);
             return;
         }
@@ -1096,10 +1096,32 @@ void Satellite::CancelLocalTts(bool timed_out) {
 
 void Satellite::PollLocalTts() {
     if (!local_.tts) return;
-    if (pending_tts_ && std::chrono::steady_clock::now() >= pending_tts_->deadline) {
-        LVA_LOGW(kTag, "local TTS timed out after 60 s (job=%llu); cancelling turn",
-                 static_cast<unsigned long long>(pending_tts_->generation));
+    // Consume a completed result first: a delayed main-loop tick must not
+    // discard a successful job just because its old deadline has elapsed.
+    auto result = local_.tts->TakeResult();
+    if (!result) {
+        if (!pending_tts_) return;
+        if (const auto progress = local_.tts->ProgressAt(pending_tts_->generation)) {
+            pending_tts_->deadline = std::max(pending_tts_->deadline,
+                                             *progress + kLocalTtsStallTimeout);
+        }
+        if (std::chrono::steady_clock::now() < pending_tts_->deadline) return;
+        // The worker may publish a result/progress between the reads above.
+        // Recheck and invalidate the generation atomically before falling back.
+        if (!local_.tts->TryCancelStalled(pending_tts_->generation,
+                                         kLocalTtsStallTimeout)) return;
+
+        auto pending = std::move(*pending_tts_);
+        LVA_LOGW(kTag, "local TTS made no progress for 60 s (job=%llu); cancelling synthesis",
+                 static_cast<unsigned long long>(pending.generation));
         CancelLocalTts(true);
+        if (!local_speech_ && !pending.fallback_media_id.empty() &&
+            speech_active_ && pipeline_active_ && !state_.muted.load()) {
+            LVA_LOGW(kTag, "local TTS stalled; falling back to announcement media: %s",
+                     pending.fallback_media_id.c_str());
+            PlayAnnouncementMedia(pending.fallback_media_id, pending.preannounce_media_id);
+            return;
+        }
         continue_conversation_ = false;
         continue_listen_at_ns_.store(0, std::memory_order_relaxed);
         if (local_speech_) {
@@ -1111,8 +1133,6 @@ void Satellite::PollLocalTts() {
         }
         return;
     }
-    auto result = local_.tts->TakeResult();
-    if (!result) return;
     const bool current = pending_tts_ && result->generation == pending_tts_->generation;
     if (!current ||
         !speech_active_ || !pipeline_active_ || state_.muted.load()) {
@@ -1161,7 +1181,7 @@ void Satellite::SpeakLocal(const std::string& text) {
         return;
     }
     pending_tts_ = PendingTts{generation, {}, {},
-        std::chrono::steady_clock::now() + kLocalTtsTimeout};
+        std::chrono::steady_clock::now() + kLocalTtsStallTimeout};
     lva::tr::Show(lva::tr::LedState::Thinking);
     pipeline_active_ = true;
     speech_active_ = true;

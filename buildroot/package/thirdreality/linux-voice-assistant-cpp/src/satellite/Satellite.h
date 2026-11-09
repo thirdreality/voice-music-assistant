@@ -181,6 +181,7 @@ class Satellite {
         std::uint64_t generation;
         std::string fallback_media_id;
         std::string preannounce_media_id;
+        // Renewed only by actual model/chunk progress, not wall-clock polling.
         std::chrono::steady_clock::time_point deadline;
     };
     std::optional<PendingTts> pending_tts_;

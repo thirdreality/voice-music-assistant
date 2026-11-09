@@ -418,18 +418,26 @@ void SanoTts::SetSpeed(float speed) {
 
 bool SanoTts::Synthesize(const std::string& text,
                          std::vector<std::int16_t>& out_pcm) {
-    return SynthesizeImpl(text, out_pcm, nullptr);
+    return SynthesizeImpl(text, out_pcm, nullptr, {});
 }
 
 bool SanoTts::Synthesize(const std::string& text,
                          std::vector<std::int16_t>& out_pcm,
                          const std::atomic<bool>& cancelled) {
-    return SynthesizeImpl(text, out_pcm, &cancelled);
+    return SynthesizeImpl(text, out_pcm, &cancelled, {});
+}
+
+bool SanoTts::Synthesize(const std::string& text,
+                         std::vector<std::int16_t>& out_pcm,
+                         const std::atomic<bool>& cancelled,
+                         const std::function<void()>& progress) {
+    return SynthesizeImpl(text, out_pcm, &cancelled, progress);
 }
 
 bool SanoTts::SynthesizeImpl(const std::string& text,
                              std::vector<std::int16_t>& out_pcm,
-                             const std::atomic<bool>* cancelled) {
+                             const std::atomic<bool>* cancelled,
+                             const std::function<void()>& progress) {
     out_pcm.clear();
     const auto is_cancelled = [&] {
         return cancelled && cancelled->load(std::memory_order_relaxed);
@@ -446,6 +454,8 @@ bool SanoTts::SynthesizeImpl(const std::string& text,
         LVA_LOGW(kTag, "no phonemes for '%s'", text.c_str());
         return false;
     }
+
+    if (progress) progress();
 
     // Students can have a smaller vocabulary than the G2P table.
     std::vector<std::int32_t> local_ids(ids.size());
@@ -476,6 +486,8 @@ bool SanoTts::SynthesizeImpl(const std::string& text,
         return false;
     }
 
+    if (progress) progress();
+
     std::vector<float> latent(static_cast<std::size_t>(m.front.a_out) *
                               static_cast<std::size_t>(frames));
     {
@@ -492,6 +504,7 @@ bool SanoTts::SynthesizeImpl(const std::string& text,
         }
     }
     if (is_cancelled()) return false;
+    if (progress) progress();
     const auto t1 = std::chrono::steady_clock::now();
 
     // Decode in overlapping chunks; keep only each chunk's core.
@@ -531,6 +544,7 @@ bool SanoTts::SynthesizeImpl(const std::string& text,
             out_pcm[static_cast<std::size_t>(j)] = static_cast<std::int16_t>(
                 std::lrintf(std::clamp(v, -32768.0f, 32767.0f)));
         }
+        if (progress) progress();
     }
 
     const auto t2 = std::chrono::steady_clock::now();
