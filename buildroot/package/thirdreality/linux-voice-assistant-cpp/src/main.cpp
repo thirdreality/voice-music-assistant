@@ -155,7 +155,7 @@ void PrintUsage(const char* argv0) {
         "  --host <addr>            Bind address (default: 0.0.0.0)\n"
         "  --preferences-file <p>   JSON file for persisted prefs\n"
         "                           (default: /data/conf/sound.json)\n"
-        "  --wakeword-dir <dir>     Wake-word model directory\n"
+        "  --wakeword-type <type>   micro|open (default: micro); selects model directory\n"
         "  --wakeword-models <ids>  Comma-separated model IDs (default: okay_nabu)\n"
         "  --audio-device <dev>     PulseAudio device name\n"
         "  --capture-backend <b>    Capture backend: alsa|pulse (default: alsa)\n"
@@ -316,8 +316,11 @@ bool ParseCli(int argc, char** argv, CliOptions& out) {
                 break;
             }
             case 'p': {
-                const long v = std::strtol(optarg, nullptr, 10);
-                if (v <= 0 || v > 65535) {
+                char* end = nullptr;
+                errno = 0;
+                const long v = std::strtol(optarg, &end, 10);
+                if (errno == ERANGE || end == optarg || *end != '\0' ||
+                    v <= 0 || v > 65535) {
                     std::fprintf(stderr, "Invalid --port: %s\n", optarg);
                     return false;
                 }
