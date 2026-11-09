@@ -3,11 +3,9 @@
 #include <algorithm>
 #include <cstring>
 
-#include "audio/LibMpvPlayer.h"
 #include "audio/MicroWakeWord.h"
 #include "audio/WebRtcProcessor.h"
 #include "protocol/MessageRegistry.h"
-#include "satellite/Satellite.h"
 #include "sendspin/SendspinHub.h"
 #include "state/ServerState.h"
 #include "util/Log.h"
@@ -48,52 +46,49 @@ bool IsActiveState(lva::audio::PlayerState state) {
 
 MediaPlayerEntity::MediaPlayerEntity(std::uint32_t key,
                                      lva::state::ServerState& state,
-                                     lva::audio::IAudioPlayer* player)
-    : Entity(key, kObjectId, kDisplayName), state_(state), player_(player) {
+                                     lva::audio::IAudioPlayer* player,
+                                     lva::audio::IAudioPlayer* announce_player,
+                                     lva::audio::WebRtcProcessor& processor)
+    : Entity(key, kObjectId, kDisplayName), state_(state), announce_player_(announce_player),
+      processor_(&processor), player_(player) {
     pre_mute_volume_ = state_.volume.load(std::memory_order_relaxed);
     if (player_ != nullptr) {
-        auto* mpv = dynamic_cast<lva::audio::LibMpvPlayer*>(player_);
-        if (mpv != nullptr) {
-            mpv->SetStateChangedCallback(
-                [this](lva::audio::PlayerState s) {
-                    OnPlayerStateChanged(s);
-                });
-        }
+        player_->SetStateChangedCallback(
+            [this](lva::audio::PlayerState s) { OnPlayerStateChanged(s); });
     }
+    if (announce_player_ != nullptr && announce_player_ != player_) {
+        announce_player_->SetStateChangedCallback(
+            [this](lva::audio::PlayerState s) { OnPlayerStateChanged(s); });
+    }
+}
 
-    if (state_.announce_player != nullptr &&
-        state_.announce_player != player_) {
-        auto* mpv = dynamic_cast<lva::audio::LibMpvPlayer*>(
-            state_.announce_player);
-        if (mpv != nullptr) {
-            mpv->SetStateChangedCallback(
-                [this](lva::audio::PlayerState s) {
-                    OnPlayerStateChanged(s);
-                });
-        }
-    }
+MediaPlayerEntity::~MediaPlayerEntity() {
+    // Players outlive the entity; detach the observers that capture this.
+    if (player_ != nullptr) player_->SetStateChangedCallback({});
+    if (announce_player_ != nullptr && announce_player_ != player_)
+        announce_player_->SetStateChangedCallback({});
 }
 
 void MediaPlayerEntity::OnPlayerStateChanged(lva::audio::PlayerState s) {
     // AEC runs only while music or TTS plays (see SetFarEndActive). Check
     // both players; either one may have triggered this callback.
-    if (state_.webrtc_processor != nullptr) {
+    if (processor_ != nullptr) {
         auto is_active = [](lva::audio::PlayerState st) {
             return st == lva::audio::PlayerState::kLoading ||
                    st == lva::audio::PlayerState::kPlaying;
         };
         bool far_end = is_active(s);
-        if (state_.music_player != nullptr) {
-            far_end = far_end || is_active(state_.music_player->State());
+        if (player_ != nullptr) {
+            far_end = far_end || is_active(player_->State());
         }
-        if (state_.announce_player != nullptr) {
-            far_end = far_end || is_active(state_.announce_player->State());
+        if (announce_player_ != nullptr) {
+            far_end = far_end || is_active(announce_player_->State());
         }
-        state_.webrtc_processor->SetFarEndActive(far_end);
+        processor_->SetFarEndActive(far_end);
     }
 
-    const auto music_state = state_.music_player != nullptr
-        ? state_.music_player->State()
+    const auto music_state = player_ != nullptr
+        ? player_->State()
         : lva::audio::PlayerState::kIdle;
     if (IsActiveState(music_state)) last_source_ = Source::kMpv;
     const bool music_finished =
@@ -126,10 +121,10 @@ void MediaPlayerEntity::OnPlayerStateChanged(lva::audio::PlayerState s) {
 }
 
 MediaPlayerEntity::PlayState MediaPlayerEntity::CurrentPlayState() const {
-    const auto music_state = state_.music_player != nullptr
-        ? state_.music_player->State() : lva::audio::PlayerState::kIdle;
-    const auto announce_state = state_.announce_player != nullptr
-        ? state_.announce_player->State() : lva::audio::PlayerState::kIdle;
+    const auto music_state = player_ != nullptr
+        ? player_->State() : lva::audio::PlayerState::kIdle;
+    const auto announce_state = announce_player_ != nullptr
+        ? announce_player_->State() : lva::audio::PlayerState::kIdle;
     // Aggregate all sources: a failed announcement must not hide music or
     // Sendspin that is still playing (or an mpv source that remains paused).
     if (IsActiveState(music_state) || IsActiveState(announce_state) ||
@@ -167,7 +162,7 @@ bool MediaPlayerEntity::SendspinIsCommandTarget() const {
 }
 
 lva::audio::IAudioPlayer* MediaPlayerEntity::CommandPlayer() const {
-    auto* announce = state_.announce_player;
+    auto* announce = announce_player_;
     if (announce != nullptr) {
         const auto announce_state = announce->State();
         const bool announce_active =
@@ -175,8 +170,8 @@ lva::audio::IAudioPlayer* MediaPlayerEntity::CommandPlayer() const {
             announce_state == lva::audio::PlayerState::kPlaying ||
             announce_state == lva::audio::PlayerState::kPaused;
         const bool satellite_owns_announce =
-            state_.satellite != nullptr &&
-            state_.satellite->OwnsAnnouncePlayback();
+            voice_.owns_announcement &&
+            voice_.owns_announcement();
         if (announce_active && !satellite_owns_announce) return announce;
     }
     return player_;
@@ -222,8 +217,8 @@ void MediaPlayerEntity::OnSendspinActiveChanged(bool active) {
             player_->Stop();
         }
     }
-    if (state_.webrtc_processor != nullptr) {
-        state_.webrtc_processor->SetExternalFarEndActive(active);
+    if (processor_ != nullptr) {
+        processor_->SetExternalFarEndActive(active);
     }
     lva::audio::MicroWakeWord::SetFarEndTelemetry(active);
     const auto music_state = player_ != nullptr
@@ -446,11 +441,11 @@ void MediaPlayerEntity::OnCommand(
                 sendspin_->Deactivate();
             }
             lva::audio::IAudioPlayer* target =
-                announcement && state_.announce_player != nullptr
-                    ? state_.announce_player
+                announcement && announce_player_ != nullptr
+                    ? announce_player_
                     : player_;
-            if (announcement && state_.satellite != nullptr) {
-                state_.satellite->PrepareForMediaAnnouncement();
+            if (announcement && voice_.prepare_announcement) {
+                voice_.prepare_announcement();
             }
             if (target == nullptr || !target->Play(cmd.media_url())) {
                 LVA_LOGW(kTag, "PLAY_MEDIA could not start: %s", cmd.media_url().c_str());

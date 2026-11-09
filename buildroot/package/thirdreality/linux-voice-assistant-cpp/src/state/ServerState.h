@@ -18,12 +18,6 @@
 #include "state/PreferencesWriter.h"
 #include "tr/NetworkPolicy.h"
 
-namespace lva::audio    { class AudioCapture; class WebRtcProcessor; class IAudioPlayer; class WakeWordEngine; }
-namespace lva::satellite { class Satellite; }
-namespace lva::tr       { class MicMuteGpio; class Supervisor; }
-namespace lva::entities { class MediaPlayerEntity; class MuteSwitchEntity; }
-namespace lva::sendspin { class SendspinHub; }
-
 namespace lva::state {
 
 class ServerState {
@@ -47,28 +41,21 @@ class ServerState {
 
     std::int64_t continue_conversation_delay_ns = 500'000'000LL;
 
-    class ::lva::audio::AudioCapture* audio_capture = nullptr;
+    // Runtime side effects are supplied by the application, never discovered
+    // through concrete service pointers. Invoked on the main loop only.
+    struct PreferenceEffects {
+        std::function<void(double)> volume_changed;
+        std::function<void(bool)> muted_changed;
+        std::function<void(bool)> mute_sound;
+        std::function<void(int, double)> wake_sensitivity_changed;
+        std::function<void(double)> stop_sensitivity_changed;
+        std::function<void(int, int)> mic_levels_changed;
+    };
+    void SetPreferenceEffects(PreferenceEffects effects) { effects_ = std::move(effects); }
 
-    class ::lva::satellite::Satellite* satellite = nullptr;
-
-    class ::lva::audio::WebRtcProcessor* webrtc_processor = nullptr;
-
-    class ::lva::audio::WakeWordEngine* wakeword_engine = nullptr;
-
-    class ::lva::tr::MicMuteGpio* mic_mute_gpio = nullptr;
-
-    class ::lva::entities::MediaPlayerEntity* media_player_entity = nullptr;
-
-    class ::lva::entities::MuteSwitchEntity* mute_switch_entity = nullptr;
-
-    class ::lva::audio::IAudioPlayer* announce_player = nullptr;
-
-    class ::lva::audio::IAudioPlayer* music_player = nullptr;
-
-    // In-process Sendspin player; null while disabled.
-    class ::lva::sendspin::SendspinHub* sendspin = nullptr;
-
-    class ::lva::tr::Supervisor* supervisor = nullptr;
+    using VoiceMessageHandler = std::function<bool(
+        std::uint32_t, const ::google::protobuf::MessageLite&)>;
+    VoiceMessageHandler handle_voice_message;
 
     using BroadcastFn = std::function<bool(
         std::uint32_t msg_type_id,
@@ -143,6 +130,7 @@ class ServerState {
     void PersistTtsRate(int rate_wpm);
 
    private:
+    PreferenceEffects effects_;
     PreferencesWriter preferences_writer_;
     struct PendingNotification {
         std::string title;

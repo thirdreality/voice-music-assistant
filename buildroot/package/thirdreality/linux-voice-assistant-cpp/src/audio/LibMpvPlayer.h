@@ -46,7 +46,7 @@ class LibMpvPlayer final : public IAudioPlayer {
     int  DrainFd() const noexcept { return drain_fd_; }
 
     void SetStateChangedCallback(
-        std::function<void(PlayerState)> on_state_changed);
+        StateChangedCallback on_state_changed) override;
 
    private:
     static void OnMpvWakeupTrampoline(void* opaque);

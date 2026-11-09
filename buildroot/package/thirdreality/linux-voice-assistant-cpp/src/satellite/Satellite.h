@@ -37,7 +37,9 @@ class Satellite {
     Satellite(lva::state::ServerState& state,
               lva::audio::PcmRingBuffer& mic_ring,
               lva::audio::WakeWordEngine& engine,
-              lva::audio::IAudioPlayer* announce_player);
+              lva::audio::IAudioPlayer* announce_player,
+              lva::audio::IAudioPlayer& music_player,
+              std::function<void(bool)> duck_sendspin);
     ~Satellite();
 
     Satellite(const Satellite&)            = delete;
@@ -125,6 +127,8 @@ class Satellite {
         float       prob = 0.0f;
     };
 
+    lva::audio::IAudioPlayer* music_player_;
+    std::function<void(bool)> duck_sendspin_;
     lva::state::ServerState&    state_;
     lva::audio::PcmRingBuffer&  mic_ring_;
     lva::audio::WakeWordEngine& engine_;

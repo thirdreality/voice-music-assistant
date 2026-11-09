@@ -180,6 +180,17 @@ install(TARGETS lva_speech LIBRARY DESTINATION lib)
 
 add_executable(linux-voice-assistant-cpp
     src/main.cpp
+    src/app/ApiSetup.cpp
+    src/app/Application.cpp
+    src/app/AudioSetup.cpp
+    src/app/CliOptions.cpp
+    src/app/EntitySetup.cpp
+    src/app/PreferenceEffects.cpp
+    src/app/Runtime.cpp
+    src/app/SendspinService.cpp
+    src/app/Signals.cpp
+    src/app/VoiceSetup.cpp
+    src/app/WakeSetup.cpp
     src/protocol/Frame.cpp
     src/protocol/MessageRegistry.cpp
     src/protocol/Connection.cpp
@@ -232,6 +243,7 @@ add_executable(linux-voice-assistant-cpp
     src/entities/UpdateEntity.cpp
     src/entities/UpdateEntity_Ota.cpp
     src/util/Log.cpp
+    src/util/Md5.cpp
     src/util/Sha256.cpp
 )
 

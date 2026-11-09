@@ -124,7 +124,7 @@ void UpdateEntity::ScheduleCheck(lva::tr::RequestSource source) {
 }
 
 void UpdateEntity::ScheduleInstall() {
-    if (!state_.supervisor || check_.valid() || installing_) return;
+    if (check_.valid() || installing_) return;
     if (download_url_.empty() || expected_md5_.empty()) {
         ScheduleCheck(lva::tr::RequestSource::Explicit);
         return;
@@ -134,7 +134,7 @@ void UpdateEntity::ScheduleInstall() {
     release.version = latest_version_;
     release.expected_md5 = expected_md5_;
     release.source = lva::tr::RequestSource::Explicit;
-    installing_ = !state_.supervisor->StartOtaUpdateAsync(release).empty();
+    installing_ = !supervisor_.StartOtaUpdateAsync(release).empty();
     in_progress_ = installing_;
     BroadcastState();
 }
@@ -149,8 +149,8 @@ void UpdateEntity::Poll() {
         }
     }
     if (installing_) {
-        const bool running = state_.supervisor->IsOtaRunning();
-        const auto status = state_.supervisor->GetOtaState();
+        const bool running = supervisor_.IsOtaRunning();
+        const auto status = supervisor_.GetOtaState();
         const bool changed = progress_ != status.progress || release_summary_ != status.message || !running;
         has_progress_ = true;
         progress_ = status.progress;

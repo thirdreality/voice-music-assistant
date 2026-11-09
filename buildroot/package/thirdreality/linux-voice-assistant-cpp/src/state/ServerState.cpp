@@ -3,18 +3,6 @@
 #include <algorithm>
 #include <cmath>
 
-#include "audio/IAudioPlayer.h"
-#include "audio/MicroWakeWord.h"
-#include "audio/OpenWakeWord.h"
-#include "audio/WakeWordEngine.h"
-#include "audio/WebRtcProcessor.h"
-#include "entities/MediaPlayerEntity.h"
-#include "entities/MuteSwitchEntity.h"
-#include "satellite/Satellite.h"
-#include "sendspin/SendspinHub.h"
-#include "tr/LedRing.h"
-#include "tr/MicMuteGpio.h"
-#include "tr/SystemVolume.h"
 #include "util/Log.h"
 
 namespace lva::state {
@@ -41,14 +29,7 @@ void ServerState::PersistVolume(double new_volume) {
     }
     volume.store(clamped, std::memory_order_relaxed);
     preferences.volume = clamped;
-    lva::tr::SetSystemVolume(static_cast<int>(clamped * 100.0 + 0.5));
-    lva::tr::ShowVolumeChanged();
-    if (sendspin != nullptr) {
-        sendspin->SetVolume(static_cast<int>(clamped * 100.0 + 0.5));
-    }
-    if (media_player_entity != nullptr) {
-        media_player_entity->BroadcastState();
-    }
+    if (effects_.volume_changed) effects_.volume_changed(clamped);
     if (!SavePreferences()) {
         LVA_LOGW(kTag, "PersistVolume(%.4f): save failed", clamped);
     }
@@ -62,29 +43,14 @@ void ServerState::PersistMuted(bool new_muted) {
 
     muted.store(new_muted, std::memory_order_relaxed);
     preferences.set_mic_muted(new_muted);
-    if (mic_mute_gpio != nullptr) {
-        mic_mute_gpio->SyncToHardware(new_muted);
-    }
-    if (new_muted && satellite != nullptr) {
-        satellite->OnMuted();
-    }
-    if (mute_switch_entity != nullptr) {
-        mute_switch_entity->BroadcastState();
-    }
-    if (media_player_entity != nullptr) {
-        media_player_entity->BroadcastState();
-    }
+    if (effects_.muted_changed) effects_.muted_changed(new_muted);
     if (!SavePreferences()) {
         LVA_LOGW(kTag, "PersistMuted(%d): save failed", new_muted ? 1 : 0);
     }
 }
 
 void ServerState::PlayMuteToggleSound(bool muted) {
-    if (announce_player == nullptr) return;
-    announce_player->Play(muted
-        ? "/usr/share/thirdreality/sounds/mute_switch_on.flac"
-        : "/usr/share/thirdreality/sounds/mute_switch_off.flac",
-        {});
+    if (effects_.mute_sound) effects_.mute_sound(muted);
 }
 
 void ServerState::PersistSendspinEnabled(bool enabled) {
@@ -125,31 +91,7 @@ void ServerState::PersistWakeWordSensitivity(int n, double value) {
                           : preferences.wake_word_2_sensitivity;
     if (slot.has_value() && std::abs(*slot - value) < 1e-4) return;
     slot = value;
-    if (wakeword_engine) {
-        const auto micro_models = wakeword_engine->SnapshotModels();
-        const std::size_t target_idx = static_cast<std::size_t>(n - 1);
-        std::size_t wake_idx = 0;
-        bool applied = false;
-        for (const auto& m : micro_models) {
-            if (m->config().id == "stop") continue;
-            if (wake_idx == target_idx) {
-                m->SetProbabilityCutoff(static_cast<float>(value));
-                applied = true;
-                break;
-            }
-            ++wake_idx;
-        }
-        if (!applied) {
-            const auto open_models = wakeword_engine->SnapshotOpenModels();
-            for (const auto& m : open_models) {
-                if (wake_idx == target_idx) {
-                    m->SetProbabilityCutoff(static_cast<float>(value));
-                    break;
-                }
-                ++wake_idx;
-            }
-        }
-    }
+    if (effects_.wake_sensitivity_changed) effects_.wake_sensitivity_changed(n, value);
     if (!SavePreferences()) {
         LVA_LOGW(kTag, "PersistWakeWordSensitivity(%d, %.4f): save failed",
                  n, value);
@@ -160,15 +102,7 @@ void ServerState::PersistStopWordSensitivity(double value) {
     auto& slot = preferences.stop_word_sensitivity;
     if (slot.has_value() && std::abs(*slot - value) < 1e-4) return;
     slot = value;
-    if (wakeword_engine) {
-        const auto micro_models = wakeword_engine->SnapshotModels();
-        for (const auto& m : micro_models) {
-            if (m->config().id == "stop") {
-                m->SetProbabilityCutoff(static_cast<float>(value));
-                break;
-            }
-        }
-    }
+    if (effects_.stop_sensitivity_changed) effects_.stop_sensitivity_changed(value);
     if (!SavePreferences()) {
         LVA_LOGW(kTag, "PersistStopWordSensitivity(%.4f): save failed", value);
     }
@@ -178,9 +112,8 @@ void ServerState::PersistMicAutoGain(int value) {
     const int clamped = std::clamp(value, 0, 31);
     if (preferences.mic_auto_gain == clamped) return;
     preferences.mic_auto_gain = clamped;
-    if (webrtc_processor != nullptr) {
-        webrtc_processor->SetLevels(clamped, preferences.mic_noise_suppression);
-    }
+    if (effects_.mic_levels_changed)
+        effects_.mic_levels_changed(clamped, preferences.mic_noise_suppression);
     if (!SavePreferences()) {
         LVA_LOGW(kTag, "PersistMicAutoGain(%d): save failed", clamped);
     }
@@ -190,9 +123,8 @@ void ServerState::PersistMicNoiseSuppression(int value) {
     const int clamped = std::clamp(value, 0, 4);
     if (preferences.mic_noise_suppression == clamped) return;
     preferences.mic_noise_suppression = clamped;
-    if (webrtc_processor != nullptr) {
-        webrtc_processor->SetLevels(preferences.mic_auto_gain, clamped);
-    }
+    if (effects_.mic_levels_changed)
+        effects_.mic_levels_changed(preferences.mic_auto_gain, clamped);
     if (!SavePreferences()) {
         LVA_LOGW(kTag, "PersistMicNoiseSuppression(%d): save failed", clamped);
     }

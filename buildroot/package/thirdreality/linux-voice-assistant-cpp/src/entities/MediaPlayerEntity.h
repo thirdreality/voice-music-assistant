@@ -3,11 +3,14 @@
 
 #include <cstdint>
 #include <string>
+#include <functional>
+#include <utility>
 
 #include "audio/IAudioPlayer.h"
 #include "entities/Entity.h"
 
 namespace lva::state { class ServerState; }
+namespace lva::audio { class WebRtcProcessor; }
 namespace lva::sendspin { class SendspinHub; }
 
 namespace lva::entities {
@@ -16,13 +19,24 @@ class MediaPlayerEntity final : public Entity {
    public:
     MediaPlayerEntity(std::uint32_t key,
                       lva::state::ServerState& state,
-                      lva::audio::IAudioPlayer* player);
+                      lva::audio::IAudioPlayer* player,
+                      lva::audio::IAudioPlayer* announce_player,
+                      lva::audio::WebRtcProcessor& processor);
 
     void OnListEntities(const ResponseSink& sink) override;
     void OnSubscribeStates(const ResponseSink& sink) override;
     void OnCommand(const ::google::protobuf::MessageLite& request,
                    std::uint32_t request_msg_type_id,
                    const ResponseSink& sink) override;
+
+    // Satellite is constructed later; these operations break the construction
+    // cycle without making the entity depend on a service registry.
+    struct VoiceActions {
+        std::function<bool()> owns_announcement;
+        std::function<void()> prepare_announcement;
+    };
+    void SetVoiceActions(VoiceActions actions) { voice_ = std::move(actions); }
+    ~MediaPlayerEntity() override;
 
     void BroadcastState();
     bool IsPlaying() const;
@@ -53,6 +67,9 @@ class MediaPlayerEntity final : public Entity {
     void PlaySendspinUri(const std::string& uri);
 
     lva::state::ServerState&  state_;
+    VoiceActions voice_;
+    lva::audio::IAudioPlayer* announce_player_;
+    lva::audio::WebRtcProcessor* processor_;
     lva::audio::IAudioPlayer* player_;     // not owned
     lva::sendspin::SendspinHub* sendspin_ = nullptr;  // not owned
     // Last source that played on the media pipeline; PLAY goes back to it.

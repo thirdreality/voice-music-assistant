@@ -27,8 +27,9 @@ constexpr int kEnumUpdateCmdInstall = 1;
 
 }  // namespace
 
-UpdateEntity::UpdateEntity(std::uint32_t key, lva::state::ServerState& state)
-    : Entity(key, kObjectId, kDisplayName), state_(state) {}
+UpdateEntity::UpdateEntity(std::uint32_t key, lva::state::ServerState& state,
+                           lva::tr::Supervisor& supervisor)
+    : Entity(key, kObjectId, kDisplayName), state_(state), supervisor_(supervisor) {}
 
 void UpdateEntity::OnListEntities(const ResponseSink& sink) {
     ::ListEntitiesUpdateResponse resp;

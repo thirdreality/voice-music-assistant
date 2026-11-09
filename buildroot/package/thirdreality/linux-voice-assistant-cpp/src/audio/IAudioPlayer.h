@@ -17,6 +17,7 @@ enum class PlayerState {
 class IAudioPlayer {
    public:
     using DoneCallback = std::function<void(bool ok)>;
+    using StateChangedCallback = std::function<void(PlayerState)>;
 
     virtual ~IAudioPlayer() = default;
 
@@ -36,6 +37,10 @@ class IAudioPlayer {
     virtual void SetGain(double normalized) = 0;
 
     virtual PlayerState State() const = 0;
+
+    // Single observer; an empty callback detaches it. Deliver on the main loop,
+    // and do not retain/invoke the previous observer after replacement returns.
+    virtual void SetStateChangedCallback(StateChangedCallback callback) = 0;
 };
 
 }  // namespace lva::audio

@@ -12,7 +12,6 @@
 
 #include "entities/Entity.h"
 #include "protocol/MessageRegistry.h"
-#include "satellite/Satellite.h"
 #include "tr/TimeZoneSync.h"
 #include "tr/TimeSync.h"
 #include "state/ServerState.h"
@@ -397,8 +396,8 @@ bool Connection::DispatchFrame(const InboundFrame& frame) {
                          peer_label_.c_str());
                 return false;
             }
-            if (state_.satellite) {
-                state_.satellite->HandleMessage(kIdVoiceAssistantResponse, m);
+            if (state_.handle_voice_message) {
+                state_.handle_voice_message(kIdVoiceAssistantResponse, m);
             }
             return true;
         }
@@ -410,8 +409,8 @@ bool Connection::DispatchFrame(const InboundFrame& frame) {
                          peer_label_.c_str());
                 return false;
             }
-            if (state_.satellite) {
-                state_.satellite->HandleMessage(
+            if (state_.handle_voice_message) {
+                state_.handle_voice_message(
                     kIdVoiceAssistantConfigurationRequest, m);
             }
             return true;
@@ -424,8 +423,8 @@ bool Connection::DispatchFrame(const InboundFrame& frame) {
                          peer_label_.c_str());
                 return false;
             }
-            if (state_.satellite) {
-                state_.satellite->HandleMessage(
+            if (state_.handle_voice_message) {
+                state_.handle_voice_message(
                     kIdVoiceAssistantSetConfiguration, m);
             }
             return true;
@@ -438,8 +437,8 @@ bool Connection::DispatchFrame(const InboundFrame& frame) {
                          peer_label_.c_str());
                 return false;
             }
-            if (state_.satellite) {
-                state_.satellite->HandleMessage(
+            if (state_.handle_voice_message) {
+                state_.handle_voice_message(
                     kIdVoiceAssistantEventResponse, m);
             }
             return true;
@@ -452,8 +451,8 @@ bool Connection::DispatchFrame(const InboundFrame& frame) {
                          peer_label_.c_str());
                 return false;
             }
-            if (state_.satellite) {
-                state_.satellite->HandleMessage(
+            if (state_.handle_voice_message) {
+                state_.handle_voice_message(
                     kIdVoiceAssistantTimerEventResponse, m);
             }
             return true;
@@ -466,8 +465,8 @@ bool Connection::DispatchFrame(const InboundFrame& frame) {
                          peer_label_.c_str());
                 return false;
             }
-            if (state_.satellite) {
-                state_.satellite->HandleMessage(
+            if (state_.handle_voice_message) {
+                state_.handle_voice_message(
                     kIdHomeassistantActionResponse, m);
             }
             return true;
@@ -480,8 +479,8 @@ bool Connection::DispatchFrame(const InboundFrame& frame) {
                          peer_label_.c_str());
                 return false;
             }
-            if (state_.satellite) {
-                state_.satellite->HandleMessage(
+            if (state_.handle_voice_message) {
+                state_.handle_voice_message(
                     kIdVoiceAssistantAnnounceRequest, m);
             }
             return true;

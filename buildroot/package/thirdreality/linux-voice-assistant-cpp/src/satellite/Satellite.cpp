@@ -22,7 +22,6 @@
 #include "satellite/LocalTts.h"
 #include "state/ServerState.h"
 #include "tr/LedRing.h"
-#include "sendspin/SendspinHub.h"
 #include "util/Log.h"
 
 #include "api.pb.h"
@@ -85,8 +84,11 @@ constexpr const char* kLocalIntentFailed =
 Satellite::Satellite(lva::state::ServerState& state,
                      lva::audio::PcmRingBuffer& mic_ring,
                      lva::audio::WakeWordEngine& engine,
-                     lva::audio::IAudioPlayer* announce_player)
-    : state_(state), mic_ring_(mic_ring), engine_(engine),
+                     lva::audio::IAudioPlayer* announce_player,
+                     lva::audio::IAudioPlayer& music_player,
+                     std::function<void(bool)> duck_sendspin)
+    : music_player_(&music_player), duck_sendspin_(std::move(duck_sendspin)),
+      state_(state), mic_ring_(mic_ring), engine_(engine),
       announce_player_(announce_player) {}
 
 Satellite::~Satellite() {
@@ -615,18 +617,18 @@ void Satellite::PlayAnnouncementMedia(const std::string& media_id,
 void Satellite::Duck() {
     if (ducked_) return;
     ducked_ = true;
-    if (state_.sendspin != nullptr) state_.sendspin->SetDucked(true);
-    if (state_.music_player) {
-        state_.music_player->SetGain(kDuckFactor);
+    if (duck_sendspin_) duck_sendspin_(true);
+    if (music_player_) {
+        music_player_->SetGain(kDuckFactor);
     }
 }
 
 void Satellite::Unduck() {
     if (!ducked_) return;
     ducked_ = false;
-    if (state_.sendspin != nullptr) state_.sendspin->SetDucked(false);
-    if (state_.music_player) {
-        state_.music_player->SetGain(1.0);
+    if (duck_sendspin_) duck_sendspin_(false);
+    if (music_player_) {
+        music_player_->SetGain(1.0);
     }
 }
 
@@ -915,7 +917,7 @@ void Satellite::OnDisconnected() {
     Unduck();
     lva::tr::Show(lva::tr::LedState::Idle);
     if (announce_player_) announce_player_->Stop();
-    if (state_.music_player) state_.music_player->Stop();
+    if (music_player_) music_player_->Stop();
     tts_url_.clear();
     tts_played_ = false;
 }

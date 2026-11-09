@@ -20,8 +20,9 @@ aarch64, Buildroot).
 - ThirdReality hardware: LED ring (D-Bus), mic mute GPIO, system volume
   (`tr-volume`), tap/home gestures forwarded by `tr-buttond` over
   `/tmp/lva-control.sock`
-- `sound.json` watcher (500 ms poll) for changes made by other tools
-- Supervisor HTTP API on port 8086 (HMAC-MD5 signed commands), OTA
+- `sound.json` watcher (500 ms poll) for volume and mic mute changes made
+  by other tools; other settings are applied through HA or on restart
+- Supervisor HTTP API on port 8086 (MD5-signed commands), OTA
   (version check, download, MD5 verify, swupdate)
 - Timezone sync from HA
 
@@ -134,10 +135,15 @@ The wake-word model directory is derived from `--wakeword-type`:
 ```
 proto/                      Vendored api.proto + api_options.proto
                             (aioesphomeapi v42.7.0)
-src/main.cpp                CLI, startup, epoll main loop
-src/protocol/               ESPHome wire framing, TCP server, mDNS
-src/state/                  Preferences (sound.json) + ServerState
-src/entities/               ESPHome entities
+src/main.cpp                Process entry point and allocator setup
+src/app/                    Application ownership/lifecycle, CLI options,
+                            entity registration, audio/voice/wake setup,
+                            Sendspin control, periodic ticks, button commands,
+                            preference effects and signal handling
+src/protocol/               ESPHome wire framing, epoll TCP server, mDNS
+src/state/                  Preferences (sound.json), asynchronous persistence,
+                            shared state and application-supplied callbacks
+src/entities/               ESPHome entities with explicit runtime dependencies
 src/audio/                  AudioCapture, LibMpvPlayer, PcmRingBuffer,
                             MicroFeatures, MicroWakeWord, OpenWakeWord,
                             OpenWakeWordFeatures, WakeWordScanner,
@@ -150,11 +156,11 @@ src/sendspin/               SendspinHub: sendspin-cpp client, PulseAudio
 src/tr/                     ThirdReality integration (control socket, LED,
                             mic mute GPIO, volume, model download,
                             supervisor, OTA, timezone sync, sound.json
-                            watcher)
+                            watcher, background volume/LED effects)
 src/tools/                  Dev tools (micro_features_dump, tflite_inspect,
                             wake_word_dump, aec_loopback_test, stt_wav_test,
                             tts_wav_test, conversation_reply_test)
-src/util/                   Log helper
+src/util/                   Logging, shared MD5 and file SHA-256 helpers
 third_party/microfrontend/  TFLM microfrontend + kissfft sources
 third_party/tflite_c/       Prebuilt libtensorflowlite_c.so (GLIBC <= 2.29)
 third_party/whisper.cpp/    Prebuilt whisper.cpp + ggml static libs (A113X),
@@ -211,10 +217,11 @@ Selected in HA with the "Speech Processing" select (`Home Assistant` /
 - The TTS voice (`amy`, 2.8 MB) and the espeak-ng phonemizer data ship
   in `/usr/share/thirdreality/tts`; see `models/README.md`. The STT
   model (31 MB) is downloaded to `/data/models/stt` from the `v1.2.4`
-  GitHub release; see `models/README.md`. LVA starts the download on
-  every start until the model is installed, whatever the backend. The
-  download resumes after a drop and the file is installed only after its
-  sha256 matches.
+  GitHub release; see `models/README.md`. Startup downloads are requested
+  only when local speech is selected and background internet access is
+  allowed. Selecting `3R Speaker` explicitly can request a download even
+  with background access off. Downloads resume after a drop, and the file
+  is installed only after its sha256 matches.
 - Picking `3R Speaker` before the model is installed keeps HA in use and
   shows an HA notification with the download progress. When the
   download finishes (or fails) another notification replaces it.
@@ -231,10 +238,13 @@ Selected in HA with the "Speech Processing" select (`Home Assistant` /
   chunks, so it cannot interrupt an individual model call. Shutdown waits for
   the worker before releasing its engine and removes outstanding WAV files.
   The worker removes `/tmp/lva-tts` at startup to reclaim files left by crashes.
-  Each submitted job has a 60 s deadline, including initialization/queue time.
-  A timeout ends the turn and disables continuation; new synthesis jobs are
-  rejected until the cancelled call returns. A model call that never returns
-  still requires a process restart and can prevent graceful worker shutdown.
+  Jobs time out after 60 s without progress; completed model stages and decoder
+  chunks renew the deadline, allowing longer synthesis while it keeps advancing.
+  Initialization and queue waits are also covered. A stalled announcement falls
+  back to its HA media URL when available; otherwise the turn ends without
+  continuation. New synthesis jobs are rejected until the cancelled call returns.
+  A model call that never returns still requires a process restart and can
+  prevent graceful worker shutdown.
 
 ```
 wake -> LocalStt (whisper.cpp) -> HA conversation.process -> LocalTts (SanoTts) -> mpv

@@ -9,13 +9,15 @@
 
 #include "entities/Entity.h"
 
+namespace lva::tr { class Supervisor; }
 namespace lva::state { class ServerState; }
 
 namespace lva::entities {
 
 class UpdateEntity final : public Entity {
    public:
-    UpdateEntity(std::uint32_t key, lva::state::ServerState& state);
+    UpdateEntity(std::uint32_t key, lva::state::ServerState& state,
+                 lva::tr::Supervisor& supervisor);
 
     ~UpdateEntity() override;
     bool AutomaticBusy() const { return check_.valid() && check_source_ != lva::tr::RequestSource::Explicit; }
@@ -41,6 +43,7 @@ class UpdateEntity final : public Entity {
     void Poll();
 
     lva::state::ServerState& state_;
+    lva::tr::Supervisor& supervisor_;
 
     std::string current_version_;
     std::string latest_version_;
