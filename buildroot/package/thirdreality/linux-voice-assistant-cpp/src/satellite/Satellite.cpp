@@ -323,13 +323,19 @@ void Satellite::StartPipeline(const std::string& wake_word_phrase) {
     if (announce_player_ != nullptr) {
         const std::string phrase_copy = wake_word_phrase;
         wake_sound_pending_ = true;
-        announce_player_->Play(kWakeupSoundPath, [this, phrase_copy] {
+        const bool started = announce_player_->Play(kWakeupSoundPath, [this, phrase_copy](bool ok) {
             if (!wake_sound_pending_.exchange(false,
                                                std::memory_order_acq_rel)) {
                 return;
             }
+            if (!ok) LVA_LOGW(kTag, "wake sound failed; starting voice without chime");
             OpenStreamToHa(phrase_copy);
         });
+        if (!started) {
+            LVA_LOGW(kTag, "wake sound failed; starting voice without chime");
+            wake_sound_pending_ = false;
+            OpenStreamToHa(phrase_copy);
+        }
     } else {
         OpenStreamToHa(wake_word_phrase);
     }
@@ -462,14 +468,24 @@ void Satellite::PlayTts() {
 
     if (timer_ringing_) StopTimerRing();
     speech_active_ = true;
-    announce_player_->Play(tts_url_, [this]() {
+    if (!announce_player_->Play(tts_url_, [this](bool ok) {
+        if (!ok) LVA_LOGW(kTag, "TTS playback failed asynchronously");
+        FinishSpeech(ok);
+    })) {
+        LVA_LOGW(kTag, "TTS playback could not start; ending voice turn");
+        continue_conversation_ = false;
+        continue_listen_at_ns_.store(0, std::memory_order_relaxed);
         FinishSpeech(false);
-    });
+    }
 }
 
 void Satellite::FinishSpeech(bool success) {
     if (!speech_active_.exchange(false, std::memory_order_acq_rel)) return;
     CancelLocalTts();
+    if (!success) {
+        continue_conversation_ = false;
+        continue_listen_at_ns_.store(0, std::memory_order_relaxed);
+    }
 
     const bool was_local = std::exchange(local_speech_, false);
     if (state_.broadcast && !was_local) {
@@ -548,15 +564,17 @@ void Satellite::PlayAnnouncementMedia(const std::string& media_id,
         FinishSpeech(false);
         return;
     }
-    auto play_main = [this, media_id]() {
+    auto play_main = [this, media_id, preannounce_media_id](bool preannounce_ok) {
         if (!speech_active_) return;
+        if (!preannounce_ok) {
+            LVA_LOGW(kTag, "preannouncement failed: %s; continuing with announcement",
+                     preannounce_media_id.c_str());
+        }
         lva::tr::Show(lva::tr::LedState::Speaking);
-        announce_player_->Play(media_id, [this]() {
-            FinishSpeech(true);
-        });
-        // Play() can fail synchronously without calling its completion hook.
-        if (announce_player_->State() == lva::audio::PlayerState::kIdle ||
-            announce_player_->State() == lva::audio::PlayerState::kError) {
+        if (!announce_player_->Play(media_id, [this](bool ok) {
+            if (!ok) LVA_LOGW(kTag, "announcement playback failed asynchronously");
+            FinishSpeech(ok);
+        })) {
             LVA_LOGW(kTag, "announcement playback failed: %s", media_id.c_str());
             continue_conversation_ = false;
             FinishSpeech(false);
@@ -564,17 +582,14 @@ void Satellite::PlayAnnouncementMedia(const std::string& media_id,
     };
 
     if (!preannounce_media_id.empty()) {
-        announce_player_->Play(preannounce_media_id,
-                               std::move(play_main));
-        if (announce_player_->State() == lva::audio::PlayerState::kIdle ||
-            announce_player_->State() == lva::audio::PlayerState::kError) {
-            LVA_LOGW(kTag, "preannouncement playback failed: %s",
-                     preannounce_media_id.c_str());
-            continue_conversation_ = false;
-            FinishSpeech(false);
+        if (!announce_player_->Play(preannounce_media_id,
+                                    play_main)) {
+            // Keep the local callable for synchronous failure: Play() does
+            // not invoke its callback when it returns false.
+            play_main(false);
         }
     } else {
-        play_main();
+        play_main(true);
     }
 }
 
@@ -607,9 +622,13 @@ void Satellite::StartTimerRing() {
     timer_ringing_    = true;
     timer_ring_start_ = std::chrono::steady_clock::now();
     if (announce_player_ != nullptr) {
-        announce_player_->Play(kTimerFinishedSoundPath, [this] {
-            OnTimerSoundEof();
-        });
+        if (!announce_player_->Play(kTimerFinishedSoundPath, [this](bool ok) {
+            OnTimerSoundEof(ok);
+        })) {
+            LVA_LOGW(kTag, "timer sound failed; stopping ring");
+            StopTimerRing();
+            return;
+        }
     }
     Duck();
     lva::tr::Show(lva::tr::LedState::Speaking);
@@ -625,8 +644,13 @@ void Satellite::StopTimerRing() {
     lva::tr::Show(lva::tr::LedState::Idle);
 }
 
-void Satellite::OnTimerSoundEof() {
+void Satellite::OnTimerSoundEof(bool success) {
     if (!timer_ringing_) return;  // user cancelled
+    if (!success) {
+        LVA_LOGW(kTag, "timer sound failed asynchronously; stopping ring");
+        StopTimerRing();
+        return;
+    }
 
     const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::steady_clock::now() - timer_ring_start_).count();
@@ -637,9 +661,12 @@ void Satellite::OnTimerSoundEof() {
         return;
     }
     if (announce_player_ != nullptr) {
-        announce_player_->Play(kTimerFinishedSoundPath, [this] {
-            OnTimerSoundEof();
-        });
+        if (!announce_player_->Play(kTimerFinishedSoundPath, [this](bool ok) {
+            OnTimerSoundEof(ok);
+        })) {
+            LVA_LOGW(kTag, "timer sound replay failed; stopping ring");
+            StopTimerRing();
+        }
     }
 }
 

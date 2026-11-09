@@ -29,8 +29,8 @@ class LibMpvPlayer final : public IAudioPlayer {
     LibMpvPlayer(const LibMpvPlayer&)            = delete;
     LibMpvPlayer& operator=(const LibMpvPlayer&) = delete;
 
-    void        Play(const std::string& url,
-                     std::function<void()> done_callback = {}) override;
+    bool        Play(const std::string& url,
+                     DoneCallback done_callback = {}) override;
     void        Pause()  override;
     void        Resume() override;
     void        Stop()   override;
@@ -58,6 +58,7 @@ class LibMpvPlayer final : public IAudioPlayer {
     void        ResumeDrain();
 
     void        SetState(PlayerState new_state);
+    bool        FailPlay();
 
     mpv_handle* mpv_      = nullptr;
     int  wakeup_read_fd_  = -1;
@@ -66,15 +67,17 @@ class LibMpvPlayer final : public IAudioPlayer {
 
     std::unordered_set<std::int64_t> requested_entry_ids_;
     std::int64_t event_entry_id_ = -1;
+    bool playback_ok_ = true;  // Accumulate errors across redirected entries.
 
     std::atomic<PlayerState> state_{PlayerState::kIdle};
 
     std::function<void(PlayerState)> on_state_changed_;
 
     std::mutex                   cb_mutex_;
-    std::function<void()>        done_callback_;
+    DoneCallback                done_callback_;
 
-    std::function<void()>                       drain_callback_;
+    DoneCallback                               drain_callback_;
+    bool                                        drain_ok_ = true;
     bool                                        drain_pending_ = false;
     std::int64_t                                drain_delay_ns_ = 0;
     std::int64_t                                drain_remaining_ns_ = 0;

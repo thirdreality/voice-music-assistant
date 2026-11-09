@@ -163,17 +163,19 @@ void LibMpvPlayer::FinishPlayback() {
     drain_pending_ = false;
     drain_paused_  = false;
     drain_remaining_ns_ = 0;
-    SetState(PlayerState::kIdle);
-
-    std::function<void()> cb;
+    DoneCallback cb;
+    // Drain/result state is main-loop-only (including pause/resume).
+    // cb_mutex_ guards callback storage; it does not guard these fields.
+    const bool ok = drain_ok_;
     {
         std::lock_guard<std::mutex> lk(cb_mutex_);
         cb = std::move(drain_callback_);
         drain_callback_ = nullptr;
     }
+    SetState(PlayerState::kIdle);
     if (!cb) return;
     try {
-        cb();
+        cb(ok);
     } catch (...) {
         // Callback errors must never break the player.
     }
@@ -290,6 +292,9 @@ void LibMpvPlayer::DrainEvents() {
                         requested_entry_ids_.insert(end->playlist_insert_id + i);
                     break;
                 }
+                // A successful redirect is followed above. An empty redirect,
+                // ERROR, or unexpected termination cannot count as success.
+                if (reason != MPV_END_FILE_REASON_EOF) playback_ok_ = false;
                 if (!requested_entry_ids_.empty() &&
                     (reason == MPV_END_FILE_REASON_EOF ||
                      reason == MPV_END_FILE_REASON_ERROR ||
@@ -303,18 +308,16 @@ void LibMpvPlayer::DrainEvents() {
                     reason != MPV_END_FILE_REASON_ERROR &&
                     reason != MPV_END_FILE_REASON_REDIRECT) {
                     requested_entry_ids_.clear();
-                    SetState(PlayerState::kIdle);
-                    break;
                 }
 
                 {
                     std::lock_guard<std::mutex> lk(cb_mutex_);
                     drain_callback_ = std::move(done_callback_);
                     done_callback_  = nullptr;
+                    drain_ok_ = playback_ok_;
                 }
 
-                if (reason == MPV_END_FILE_REASON_ERROR ||
-                    reason == MPV_END_FILE_REASON_REDIRECT ||
+                if (reason != MPV_END_FILE_REASON_EOF ||
                     drain_delay_ns_ <= 0) {
                     if (reason == MPV_END_FILE_REASON_ERROR) {
                         LVA_LOGW(kTag,
@@ -364,7 +367,17 @@ void LibMpvPlayer::DrainEvents() {
             }
             case MPV_EVENT_SHUTDOWN:
                 LVA_LOGI(kTag, "event: SHUTDOWN");
-                SetState(PlayerState::kIdle);
+                requested_entry_ids_.clear();
+                event_entry_id_ = -1;
+                {
+                    std::lock_guard<std::mutex> lk(cb_mutex_);
+                    if (done_callback_) {
+                        drain_callback_ = std::move(done_callback_);
+                        done_callback_ = nullptr;
+                    }
+                    drain_ok_ = false;
+                }
+                FinishPlayback();
                 return;
             default:
                 LVA_LOGD(kTag, "event: %s", mpv_event_name(ev->event_id));
@@ -373,15 +386,38 @@ void LibMpvPlayer::DrainEvents() {
     }
 }
 
-void LibMpvPlayer::Play(const std::string& url,
-                        std::function<void()> done_callback) {
+bool LibMpvPlayer::FailPlay() {
+    CancelDrain();
+    requested_entry_ids_.clear();
+    event_entry_id_ = -1;
+    playback_ok_ = true;
+    {
+        std::lock_guard<std::mutex> lk(cb_mutex_);
+        done_callback_ = nullptr;
+    }
+    // loadfile may have succeeded without returning a usable entry ID, or
+    // an older file may still be playing after a rejected replacement.
+    if (mpv_ != nullptr) {
+        const char* args[] = {"stop", nullptr};
+        if (const int rc = mpv_command(mpv_, args); rc < 0) {
+            LVA_LOGW(kTag, "stop after playback setup failure failed: %s",
+                     mpv_error_string(rc));
+        }
+    }
+    SetState(PlayerState::kIdle);
+    return false;
+}
+
+bool LibMpvPlayer::Play(const std::string& url,
+                        DoneCallback done_callback) {
     if (mpv_ == nullptr) {
         LVA_LOGW(kTag, "Play(%s) ignored: mpv not initialized",
                  url.c_str());
-        return;
+        return FailPlay();
     }
     CancelDrain();
     requested_entry_ids_.clear();
+    playback_ok_ = true;
     {
         std::lock_guard<std::mutex> lk(cb_mutex_);
         done_callback_ = std::move(done_callback);
@@ -405,19 +441,18 @@ void LibMpvPlayer::Play(const std::string& url,
     if (rc < 0 || requested_entry_id < 0) {
         LVA_LOGE(kTag, "loadfile(%s) failed: %s", url.c_str(),
                  rc < 0 ? mpv_error_string(rc) : "missing playlist entry ID");
-        SetState(PlayerState::kIdle);
-        std::lock_guard<std::mutex> lk(cb_mutex_);
-        done_callback_ = nullptr;
-        return;
+        return FailPlay();
     }
     requested_entry_ids_.insert(requested_entry_id);
     int no = 0;
     if (const int rc = mpv_set_property(mpv_, "pause", MPV_FORMAT_FLAG, &no);
         rc < 0) {
         LVA_LOGW(kTag, "clear pause failed: %s", mpv_error_string(rc));
+        return FailPlay();
     }
     SetState(PlayerState::kLoading);
     LVA_LOGI(kTag, "Play: %s", url.c_str());
+    return true;
 }
 
 void LibMpvPlayer::Pause() {

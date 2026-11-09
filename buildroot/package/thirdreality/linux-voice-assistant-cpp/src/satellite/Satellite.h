@@ -113,7 +113,7 @@ class Satellite {
 
     void StartTimerRing();
     void StopTimerRing();
-    void OnTimerSoundEof();
+    void OnTimerSoundEof(bool success);
     void Duck();
     void Unduck();
 

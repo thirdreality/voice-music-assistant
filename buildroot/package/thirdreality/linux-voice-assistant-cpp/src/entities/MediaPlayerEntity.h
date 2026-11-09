@@ -43,6 +43,7 @@ class MediaPlayerEntity final : public Entity {
     enum class Source { kNone, kMpv, kSendspin };
     void EmitState(const ResponseSink& sink) const;
     void OnPlayerStateChanged(lva::audio::PlayerState s);
+    PlayState CurrentPlayState() const;
     lva::audio::IAudioPlayer* CommandPlayer() const;
     bool SendspinActive() const;
     // HA command / TAP target: an HA announcement keeps priority, then the

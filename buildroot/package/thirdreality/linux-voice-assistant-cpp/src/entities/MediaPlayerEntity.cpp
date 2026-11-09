@@ -95,9 +95,6 @@ void MediaPlayerEntity::OnPlayerStateChanged(lva::audio::PlayerState s) {
     const auto music_state = state_.music_player != nullptr
         ? state_.music_player->State()
         : lva::audio::PlayerState::kIdle;
-    const auto announce_state = state_.announce_player != nullptr
-        ? state_.announce_player->State()
-        : lva::audio::PlayerState::kIdle;
     if (IsActiveState(music_state)) last_source_ = Source::kMpv;
     const bool music_finished =
         music_state == lva::audio::PlayerState::kIdle &&
@@ -119,23 +116,30 @@ void MediaPlayerEntity::OnPlayerStateChanged(lva::audio::PlayerState s) {
         sendspin_->SetAnnouncementDucked(CommandPlayer() != player_);
     }
 
-    // Same priority as ESPHome's speaker_source: the active media source
-    // decides, Sendspin being one of them. Sendspin has no paused state on
-    // the wire; a stopped group reads as idle.
-    PlayState new_local = PlayState::kIdle;
-    if (IsActiveState(music_state) || IsActiveState(announce_state) ||
-        SendspinActive()) {
-        new_local = PlayState::kPlaying;
-    } else if (music_state == lva::audio::PlayerState::kPaused ||
-               announce_state == lva::audio::PlayerState::kPaused) {
-        new_local = PlayState::kPaused;
-    }
+    const auto new_local = CurrentPlayState();
     if (new_local == play_state_) {
         return;  // no-op, don't spam HA
     }
     play_state_ = new_local;
 
     BroadcastState();
+}
+
+MediaPlayerEntity::PlayState MediaPlayerEntity::CurrentPlayState() const {
+    const auto music_state = state_.music_player != nullptr
+        ? state_.music_player->State() : lva::audio::PlayerState::kIdle;
+    const auto announce_state = state_.announce_player != nullptr
+        ? state_.announce_player->State() : lva::audio::PlayerState::kIdle;
+    // Aggregate all sources: a failed announcement must not hide music or
+    // Sendspin that is still playing (or an mpv source that remains paused).
+    if (IsActiveState(music_state) || IsActiveState(announce_state) ||
+        SendspinActive()) {
+        return PlayState::kPlaying;
+    } else if (music_state == lva::audio::PlayerState::kPaused ||
+               announce_state == lva::audio::PlayerState::kPaused) {
+        return PlayState::kPaused;
+    }
+    return PlayState::kIdle;
 }
 
 bool MediaPlayerEntity::IsPlaying() const {
@@ -448,10 +452,10 @@ void MediaPlayerEntity::OnCommand(
             if (announcement && state_.satellite != nullptr) {
                 state_.satellite->PrepareForMediaAnnouncement();
             }
-            if (target != nullptr) {
-                target->Play(cmd.media_url());
+            if (target == nullptr || !target->Play(cmd.media_url())) {
+                LVA_LOGW(kTag, "PLAY_MEDIA could not start: %s", cmd.media_url().c_str());
             }
-            play_state_ = PlayState::kPlaying;
+            play_state_ = CurrentPlayState();
             state_changed = true;
         }
     }
