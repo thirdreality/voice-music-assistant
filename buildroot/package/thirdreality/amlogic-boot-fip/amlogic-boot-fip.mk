@@ -17,7 +17,9 @@ AMLOGIC_BOOT_BINS += u-boot.bin u-boot.bin.sd.bin u-boot.bin.usb.bl2 u-boot.bin.
 
 define AMLOGIC_BOOT_FIP_BUILD_CMDS
 	mkdir -p $(@D)/fip
-	cp $(BINARIES_DIR)/u-boot.bin $(@D)/fip/bl33.bin
+	# images/u-boot.bin is overwritten by this package's complete FIP. Reading
+	# it on a rebuild would wrap that FIP as BL33 instead of using raw U-Boot.
+	cp "$(UBOOT_DIR)/build/u-boot.bin" "$(@D)/fip/bl33.bin"
 	cd "$(@D)"; ./build-fip.sh $(call qstrip,$(BR2_PACKAGE_AMLOGIC_BOOT_FIP_BOARD)) $(@D)/fip/bl33.bin $(@D)/fip
 endef
 
