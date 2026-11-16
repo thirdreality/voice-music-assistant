@@ -44,6 +44,7 @@ constexpr int kEvtRunEnd         = 2;
 constexpr int kEvtSttEnd         = 4;
 constexpr int kEvtIntentStart    = 5;
 constexpr int kEvtIntentEnd      = 6;
+constexpr int kEvtSttVadStart    = 11;
 constexpr int kEvtSttVadEnd      = 12;
 constexpr int kEvtIntentProgress = 100;
 constexpr int kEvtTtsEnd         = 8;
@@ -70,6 +71,11 @@ constexpr auto kLocalTtsStallTimeout = std::chrono::seconds(60);
 constexpr auto kHaStartTimeout = std::chrono::seconds(8);
 // Longest gap between HA voice events (e.g. a slow LLM intent).
 constexpr auto kHaEventTimeout = std::chrono::seconds(60);
+constexpr auto kHaSpeechStartTimeout = std::chrono::seconds(60);
+// HA can still display listening while waiting for transcription after VAD.
+constexpr auto kHaTranscriptionTimeout = std::chrono::seconds(60);
+// While HA reports speech, watch audio delivery instead of utterance length.
+constexpr auto kHaAudioStallTimeout = std::chrono::seconds(8);
 
 constexpr const char* kLocalSttUnavailable =
     "Local speech recognition is still loading.";
@@ -164,9 +170,14 @@ void Satellite::ProcessStopDetected() {
         } else {
             wake_sound_pending_ = false;
             CancelLocalTurn();
-            pipeline_active_ = false;
-            Unduck();
-            lva::tr::Show(lva::tr::LedState::Idle);
+            if (!LocalVoiceEnabled()) {
+                ResetHaPipeline("stop word during voice input");
+            } else {
+                DisarmHaWatchdog();
+                pipeline_active_ = false;
+                Unduck();
+                lva::tr::Show(lva::tr::LedState::Idle);
+            }
         }
     }
 }
@@ -390,6 +401,9 @@ void Satellite::OpenStreamToHa(const std::string& wake_word_phrase) {
         return;
     }
     ArmHaWatchdog(kHaStartTimeout);
+    ha_user_speaking_ = false;
+    ha_last_audio_at_ = std::chrono::steady_clock::now();
+    ha_wait_deadline_ = ha_last_audio_at_ + kHaSpeechStartTimeout;
 }
 
 void Satellite::PumpAudioToHa() {
@@ -411,13 +425,16 @@ void Satellite::PumpAudioToHa() {
         ::VoiceAssistantAudio audio_msg;
         audio_msg.set_data(reinterpret_cast<const char*>(chunk.data()),
                            got * sizeof(std::int16_t));
-        state_.broadcast(lva::proto::kIdVoiceAssistantAudio, audio_msg);
+        if (state_.broadcast(lva::proto::kIdVoiceAssistantAudio, audio_msg)) {
+            ha_last_audio_at_ = std::chrono::steady_clock::now();
+        }
     }
 }
 
 void Satellite::StopAudioStreaming() {
     if (!is_streaming_audio_) return;
     is_streaming_audio_ = false;
+    ha_user_speaking_ = false;
     LVA_LOGD(kTag, "stopped streaming audio to HA");
 }
 
@@ -456,6 +473,9 @@ void Satellite::BeginListening() {
         return;
     }
     ArmHaWatchdog(kHaStartTimeout);
+    ha_user_speaking_ = false;
+    ha_last_audio_at_ = std::chrono::steady_clock::now();
+    ha_wait_deadline_ = ha_last_audio_at_ + kHaSpeechStartTimeout;
 }
 
 bool Satellite::ScheduleContinuedListening(const char* reason) {
@@ -708,7 +728,8 @@ void Satellite::OnVoiceEvent(
     // the previous deadline. Restore protection for an active HA turn, rather
     // than requiring the old watchdog to still be armed. Local voice and
     // speech playback have their own completion paths.
-    if (pipeline_active_ && !speech_active_ && !LocalVoiceEnabled()) {
+    if (pipeline_active_ && !speech_active_ && !LocalVoiceEnabled() &&
+        !ha_user_speaking_) {
         ArmHaWatchdog(kHaEventTimeout);
     }
     switch (event_type) {
@@ -750,14 +771,46 @@ void Satellite::OnVoiceEvent(
             break;
         }
 
+        case kEvtSttVadStart:
+            if (pipeline_active_ && is_streaming_audio_ &&
+                !speech_active_ && !LocalVoiceEnabled()) {
+                ha_user_speaking_ = true;
+                ha_wait_deadline_ = {};
+                ha_deadline_ = {};
+                LVA_LOGD(kTag, "STT_VAD_START — waiting for speech end");
+            }
+            break;
+
         case kEvtSttVadEnd:
+            if (pipeline_active_ && is_streaming_audio_ &&
+                !speech_active_ && !LocalVoiceEnabled()) {
+                // Start a fresh transcription wait once. Duplicate VAD_END
+                // events must not postpone a stuck recognizer indefinitely.
+                ha_wait_deadline_ = std::chrono::steady_clock::now() +
+                                    kHaTranscriptionTimeout;
+                ArmHaWatchdog(kHaEventTimeout);
+            }
+            LVA_LOGD(kTag, "STT_VAD_END — stop streaming; waiting for transcription");
+            StopAudioStreaming();
+            lva::tr::Show(lva::tr::LedState::Thinking);
+            break;
+
         case kEvtSttEnd:
+            ha_wait_deadline_ = {};
+            if (pipeline_active_ && !speech_active_ && !LocalVoiceEnabled()) {
+                ArmHaWatchdog(kHaEventTimeout);
+            }
             LVA_LOGD(kTag, "STT_(VAD_)END — stop streaming");
             StopAudioStreaming();
             lva::tr::Show(lva::tr::LedState::Thinking);
             break;
 
         case kEvtIntentStart:
+            ha_wait_deadline_ = {};
+            ha_user_speaking_ = false;
+            if (pipeline_active_ && !speech_active_ && !LocalVoiceEnabled()) {
+                ArmHaWatchdog(kHaEventTimeout);
+            }
             LVA_LOGD(kTag, "INTENT_START");
             if (state_.preferences.thinking_sound != 0 &&
                 announce_player_ != nullptr) {
@@ -881,13 +934,27 @@ void Satellite::ArmHaWatchdog(std::chrono::steady_clock::duration timeout) {
 }
 
 void Satellite::CheckHaWatchdog() {
-    if (ha_deadline_ == std::chrono::steady_clock::time_point{}) return;
     if (!pipeline_active_ || speech_active_) {
         DisarmHaWatchdog();
         return;
     }
-    if (std::chrono::steady_clock::now() < ha_deadline_) return;
-    ResetHaPipeline("no voice event from HA");
+    const auto now = std::chrono::steady_clock::now();
+    if (ha_user_speaking_) {
+        if (ha_last_audio_at_ != std::chrono::steady_clock::time_point{} &&
+            now - ha_last_audio_at_ >= kHaAudioStallTimeout) {
+            ResetHaPipeline("microphone audio delivery stalled");
+        }
+        return;
+    }
+    if (ha_wait_deadline_ != std::chrono::steady_clock::time_point{} &&
+        now >= ha_wait_deadline_) {
+        ResetHaPipeline(is_streaming_audio_
+                            ? "no speech start from HA within 60 s"
+                            : "HA transcription exceeded 60 s");
+    } else if (ha_deadline_ != std::chrono::steady_clock::time_point{} &&
+               now >= ha_deadline_) {
+        ResetHaPipeline("no voice event from HA");
+    }
 }
 
 void Satellite::ResetHaPipeline(const char* reason) {

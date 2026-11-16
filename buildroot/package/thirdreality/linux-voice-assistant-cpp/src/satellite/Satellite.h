@@ -111,7 +111,12 @@ class Satellite {
 
     // HA pipeline watchdog; main thread only.
     void ArmHaWatchdog(std::chrono::steady_clock::duration timeout);
-    void DisarmHaWatchdog() { ha_deadline_ = {}; }
+    void DisarmHaWatchdog() {
+        ha_deadline_ = {};
+        ha_wait_deadline_ = {};
+        ha_last_audio_at_ = {};
+        ha_user_speaking_ = false;
+    }
     void CheckHaWatchdog();
     void ResetHaPipeline(const char* reason);
 
@@ -155,6 +160,12 @@ class Satellite {
 
     // Reset the turn if HA sends no voice event before this time.
     std::chrono::steady_clock::time_point ha_deadline_{};
+
+    // Bound waiting for speech onset / transcription, not utterance length.
+    // Repeated HA events must not postpone a pending wait.
+    std::chrono::steady_clock::time_point ha_wait_deadline_{};
+    std::chrono::steady_clock::time_point ha_last_audio_at_{};
+    bool ha_user_speaking_ = false;  // main thread; HA VAD_START to VAD_END
 
     bool                                  timer_ringing_ = false;
     std::chrono::steady_clock::time_point timer_ring_start_{};
