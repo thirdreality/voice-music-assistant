@@ -150,6 +150,14 @@ bool Application::HandleControl(const std::string& cmd) {
         }
         return true;
     }
+    if (const auto delta = ParseControlInteger(cmd, "CONFIG_ADJUST_VOLUME:")) {
+        if (*delta != -10 && *delta != 10) return false;
+        // Commands run serially on the main loop. PersistVolume updates the
+        // live value immediately, while disk writes may be coalesced later.
+        state.PersistVolume(state.volume.load(std::memory_order_relaxed) +
+                            static_cast<double>(*delta) / 100.0);
+        return true;
+    }
     if (const auto value = ParseControlInteger(cmd, "CONFIG_SET_VOLUME:")) {
         if (*value < 0 || *value > 100) return false;
         state.PersistVolume(static_cast<double>(*value) / 100.0);

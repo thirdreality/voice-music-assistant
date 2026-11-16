@@ -3,53 +3,18 @@
 # set -x
 SOUND_CONF="/data/conf/sound.json"
 LOCK_FILE="/tmp/sound_config.lock"
-VOL_PENDING_FILE="/tmp/volume_pending"
-VOL_PID_FILE="/tmp/volume_pid"
-VOL_COUNT_FILE="/tmp/volume_count"
-
-vol() {
-    action="$1"
-
-    if [ -f "$VOL_COUNT_FILE" ]; then
-        count=$(cat "$VOL_COUNT_FILE")
-    else
-        count=0
-    fi
-    count=$((count + 1))
-    echo "$count" > "$VOL_COUNT_FILE"
-
-    echo "$action" > "$VOL_PENDING_FILE"
-
-    if [ -f "$VOL_PID_FILE" ]; then
-        old_pid=$(cat "$VOL_PID_FILE")
-        kill $old_pid 2>/dev/null
-    fi
-
-    (
-        sleep 0.3
-        if [ -f "$VOL_PENDING_FILE" ]; then
-            pending_action=$(cat "$VOL_PENDING_FILE")
-            pending_count=$(cat "$VOL_COUNT_FILE" 2>/dev/null || echo "1")
-            rm -f "$VOL_PENDING_FILE"
-            rm -f "$VOL_COUNT_FILE"
-            do_volume_change "$pending_action" "$pending_count"
-        fi
-        rm -f "$VOL_PID_FILE"
-    ) &
-
-    echo $! > "$VOL_PID_FILE"
-}
 
 do_volume_change() {
     action="$1"
-    count="${2:-1}"
 
+    # LVA is unavailable: apply every press synchronously under the lock.
+    # Shared debounce/count files can lose presses or reverse their direction.
     exec 200>"$LOCK_FILE"
     flock -x 200
 
     vol=$(jq '.volume' "$SOUND_CONF")
 
-    step=$((10 * count))
+    step=10
 
     if [ "$action" = "up" ]; then
         vol=$((vol + step))
@@ -63,16 +28,16 @@ do_volume_change() {
         vol=0
     fi
 
-    echo "Volume $action (x${count}): $vol%"
+    echo "Volume $action: $vol%"
 
     tmpfile=$(mktemp)
     jq --argjson v "$vol" '.volume = $v' "$SOUND_CONF" > "$tmpfile" && mv "$tmpfile" "$SOUND_CONF"
     sync
 
+    /usr/bin/tr-volume set "$vol" > /dev/null 2>&1
+
     flock -u 200
     exec 200>&-
-
-    /usr/bin/tr-volume set "$vol" > /dev/null 2>&1
 
     dbus-send --system --type=signal /com/3r/EventBus com._3reality.EventBus.LedShow boolean:false array:string:'/usr/share/thirdreality/animation/volume-changed.animation'
 }
@@ -178,8 +143,8 @@ change_wifi() {
 }
 
 case $1 in
-    "Volup") vol "up" ;;
-    "Voldown") vol "down" ;;
+    "Volup") do_volume_change "up" ;;
+    "Voldown") do_volume_change "down" ;;
     "SetVolume") set_volume "$2" ;;
     "SetMicMute") set_mic_mute "$2" ;;
     "Home") echo "home was pressed";;

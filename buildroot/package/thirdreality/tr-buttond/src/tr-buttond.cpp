@@ -31,7 +31,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
@@ -47,7 +46,6 @@ namespace {
 constexpr const char* kInputDeviceName = "gpio_keypad";
 constexpr const char* kAdckeyScript   = "/etc/adckey/adckey_function.sh";
 constexpr const char* kLvaSocket      = "/tmp/lva-control.sock";
-constexpr const char* kSoundConfig    = "/data/conf/sound.json";
 constexpr const char* kMicMuteGpio    = "/sys/class/gpio/gpio438/value";
 
 // Key codes (see /etc/gpio_key.kl).
@@ -106,10 +104,12 @@ int OpenInputDevice() {
     return found;
 }
 
-bool SendConfigToLva(const char* command) {
+enum class ConfigResult { kNotSent, kApplied, kRejected, kUnconfirmed };
+
+ConfigResult SendConfigToLva(const char* command) {
     const int fd = ::socket(AF_UNIX,
                             SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-    if (fd < 0) return false;
+    if (fd < 0) return ConfigResult::kNotSent;
 
     struct sockaddr_un local{};
     local.sun_family = AF_UNIX;
@@ -123,7 +123,7 @@ bool SendConfigToLva(const char* command) {
         std::strlen(local.sun_path + 1));
     if (::bind(fd, reinterpret_cast<struct sockaddr*>(&local), local_len) < 0) {
         ::close(fd);
-        return false;
+        return ConfigResult::kNotSent;
     }
 
     struct sockaddr_un peer{};
@@ -133,20 +133,22 @@ bool SendConfigToLva(const char* command) {
                  reinterpret_cast<struct sockaddr*>(&peer),
                  sizeof(peer)) < 0) {
         ::close(fd);
-        return false;
+        return ConfigResult::kNotSent;
     }
 
     struct pollfd pfd{fd, POLLIN, 0};
     const int result = ::poll(&pfd, 1, 100);
     if (result <= 0 || !(pfd.revents & POLLIN)) {
         ::close(fd);
-        return false;
+        return ConfigResult::kUnconfirmed;
     }
 
     char reply[8] = {};
     const ssize_t n = ::recv(fd, reply, sizeof(reply) - 1, 0);
     ::close(fd);
-    return n == 2 && std::memcmp(reply, "OK", 2) == 0;
+    if (n == 2 && std::memcmp(reply, "OK", 2) == 0) return ConfigResult::kApplied;
+    if (n == 3 && std::memcmp(reply, "ERR", 3) == 0) return ConfigResult::kRejected;
+    return ConfigResult::kUnconfirmed;
 }
 
 int ReadIntegerFile(const char* path) {
@@ -156,21 +158,6 @@ int ReadIntegerFile(const char* path) {
     if (std::fscanf(file, "%d", &value) != 1) value = -1;
     std::fclose(file);
     return value;
-}
-
-int ReadSoundVolume() {
-    FILE* file = std::fopen(kSoundConfig, "r");
-    if (!file) return -1;
-    char line[256];
-    int volume = -1;
-    while (std::fgets(line, sizeof(line), file)) {
-        const char* key = std::strstr(line, "\"volume\"");
-        if (!key) continue;
-        const char* colon = std::strchr(key, ':');
-        if (colon && std::sscanf(colon + 1, "%d", &volume) == 1) break;
-    }
-    std::fclose(file);
-    return volume;
 }
 
 bool RunScriptCommand(const char* command) {
@@ -198,21 +185,21 @@ bool RunScriptCommand(const char* command) {
 void RunScript(const char* arg) {
     if (std::strcmp(arg, "Volup") == 0 ||
         std::strcmp(arg, "Voldown") == 0) {
-        const int current = ReadSoundVolume();
-        if (current >= 0) {
-            const int delta = std::strcmp(arg, "Volup") == 0 ? 10 : -10;
-            const int desired = std::max(0, std::min(100, current + delta));
-            char request[32];
-            std::snprintf(request, sizeof(request),
-                          "CONFIG_SET_VOLUME:%d", desired);
-            if (SendConfigToLva(request)) return;
-
-            char fallback[32];
-            std::snprintf(fallback, sizeof(fallback),
-                          "SetVolume %d", desired);
-            RunScriptCommand(fallback);
+        // sound.json is persisted asynchronously; consecutive presses must
+        // accumulate against LVA's live state, not a stale on-disk value.
+        const int delta = std::strcmp(arg, "Volup") == 0 ? 10 : -10;
+        char request[40];
+        std::snprintf(request, sizeof(request), "CONFIG_ADJUST_VOLUME:%d", delta);
+        const auto result = SendConfigToLva(request);
+        if (result == ConfigResult::kApplied) return;
+        if (result == ConfigResult::kUnconfirmed) {
+            // Delivery succeeded. Replaying a relative change in the shell
+            // after an ACK timeout could apply the same press twice.
+            fprintf(stderr, "[buttond] volume change sent; acknowledgement missing\n");
             return;
         }
+        RunScriptCommand(arg);
+        return;
     }
 
     if (std::strcmp(arg, "Mute") == 0) {
@@ -222,7 +209,7 @@ void RunScript(const char* arg) {
             char request[40];
             std::snprintf(request, sizeof(request),
                           "CONFIG_SET_MIC_MUTE:%d", desired);
-            if (SendConfigToLva(request)) return;
+            if (SendConfigToLva(request) == ConfigResult::kApplied) return;
 
             char fallback[32];
             std::snprintf(fallback, sizeof(fallback),
