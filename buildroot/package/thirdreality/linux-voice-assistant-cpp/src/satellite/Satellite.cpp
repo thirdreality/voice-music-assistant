@@ -105,6 +105,7 @@ bool Satellite::IsIdle() const {
 }
 
 void Satellite::OnWakeDetected(const std::string& model_id, float prob) {
+    if (state_.mic_muted.load(std::memory_order_relaxed)) return;
     const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     if (now_ns < refractory_until_ns_.load(std::memory_order_relaxed)) {
@@ -116,11 +117,13 @@ void Satellite::OnWakeDetected(const std::string& model_id, float prob) {
 }
 
 void Satellite::OnStopDetected() {
+    if (state_.mic_muted.load(std::memory_order_relaxed)) return;
     // Wake-word thread: only post the event; OnLoopTick handles it.
     pending_stop_.store(true, std::memory_order_release);
 }
 
 void Satellite::ProcessStopDetected() {
+    if (state_.mic_muted.load(std::memory_order_relaxed)) return;
     if (!pipeline_active_ && !timer_ringing_) return;
 
     // Ignore stop words during the wake chime, except to stop a timer.
@@ -258,6 +261,7 @@ std::string Satellite::WakeWordPhraseFor(const std::string& model_id) const {
 }
 
 void Satellite::StartPipeline(const std::string& wake_word_phrase) {
+    if (state_.mic_muted.load(std::memory_order_relaxed)) return;
     const auto now = std::chrono::steady_clock::now();
     const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         now.time_since_epoch()).count();
@@ -392,7 +396,8 @@ void Satellite::PumpAudioToHa() {
     std::vector<std::int16_t> chunk(kAudioPumpSamples);
 
     // Drain while idle, so an overrun only means streaming fell behind.
-    if (!is_streaming_audio_ || !state_.broadcast) {
+    if (!is_streaming_audio_ || !state_.broadcast ||
+        state_.mic_muted.load(std::memory_order_relaxed)) {
         while (mic_ring_.Read(chunk.data(), chunk.size()) > 0) {
         }
         return;
@@ -417,6 +422,10 @@ void Satellite::StopAudioStreaming() {
 }
 
 void Satellite::BeginListening() {
+    if (state_.mic_muted.load(std::memory_order_relaxed)) {
+        OnMicMuted();
+        return;
+    }
     if (LocalVoiceEnabled()) {
         pipeline_active_ = true;
         BeginLocalListening();
@@ -453,7 +462,8 @@ bool Satellite::ScheduleContinuedListening(const char* reason) {
     const bool pipeline = pipeline_active_.load(std::memory_order_relaxed);
     const bool continuing = continue_conversation_.load(std::memory_order_relaxed);
     const bool speech = speech_active_.load(std::memory_order_relaxed);
-    if (!pipeline || !continuing || speech) {
+    if (!pipeline || !continuing || speech ||
+        state_.mic_muted.load(std::memory_order_relaxed)) {
         LVA_LOGD(kTag, "%s — not continuing: pipeline=%d continue=%d speech=%d",
                  reason, pipeline ? 1 : 0, continuing ? 1 : 0, speech ? 1 : 0);
         return false;
@@ -798,7 +808,7 @@ void Satellite::OnVoiceEvent(
                      tts_played_ ? 1 : 0);
             StopAudioStreaming();
             if (!tts_played_) {
-                if (continue_conversation_) {
+                if (continue_conversation_ && !state_.mic_muted.load(std::memory_order_relaxed)) {
                     ScheduleContinuedListening("RUN_END without TTS");
                 } else {
                     DisarmHaWatchdog();
@@ -838,7 +848,7 @@ void Satellite::OnLoopTick() {
             continue_listen_at_ns_.store(0, std::memory_order_relaxed);
             if (!pipeline_active_ || !continue_conversation_ || speech_active_) {
                 LVA_LOGD(kTag, "continued conversation skipped: turn ended or speech active");
-            } else if (state_.muted.load(std::memory_order_relaxed)) {
+            } else if (state_.mic_muted.load(std::memory_order_relaxed)) {
                 LVA_LOGD(kTag, "continued conversation skipped: muted");
                 pipeline_active_ = false;
                 continue_conversation_ = false;
@@ -922,18 +932,31 @@ void Satellite::OnDisconnected() {
     tts_played_ = false;
 }
 
-void Satellite::OnMuted() {
+void Satellite::OnMicMuted() {
+    const bool was_streaming = is_streaming_audio_.load(std::memory_order_relaxed);
+    const bool was_waking = wake_sound_pending_.exchange(false, std::memory_order_acq_rel);
+    const bool was_settling = continue_listen_at_ns_.exchange(0, std::memory_order_acq_rel) != 0;
+    const bool was_local_listening = local_phase_ == LocalPhase::kListening;
+    pending_wake_.store(false, std::memory_order_release);
+    pending_stop_.store(false, std::memory_order_release);
     StopAudioStreaming();
-    DisarmHaWatchdog();
-    CancelLocalTurn();
-    continue_listen_at_ns_.store(0, std::memory_order_relaxed);
-    if (pipeline_active_ && announce_player_) {
-        announce_player_->Stop();
-        pipeline_active_       = false;
-        continue_conversation_ = false;
-        speech_active_         = false;
+    continue_conversation_ = false;
+    if (was_local_listening && local_.stt) {
+        local_.stt->Cancel();
+        local_phase_ = LocalPhase::kIdle;
+    }
+    if (was_streaming && state_.broadcast) {
+        ::VoiceAssistantRequest request;
+        request.set_start(false);
+        state_.broadcast(lva::proto::kIdVoiceAssistantRequest, request);
+    }
+    // Cancel microphone input, not output. Keep synthesis, playback and
+    // already-submitted intent processing alive so they finish normally.
+    if ((was_streaming || was_waking || was_settling || was_local_listening) &&
+        !speech_active_) {
+        DisarmHaWatchdog();
+        pipeline_active_ = false;
         active_wake_phrase_.clear();
-        wake_sound_pending_    = false;
         Unduck();
         lva::tr::Show(lva::tr::LedState::Idle);
     }
@@ -1116,7 +1139,7 @@ void Satellite::PollLocalTts() {
                  static_cast<unsigned long long>(pending.generation));
         CancelLocalTts(true);
         if (!local_speech_ && !pending.fallback_media_id.empty() &&
-            speech_active_ && pipeline_active_ && !state_.muted.load()) {
+            speech_active_ && pipeline_active_) {
             LVA_LOGW(kTag, "local TTS stalled; falling back to announcement media: %s",
                      pending.fallback_media_id.c_str());
             PlayAnnouncementMedia(pending.fallback_media_id, pending.preannounce_media_id);
@@ -1135,7 +1158,7 @@ void Satellite::PollLocalTts() {
     }
     const bool current = pending_tts_ && result->generation == pending_tts_->generation;
     if (!current ||
-        !speech_active_ || !pipeline_active_ || state_.muted.load()) {
+        !speech_active_ || !pipeline_active_) {
         std::error_code ec;
         if (!result->path.empty()) std::filesystem::remove(result->path, ec);
         if (current) {

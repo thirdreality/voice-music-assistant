@@ -17,7 +17,7 @@ constexpr const char* kDisplayName = "Mute";
 MuteSwitchEntity::MuteSwitchEntity(std::uint32_t key,
                                    lva::state::ServerState& state)
     : Entity(key, kObjectId, kDisplayName), state_(state) {
-    state_.muted.store(state_.preferences.is_mic_muted(),
+    state_.mic_muted.store(state_.preferences.is_mic_muted(),
                        std::memory_order_relaxed);
 }
 
@@ -34,7 +34,7 @@ void MuteSwitchEntity::OnListEntities(const ResponseSink& sink) {
 void MuteSwitchEntity::OnSubscribeStates(const ResponseSink& sink) {
     ::SwitchStateResponse resp;
     resp.set_key(key());
-    resp.set_state(state_.muted.load(std::memory_order_relaxed));
+    resp.set_state(state_.mic_muted.load(std::memory_order_relaxed));
     sink(lva::proto::kIdSwitchStateResponse, resp);
 }
 
@@ -62,7 +62,7 @@ void MuteSwitchEntity::BroadcastState() {
     if (!state_.broadcast) return;
     ::SwitchStateResponse resp;
     resp.set_key(key());
-    resp.set_state(state_.muted.load(std::memory_order_relaxed));
+    resp.set_state(state_.mic_muted.load(std::memory_order_relaxed));
     state_.broadcast(lva::proto::kIdSwitchStateResponse, resp);
 }
 

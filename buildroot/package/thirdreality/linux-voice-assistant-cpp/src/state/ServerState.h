@@ -35,7 +35,8 @@ class ServerState {
     std::filesystem::path preferences_path;
     std::filesystem::path wakeword_dir;
 
-    std::atomic<bool>   muted{false};
+    // Microphone input only; never a speaker/playback mute.
+    std::atomic<bool>   mic_muted{false};
     std::atomic<double> volume{1.0};
     std::atomic<int>    mic_volume_live{100}; // 1-4000 (percent), read by capture thread
 

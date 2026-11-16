@@ -37,11 +37,11 @@ void ServerState::PersistVolume(double new_volume) {
 
 void ServerState::PersistMuted(bool new_muted) {
     const bool runtime_changed =
-        muted.load(std::memory_order_relaxed) != new_muted;
+        mic_muted.load(std::memory_order_relaxed) != new_muted;
     const bool prefs_changed = preferences.is_mic_muted() != new_muted;
     if (!runtime_changed && !prefs_changed) return;
 
-    muted.store(new_muted, std::memory_order_relaxed);
+    mic_muted.store(new_muted, std::memory_order_relaxed);
     preferences.set_mic_muted(new_muted);
     if (effects_.muted_changed) effects_.muted_changed(new_muted);
     if (!SavePreferences()) {

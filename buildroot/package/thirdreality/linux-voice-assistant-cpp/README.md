@@ -31,7 +31,7 @@ aarch64, Buildroot).
 | Entity | object_id |
 |---|---|
 | Media Player | `linux_voice_assistant_media_player` |
-| Mute | `mute` |
+| Mute (microphone input) | `mute` |
 | Thinking Sound | `thinking_sound` |
 | Wake Word 1 / 2 Sensitivity | `wake_word_1_sensitivity`, `wake_word_2_sensitivity` |
 | Stop Word Sensitivity | `stop_word_sensitivity` |
@@ -43,6 +43,10 @@ aarch64, Buildroot).
 | Home Button (event) | `thirdreality_home_button` |
 | Firmware Update | `thirdreality_firmware_update` |
 | Allow Background Internet Access | `allow_background_internet` |
+
+The Mute switch disables microphone input and wake-word detection. Music,
+announcements, TTS and timer sounds continue playing while the microphone
+is muted. Mute feedback tones play only when speaker playback is idle.
 
 ### Background internet access
 

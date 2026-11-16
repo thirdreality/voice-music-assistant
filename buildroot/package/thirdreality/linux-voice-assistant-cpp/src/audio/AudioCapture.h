@@ -60,6 +60,10 @@ class AudioCapture {
         mic_volume_ptr_ = vol;
     }
 
+    void SetMicMuteSource(const std::atomic<bool>* muted) {
+        mic_muted_ptr_ = muted;
+    }
+
     bool Start();
 
     void Stop();
@@ -86,6 +90,7 @@ class AudioCapture {
     WebRtcProcessor*         processor_ = nullptr;
 
     const std::atomic<int>*  mic_volume_ptr_ = nullptr;
+    const std::atomic<bool>* mic_muted_ptr_ = nullptr;
 
     void*                    pa_handle_  = nullptr;
     void*                    alsa_handle_ = nullptr;

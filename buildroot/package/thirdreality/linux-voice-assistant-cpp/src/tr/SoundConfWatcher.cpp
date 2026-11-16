@@ -84,7 +84,7 @@ bool SoundConfWatcher::ReloadAndApply() {
     }
 
     const bool on_disk_muted  = fresh.is_mic_muted();
-    const bool current_muted  = state_.muted.load(std::memory_order_relaxed);
+    const bool current_muted  = state_.mic_muted.load(std::memory_order_relaxed);
     const bool mute_ready = state_.CanApplyExternalPreference("mic_mute", revision);
     if (on_disk_muted != current_muted && mute_ready) {
         LVA_LOGI(kTag,

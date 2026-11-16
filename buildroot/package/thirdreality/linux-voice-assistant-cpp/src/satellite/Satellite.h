@@ -62,7 +62,7 @@ class Satellite {
 
     void OnDisconnected();
 
-    void OnMuted();
+    void OnMicMuted();
 
     // Call once at startup, before the first wake.
     void EnableLocalVoice(LocalVoiceConfig cfg);

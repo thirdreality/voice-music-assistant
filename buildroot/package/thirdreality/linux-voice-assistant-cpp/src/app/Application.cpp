@@ -205,7 +205,7 @@ bool Application::InitializeState() {
         state.volume.store(*state.preferences.volume, std::memory_order_relaxed);
         lva::tr::SetSystemVolumeSilent(static_cast<int>(*state.preferences.volume * 100.0 + 0.5));
     }
-    state.muted.store(state.preferences.is_mic_muted(), std::memory_order_relaxed);
+    state.mic_muted.store(state.preferences.is_mic_muted(), std::memory_order_relaxed);
     state.mic_volume_live.store(state.preferences.mic_volume, std::memory_order_relaxed);
     {
         const double delay_s =

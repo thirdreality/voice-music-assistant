@@ -28,17 +28,24 @@ void Application::BindPreferenceEffects() {
         .muted_changed =
             [this](bool muted) {
                 if (mic_mute_gpio) mic_mute_gpio->SyncToHardware(muted);
-                if (muted && satellite) satellite->OnMuted();
+                if (muted && satellite) satellite->OnMicMuted();
                 if (mute_switch_entity) mute_switch_entity->BroadcastState();
                 if (media_player_entity) media_player_entity->BroadcastState();
             },
         .mute_sound =
             [this](bool muted) {
-                if (announce_player)
+                if (announce_player) {
+                    // Mic feedback must never replace speaker playback. Keep
+                    // pending synthesis, paused media and timer alarms intact.
+                    if ((satellite && !satellite->IsIdle()) ||
+                        announce_player->State() != lva::audio::PlayerState::kIdle ||
+                        (music_player && music_player->State() != lva::audio::PlayerState::kIdle) ||
+                        (sendspin_active && sendspin_hub->IsGroupPlaying())) return;
                     announce_player->Play(
                         muted ? "/usr/share/thirdreality/sounds/mute_switch_on.flac"
                               : "/usr/share/thirdreality/sounds/mute_switch_off.flac",
                         {});
+                }
             },
         .wake_sensitivity_changed =
             [this](int n, double value) {

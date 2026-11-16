@@ -274,6 +274,9 @@ void AudioCapture::ThreadLoopPulse() {
             break;
         }
 
+        // Keep the capture device running but discard muted input before it
+        // reaches processing, STT, wake-word taps or the HA audio ring.
+        if (mic_muted_ptr_ && mic_muted_ptr_->load(std::memory_order_relaxed)) continue;
         if (processor_ != nullptr) {
             processor_->Process(chunk.data(), chunk.size());
         }
@@ -357,6 +360,7 @@ void AudioCapture::ThreadLoopAlsa() {
             continue;
         }
 
+        if (mic_muted_ptr_ && mic_muted_ptr_->load(std::memory_order_relaxed)) continue;
         for (std::size_t i = 0; i < period; ++i) {
             const std::int16_t* row = il.data() + i * nch;
             mic[i] = row[mic_ch];

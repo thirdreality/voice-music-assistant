@@ -139,6 +139,7 @@ bool Application::SetupAudio() {
         state.preferences.mic_auto_gain, state.preferences.mic_noise_suppression, aec_enabled);
     audio_capture->SetProcessor(webrtc_processor.get());
     audio_capture->SetMicVolumeSource(&state.mic_volume_live);
+    audio_capture->SetMicMuteSource(&state.mic_muted);
 
     return true;
 }
